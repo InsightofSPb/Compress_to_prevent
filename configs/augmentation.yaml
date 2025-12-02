@@ -6,6 +6,8 @@ palette: []  # optional list of RGB colors, leave empty for random palette
 paths:
   images: data/facades/images
   masks: data/facades/masks
+  # Optional: path to YAML/JSON dict mapping image filename -> mask filename when names differ
+  pairs: 
   output_images: data/facades_aug/images
   output_masks: data/facades_aug/masks
   output_overlays: data/facades_aug/overlays

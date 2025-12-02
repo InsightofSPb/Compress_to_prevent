@@ -175,8 +175,20 @@ def build_transforms(config: Dict) -> A.Compose:
     return A.Compose(transforms, additional_targets={"mask": "mask"})
 
 
-def load_image_mask(image_path: Path, mask_dir: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    mask_path = mask_dir / image_path.name
+def load_mask_path(image_path: Path, mask_dir: Path, mapping: Dict[str, str]) -> Path:
+    mapped = mapping.get(image_path.name)
+    if mapped is None:
+        mask_path = mask_dir / image_path.name
+    else:
+        mapped_path = Path(mapped)
+        mask_path = mapped_path if mapped_path.is_absolute() else mask_dir / mapped
+    return mask_path
+
+
+def load_image_mask(
+    image_path: Path, mask_dir: Path, mapping: Dict[str, str]
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    mask_path = load_mask_path(image_path, mask_dir, mapping)
     if not mask_path.exists():
         return None
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -217,6 +229,12 @@ def augment_dataset(config: Dict) -> None:
     paths_cfg = config.get("paths", {})
     image_dir = Path(paths_cfg.get("images"))
     mask_dir = Path(paths_cfg.get("masks"))
+    mapping_path = paths_cfg.get("pairs")
+    mapping: Dict[str, str] = {}
+    if mapping_path:
+        mapping = load_config(Path(mapping_path))
+        if not isinstance(mapping, dict):
+            raise ValueError("pairs mapping file must contain a dictionary of image->mask names")
     output_dirs = {
         "images": Path(paths_cfg.get("output_images")),
         "masks": Path(paths_cfg.get("output_masks")),
@@ -240,9 +258,12 @@ def augment_dataset(config: Dict) -> None:
 
     progress = tqdm(image_paths, desc="Augmenting images")
     for image_path in progress:
-        loaded = load_image_mask(image_path, mask_dir)
+        loaded = load_image_mask(image_path, mask_dir, mapping)
         if loaded is None:
-            progress.write(f"Skipping {image_path.name}: missing or unreadable mask")
+            expected_mask = load_mask_path(image_path, mask_dir, mapping)
+            progress.write(
+                f"Skipping {image_path.name}: missing or unreadable mask (expected at {expected_mask})"
+            )
             continue
         image, mask = loaded
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -254,7 +275,7 @@ def augment_dataset(config: Dict) -> None:
             partner_img, partner_mask = None, None
             if mixup_cfg.get("p", 0) > 0 and random.random() < mixup_cfg["p"]:
                 partner_path = sample_partner(image_paths, image_path)
-                partner_loaded = load_image_mask(partner_path, mask_dir)
+                partner_loaded = load_image_mask(partner_path, mask_dir, mapping)
                 if partner_loaded:
                     partner_image, partner_mask = partner_loaded
                     partner_image = cv2.cvtColor(partner_image, cv2.COLOR_BGR2RGB)
@@ -270,7 +291,7 @@ def augment_dataset(config: Dict) -> None:
             if cutmix_cfg.get("p", 0) > 0 and random.random() < cutmix_cfg["p"]:
                 if partner_img is None:
                     partner_path = sample_partner(image_paths, image_path)
-                    partner_loaded = load_image_mask(partner_path, mask_dir)
+                    partner_loaded = load_image_mask(partner_path, mask_dir, mapping)
                     if partner_loaded:
                         partner_image, partner_mask = partner_loaded
                         partner_image = cv2.cvtColor(partner_image, cv2.COLOR_BGR2RGB)
