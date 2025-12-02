@@ -78,6 +78,7 @@ dependencies:
   - zstd=1.5.5=hc292b87_2
   - pip:
       - addict==2.4.0
+      - albumentations==1.4.13
       - alembic==1.13.3
       - aliyun-python-sdk-core==2.15.2
       - aliyun-python-sdk-kms==2.16.4
