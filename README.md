@@ -34,6 +34,20 @@ conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 pip install kornia==0.7.4 cupy-cuda11x ftfy omegaconf open_clip_torch==2.26.1 hydra-core wandb
 ```
 
+## Offline dataset augmentation
+
+To pre-generate an augmented facade dataset (images, masks, and overlays), use the helper script:
+
+```
+python tools/augment_dataset.py -c configs/augmentation.yaml
+```
+
+Key points:
+
+* The default config (`configs/augmentation.yaml`) expects raw images under `data/facades/images` and masks under `data/facades/masks`, and will write augmented images, masks, and visual overlays into `data/facades_aug/`.
+* Augmentations include geometric/photometric transforms, weather effects from Albumentations, CutOut, MixUp, and CutMix. Counts/probabilities, output formats, and overlay transparency can all be tuned in the YAML file.
+* A tqdm progress bar is shown while augmentations are generated so you can estimate runtime even with multiple augmentations per image.
+
 ## Datasets
 
 We use 8 benchmark datasets: PASCAL VOC20, PASCAL Context59, COCO-Object, PASCAL VOC, PASCAL Context, COCO-Stuff, Cityscapes, and ADE20k.
