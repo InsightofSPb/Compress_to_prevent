@@ -1,0 +1,69 @@
+seed: 42
+augmentations_per_image: 3
+overlay_alpha: 0.45
+palette: []  # optional list of RGB colors, leave empty for random palette
+
+paths:
+  images: data/facades/images
+  masks: data/facades/masks
+  output_images: data/facades_aug/images
+  output_masks: data/facades_aug/masks
+  output_overlays: data/facades_aug/overlays
+
+save:
+  suffix: aug
+  image_format: png
+  mask_format: png
+  overlay_format: png
+
+augmentations:
+  size:
+    resize: {height: 448, width: 448}
+    random_crop: {height: 448, width: 448, p: 0.0}
+
+  geometric:
+    horizontal_flip: 0.5
+    vertical_flip: 0.0
+    random_rotate90: 0.0
+    shift_scale_rotate: {shift_limit: 0.05, scale_limit: 0.1, rotate_limit: 15, p: 0.5}
+
+  photometric:
+    brightness_contrast: 0.5
+    brightness_limit: 0.2
+    contrast_limit: 0.2
+    hue_sat: 0.4
+    hue_shift_limit: 10
+    sat_shift_limit: 10
+    val_shift_limit: 10
+    rgb_shift: 0.2
+    r_shift: 10
+    g_shift: 10
+    b_shift: 10
+    gaussian_noise: 0.2
+    noise_var: [10.0, 50.0]
+    blur: 0.1
+    blur_limit: 3
+    clahe: 0.0
+    clip_limit: 2.0
+
+  weather:
+    rain: 0.2
+    snow: 0.2
+    fog: 0.15
+    sun_flare: 0.05
+    shadow: 0.05
+
+  cutout:
+    num_holes: 8
+    max_h_size: 48
+    max_w_size: 48
+    fill_value: 0
+    p: 0.4
+
+  mixup:
+    alpha: 0.4
+    p: 0.4
+
+  cutmix:
+    alpha: 1.0
+    p: 0.4
