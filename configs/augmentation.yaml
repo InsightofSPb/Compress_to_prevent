@@ -4,8 +4,8 @@ overlay_alpha: 0.45
 palette: []  # optional list of RGB colors, leave empty for random palette
 
 paths:
-  images: data/facades/images
-  masks: data/facades/masks
+  images: /home/sasha/LPOSS/datasets/SPb_facades/raw_images
+  masks: /home/sasha/LPOSS/datasets/SPb_facades/masks
   # Optional: path to YAML/JSON dict mapping image filename -> mask filename when names differ
   pairs: 
   output_images: data/facades_aug/images

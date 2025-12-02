@@ -82,7 +82,6 @@ def build_transforms(config: Dict) -> A.Compose:
                 resize_cfg.get("height"),
                 resize_cfg.get("width"),
                 interpolation=cv2.INTER_LINEAR,
-                mask_interpolation=cv2.INTER_NEAREST,
             )
         )
     if "random_crop" in size_cfg and size_cfg["random_crop"].get("p", 0) > 0:
