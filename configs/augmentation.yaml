@@ -1,5 +1,5 @@
 seed: 42
-augmentations_per_image: 3
+augmentations_per_image: 4
 overlay_alpha: 0.45
 palette: []  # optional list of RGB colors, leave empty for random palette
 
@@ -7,9 +7,9 @@ tiling:
   enabled: true
   height: 448
   width: 448
-  stride_h: 448
-  stride_w: 448
-  pad_mode: reflect
+  stride_h: 224
+  stride_w: 224
+  pad_mode: constant
 
 paths:
   images: /home/sasha/LPOSS/datasets/SPb_facades/raw_images
@@ -32,48 +32,47 @@ augmentations:
     random_crop: {height: 448, width: 448, p: 0.0}
 
   geometric:
-    horizontal_flip: 0.5
+    horizontal_flip: 0.2
     vertical_flip: 0.0
     random_rotate90: 0.0
-    shift_scale_rotate: {shift_limit: 0.05, scale_limit: 0.1, rotate_limit: 15, p: 0.5}
+    shift_scale_rotate: {shift_limit: 0.05, scale_limit: 0.1, rotate_limit: 10, p: 0.25}
 
   photometric:
-    brightness_contrast: 0.5
-    brightness_limit: 0.2
-    contrast_limit: 0.2
-    hue_sat: 0.4
-    hue_shift_limit: 10
-    sat_shift_limit: 10
-    val_shift_limit: 10
-    rgb_shift: 0.2
-    r_shift: 10
-    g_shift: 10
-    b_shift: 10
-    gaussian_noise: 0.2
-    noise_var: [10.0, 50.0]
-    blur: 0.1
-    blur_limit: 3
+    brightness_contrast: 0.25
+    brightness_limit: 0.15
+    contrast_limit: 0.15
+    hue_sat: 0.2
+    hue_shift_limit: 8
+    sat_shift_limit: 8
+    val_shift_limit: 8
+    rgb_shift: 0.1
+    r_shift: 6
+    g_shift: 6
+    b_shift: 6
+    gaussian_noise: 0.1
+    noise_var: [3.0, 12.0]
+    blur: 0.0
     clahe: 0.0
     clip_limit: 2.0
 
   weather:
-    rain: 0.2
-    snow: 0.2
-    fog: 0.15
-    sun_flare: 0.05
-    shadow: 0.05
+    rain: 0.0
+    snow: 0.0
+    fog: 0.0
+    sun_flare: 0.0
+    shadow: 0.0
 
   cutout:
     num_holes: 8
     max_h_size: 48
     max_w_size: 48
     fill_value: 0
-    p: 0.4
+    p: 0.2
 
   mixup:
-    alpha: 0.4
-    p: 0.4
+    alpha: 0.3
+    p: 0.3
 
   cutmix:
-    alpha: 1.0
-    p: 0.4
+    alpha: 0.8
+    p: 0.2

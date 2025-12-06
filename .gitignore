@@ -177,3 +177,4 @@ pyrightconfig.json
 
 wandb/*
 datasets*
+data_augmented/*
