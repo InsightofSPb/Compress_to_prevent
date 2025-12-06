@@ -30,6 +30,50 @@ def build_palette(config: Dict) -> np.ndarray:
     return rng.integers(0, 255, size=(num_colors, 3), dtype=np.uint8)
 
 
+def pad_tile(
+    tile: np.ndarray, target_h: int, target_w: int, is_mask: bool, pad_mode: str
+) -> np.ndarray:
+    h, w = tile.shape[:2]
+    if h == target_h and w == target_w:
+        return tile
+
+    pad_bottom = max(0, target_h - h)
+    pad_right = max(0, target_w - w)
+    border_type = cv2.BORDER_REFLECT if pad_mode == "reflect" else cv2.BORDER_CONSTANT
+    pad_value = 0 if is_mask else 0
+
+    return cv2.copyMakeBorder(
+        tile,
+        0,
+        pad_bottom,
+        0,
+        pad_right,
+        border_type,
+        value=pad_value,
+    )
+
+
+def generate_tiles(
+    image: np.ndarray,
+    mask: np.ndarray,
+    tile_h: int,
+    tile_w: int,
+    stride_h: int,
+    stride_w: int,
+    pad_mode: str = "reflect",
+):
+    tile_idx = 0
+    h, w = image.shape[:2]
+    for y in range(0, h, stride_h):
+        for x in range(0, w, stride_w):
+            img_tile = image[y : y + tile_h, x : x + tile_w]
+            mask_tile = mask[y : y + tile_h, x : x + tile_w]
+            img_tile = pad_tile(img_tile, tile_h, tile_w, is_mask=False, pad_mode=pad_mode)
+            mask_tile = pad_tile(mask_tile, tile_h, tile_w, is_mask=True, pad_mode=pad_mode)
+            yield tile_idx, img_tile, mask_tile
+            tile_idx += 1
+
+
 def colorize_mask(mask: np.ndarray, palette: np.ndarray) -> np.ndarray:
     unique_labels = np.unique(mask)
     color_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
@@ -206,6 +250,7 @@ def sample_partner(image_paths: List[Path], exclude: Path) -> Path:
 
 def save_triplet(
     base_name: str,
+    tile_idx: Optional[int],
     idx: int,
     image: np.ndarray,
     mask: np.ndarray,
@@ -214,7 +259,8 @@ def save_triplet(
     cfg: Dict,
 ) -> None:
     suffix = cfg.get("suffix", "aug")
-    stem = f"{base_name}_{suffix}{idx}"
+    tile_suffix = f"_tile{tile_idx}" if tile_idx is not None else ""
+    stem = f"{base_name}{tile_suffix}_{suffix}{idx}"
     image_name = f"{stem}.{cfg.get('image_format', 'png')}"
     mask_name = f"{stem}.{cfg.get('mask_format', 'png')}"
     overlay_name = f"{stem}.{cfg.get('overlay_format', 'png')}"
@@ -245,6 +291,14 @@ def augment_dataset(config: Dict) -> None:
     base_transform = build_transforms(aug_cfg)
     palette = build_palette(config)
 
+    tiling_cfg = config.get("tiling", {})
+    tile_enabled = tiling_cfg.get("enabled", False)
+    tile_h = tiling_cfg.get("height") or aug_cfg.get("size", {}).get("resize", {}).get("height")
+    tile_w = tiling_cfg.get("width") or aug_cfg.get("size", {}).get("resize", {}).get("width")
+    stride_h = tiling_cfg.get("stride_h", tile_h)
+    stride_w = tiling_cfg.get("stride_w", tile_w)
+    pad_mode = tiling_cfg.get("pad_mode", "reflect")
+
     seed = config.get("seed", 42)
     random.seed(seed)
     np.random.seed(seed)
@@ -267,59 +321,68 @@ def augment_dataset(config: Dict) -> None:
         image, mask = loaded
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        for idx in range(num_aug):
-            transformed = base_transform(image=image, mask=mask)
-            aug_img, aug_mask = transformed["image"], transformed["mask"]
+        if tile_enabled and tile_h is not None and tile_w is not None:
+            tiles = list(
+                generate_tiles(image, mask, tile_h, tile_w, stride_h, stride_w, pad_mode)
+            )
+        else:
+            tiles = [(None, image, mask)]
 
-            partner_img, partner_mask = None, None
-            if mixup_cfg.get("p", 0) > 0 and random.random() < mixup_cfg["p"]:
-                partner_path = sample_partner(image_paths, image_path)
-                partner_loaded = load_image_mask(partner_path, mask_dir, mapping)
-                if partner_loaded:
-                    partner_image, partner_mask = partner_loaded
-                    partner_image = cv2.cvtColor(partner_image, cv2.COLOR_BGR2RGB)
-                    partner = base_transform(image=partner_image, mask=partner_mask)
-                    aug_img, aug_mask = apply_mixup(
-                        aug_img,
-                        aug_mask,
-                        partner["image"],
-                        partner["mask"],
-                        mixup_cfg.get("alpha", 0.4),
-                    )
+        for tile_idx, tile_img, tile_mask in tiles:
+            for idx in range(num_aug):
+                transformed = base_transform(image=tile_img, mask=tile_mask)
+                aug_img, aug_mask = transformed["image"], transformed["mask"]
 
-            if cutmix_cfg.get("p", 0) > 0 and random.random() < cutmix_cfg["p"]:
-                if partner_img is None:
+                partner_img, partner_mask = None, None
+                if mixup_cfg.get("p", 0) > 0 and random.random() < mixup_cfg["p"]:
                     partner_path = sample_partner(image_paths, image_path)
                     partner_loaded = load_image_mask(partner_path, mask_dir, mapping)
                     if partner_loaded:
                         partner_image, partner_mask = partner_loaded
                         partner_image = cv2.cvtColor(partner_image, cv2.COLOR_BGR2RGB)
                         partner = base_transform(image=partner_image, mask=partner_mask)
-                        partner_img, partner_mask = partner["image"], partner["mask"]
-                if partner_img is not None:
-                    aug_img, aug_mask = apply_cutmix(
-                        aug_img,
-                        aug_mask,
-                        partner_img,
-                        partner_mask,
-                        cutmix_cfg.get("alpha", 1.0),
-                    )
+                        aug_img, aug_mask = apply_mixup(
+                            aug_img,
+                            aug_mask,
+                            partner["image"],
+                            partner["mask"],
+                            mixup_cfg.get("alpha", 0.4),
+                        )
 
-            overlay = create_overlay(
-                aug_img,
-                aug_mask,
-                palette,
-                config.get("overlay_alpha", 0.45),
-            )
-            save_triplet(
-                image_path.stem,
-                idx,
-                aug_img,
-                aug_mask,
-                overlay,
-                output_dirs,
-                config.get("save", {}),
-            )
+                if cutmix_cfg.get("p", 0) > 0 and random.random() < cutmix_cfg["p"]:
+                    if partner_img is None:
+                        partner_path = sample_partner(image_paths, image_path)
+                        partner_loaded = load_image_mask(partner_path, mask_dir, mapping)
+                        if partner_loaded:
+                            partner_image, partner_mask = partner_loaded
+                            partner_image = cv2.cvtColor(partner_image, cv2.COLOR_BGR2RGB)
+                            partner = base_transform(image=partner_image, mask=partner_mask)
+                            partner_img, partner_mask = partner["image"], partner["mask"]
+                    if partner_img is not None:
+                        aug_img, aug_mask = apply_cutmix(
+                            aug_img,
+                            aug_mask,
+                            partner_img,
+                            partner_mask,
+                            cutmix_cfg.get("alpha", 1.0),
+                        )
+
+                overlay = create_overlay(
+                    aug_img,
+                    aug_mask,
+                    palette,
+                    config.get("overlay_alpha", 0.45),
+                )
+                save_triplet(
+                    image_path.stem,
+                    tile_idx,
+                    idx,
+                    aug_img,
+                    aug_mask,
+                    overlay,
+                    output_dirs,
+                    config.get("save", {}),
+                )
 
 
 def main() -> None:

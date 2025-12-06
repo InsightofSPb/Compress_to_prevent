@@ -3,6 +3,14 @@ augmentations_per_image: 3
 overlay_alpha: 0.45
 palette: []  # optional list of RGB colors, leave empty for random palette
 
+tiling:
+  enabled: true
+  height: 448
+  width: 448
+  stride_h: 448
+  stride_w: 448
+  pad_mode: reflect
+
 paths:
   images: /home/sasha/LPOSS/datasets/SPb_facades/raw_images
   masks: /home/sasha/LPOSS/datasets/SPb_facades/masks
