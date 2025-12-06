@@ -243,6 +243,21 @@ def load_image_mask(
     return image, mask
 
 
+def validate_input_dirs(image_dir: Path, mask_dir: Path) -> None:
+    if not image_dir.exists():
+        raise FileNotFoundError(
+            f"Image directory not found: {image_dir}. Update paths.images in the config."
+        )
+    if not mask_dir.exists():
+        raise FileNotFoundError(
+            f"Mask directory not found: {mask_dir}. Update paths.masks in the config."
+        )
+    if not any(image_dir.iterdir()):
+        raise FileNotFoundError(
+            f"Image directory {image_dir} is empty. Provide input images before augmenting."
+        )
+
+
 def sample_partner(image_paths: List[Path], exclude: Path) -> Path:
     candidates = [p for p in image_paths if p != exclude]
     return random.choice(candidates) if candidates else exclude
@@ -280,6 +295,7 @@ def augment_dataset(config: Dict) -> None:
         mapping = load_config(Path(mapping_path))
         if not isinstance(mapping, dict):
             raise ValueError("pairs mapping file must contain a dictionary of image->mask names")
+    validate_input_dirs(image_dir, mask_dir)
     output_dirs = {
         "images": Path(paths_cfg.get("output_images")),
         "masks": Path(paths_cfg.get("output_masks")),
@@ -315,7 +331,9 @@ def augment_dataset(config: Dict) -> None:
         if loaded is None:
             expected_mask = load_mask_path(image_path, mask_dir, mapping)
             progress.write(
-                f"Skipping {image_path.name}: missing or unreadable mask (expected at {expected_mask})"
+                "Skipping {img}: missing or unreadable mask (expected at {mask}). "
+                "Ensure the mask file exists or provide a name mapping via paths.pairs."
+            .format(img=image_path.name, mask=expected_mask)
             )
             continue
         image, mask = loaded
