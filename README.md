@@ -51,6 +51,14 @@ Key points:
 * Augmentations include geometric/photometric transforms, weather effects from Albumentations, CutOut, MixUp, and CutMix. Counts/probabilities, output formats, and overlay transparency can all be tuned in the YAML file.
 * A tqdm progress bar is shown while augmentations are generated so you can estimate runtime even with multiple augmentations per image.
 
+To split the augmented tiles (e.g., `data/facades_aug/images` and `data/facades_aug/masks`) into train/val/test subsets, use:
+
+```
+python tools/split_dataset.py --data-root data/facades_aug --train-ratio 0.8 --val-ratio 0.1 --test-ratio 0.1
+```
+
+By default the script writes the splits to `<data-root>/data_prepared/{train,val,test}/{images,masks}`. Adjust the ratios or the `--output-dir` as needed. Masks must share filenames with their corresponding images.
+
 ## Datasets
 
 We use 8 benchmark datasets: PASCAL VOC20, PASCAL Context59, COCO-Object, PASCAL VOC, PASCAL Context, COCO-Stuff, Cityscapes, and ADE20k.
