@@ -45,6 +45,8 @@ python tools/augment_dataset.py -c configs/augmentation.yaml
 Key points:
 
 * The default config (`configs/augmentation.yaml`) expects raw images under `data/facades/images` and masks under `data/facades/masks`, and will write augmented images, masks, and visual overlays into `data/facades_aug/`.
+* Images are first split into 448×448 tiles (configurable via `tiling`) so that augmentations are applied on the same patch size the network expects; this avoids random crops that would otherwise change the spatial support post-augmentation.
+* When training on the pre-generated tiles, keep the dataloader pipeline free of extra augmentations so you do not stack online transforms on top of the offline ones.
 * If mask filenames differ from the image filenames, point `paths.pairs` in the config to a YAML/JSON dict mapping `image_name.png: mask_name.png` so the script can locate the right mask.
 * Augmentations include geometric/photometric transforms, weather effects from Albumentations, CutOut, MixUp, and CutMix. Counts/probabilities, output formats, and overlay transparency can all be tuned in the YAML file.
 * A tqdm progress bar is shown while augmentations are generated so you can estimate runtime even with multiple augmentations per image.
