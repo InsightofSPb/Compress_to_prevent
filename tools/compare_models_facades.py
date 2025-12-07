@@ -74,6 +74,15 @@ def parse_args():
     return parser.parse_args()
 
 
+def strip_prefix(state_dict: Dict[str, torch.Tensor], prefix: str = "base_model.") -> Dict[str, torch.Tensor]:
+    new_state = {}
+    for k, v in state_dict.items():
+        if k.startswith(prefix):
+            new_state[k[len(prefix):]] = v
+        else:
+            new_state[k] = v
+    return new_state
+
 def _get_state_dict_from_checkpoint(logger, checkpoint_path: str) -> Dict:
     state = torch.load(checkpoint_path, map_location="cpu")
 
@@ -109,9 +118,15 @@ def load_model(
 ):
     logger = get_logger()
     model = build_model(cfg.model, class_names=class_names)
+
     if checkpoint_path:
         state = _get_state_dict_from_checkpoint(logger, checkpoint_path)
+
+        # ✅ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: убираем base_model.
+        state = strip_prefix(state, prefix="base_model.")
+
         missing, unexpected = model.load_state_dict(state, strict=False)
+
         if missing:
             logger.warning(
                 "Missing keys when loading %s: %s", checkpoint_path, missing
@@ -124,6 +139,7 @@ def load_model(
         logger.info(
             "No base checkpoint provided; using pretrained weights from the config"
         )
+
     model.to(device)
     model.eval()
     return model
