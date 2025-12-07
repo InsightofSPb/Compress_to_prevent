@@ -16,7 +16,7 @@ import mmcv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from hydra import compose, initialize
+from hydra import compose, initialize_config_dir
 from mmseg.datasets import build_dataloader, build_dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -203,8 +203,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    initialize(config_path="configs", version_base=None)
-    cfg = compose(config_name=args.config)
+    config_dir = PROJECT_ROOT / "configs"
+    if not config_dir.is_dir():
+        raise FileNotFoundError(f"Hydra config directory not found: {config_dir}")
+
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name=args.config)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = f"finetune_{timestamp}_lr{args.learning_rate}_depth{args.unfreeze_depth}_bs{args.batch_size}"

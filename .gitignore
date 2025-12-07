@@ -178,3 +178,4 @@ pyrightconfig.json
 wandb/*
 datasets/SPb_facades/*
 data_augmented/*
+outputs/*
