@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import mmcv
+import mmcv #type: ignore
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -71,12 +71,32 @@ class FineTuneWrapper(nn.Module):
         self.mix_strategy = mix_strategy
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        logits, feats = self.base_model(x, return_feat=True)
+        backbone = getattr(self.base_model, "clip_backbone", None) or self.base_model
+
+        try:
+            logits, feats = backbone(x, return_feat=True)
+        except TypeError:
+            output = backbone(x)
+            if isinstance(output, tuple):
+                logits, feats = output[0], output[1] if len(output) > 1 else None
+            else:
+                logits, feats = output, None
+
+        if feats is None:
+            feats = logits
+
         mixed_feats = feats
         for head in self.mixers:
             mixed_feats = head(mixed_feats, logits)
 
-        mixed_logits = self.base_model.decode_head.cls_seg(mixed_feats)
+        decode_head = getattr(self.base_model, "decode_head", None)
+        if decode_head is None and hasattr(self.base_model, "clip_backbone"):
+            decode_head = getattr(self.base_model.clip_backbone, "decode_head", None)
+
+        if decode_head is None:
+            raise AttributeError("No decode head found for fine-tuning")
+
+        mixed_logits = decode_head.cls_seg(mixed_feats)
 
         if self.mix_strategy == "replace":
             combined = mixed_logits
