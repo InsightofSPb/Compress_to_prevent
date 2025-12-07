@@ -10,6 +10,8 @@ from torch import Tensor
 import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
+from mmcv.parallel import DataContainer
+from mmcv import ConfigDict
 from mmseg.ops import resize
 from mmseg.models import EncoderDecoder
 
@@ -165,12 +167,37 @@ class LPOSS_Infrencer(EncoderDecoder):
             **kwargs,
     ):
         super(EncoderDecoder, self).__init__()
-        self.mode = test_cfg['mode']
+        test_cfg = ConfigDict(test_cfg or {})
+        test_cfg.setdefault('mode', 'whole')
+        self.mode = test_cfg.mode
         self.num_classes = num_classes
         self.model = model
         self.test_cfg = test_cfg
         self.align_corners = False
         self.config = config
+
+    def _ensure_list(self, value):
+        if isinstance(value, DataContainer):
+            value = value.data
+        if isinstance(value, tuple):
+            value = list(value)
+        if not isinstance(value, list):
+            value = [value]
+        return value
+
+    def forward(self, img, img_metas=None, return_loss=False, **kwargs):
+        if return_loss:
+            raise NotImplementedError("LPOSS_Infrencer is for inference only")
+
+        imgs = self._ensure_list(img)
+        imgs = [
+            i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i
+            for i in imgs
+        ]
+        metas = self._ensure_list(img_metas) if img_metas is not None else []
+        # Drop training-only fields that some evaluation loaders still supply
+        kwargs.pop('gt_semantic_seg', None)
+        return self.forward_test(imgs, metas, **kwargs)
 
     @torch.no_grad()
     def encode_decode(self, img, meta_data):

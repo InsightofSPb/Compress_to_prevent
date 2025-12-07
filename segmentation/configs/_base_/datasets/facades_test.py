@@ -1,5 +1,5 @@
 # Dataset config for facade damage test split
-_base_ = None
+_base_ = []
 
 classes = (
     "CRACK",

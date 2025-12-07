@@ -10,12 +10,13 @@ from mmcv.utils import get_logger as get_root_logger
 from termcolor import colored
 
 logger_name = None
-
+DEFAULT_LOGGER_NAME = "lposs"
 
 def get_logger(cfg=None, log_level=logging.INFO):
     global logger_name
     if cfg is None:
-        return get_root_logger(logger_name)
+        name = logger_name or DEFAULT_LOGGER_NAME
+        return get_root_logger(name)
 
     # creating logger
     name = cfg.model_name
