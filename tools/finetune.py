@@ -19,6 +19,10 @@ import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
 from mmseg.datasets import build_dataloader, build_dataset
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+warnings.filterwarnings("ignore", category=FutureWarning, module="timm")
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
