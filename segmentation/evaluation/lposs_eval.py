@@ -190,8 +190,14 @@ class LPOSS_Infrencer(EncoderDecoder):
             raise NotImplementedError("LPOSS_Infrencer is for inference only")
 
         imgs = self._ensure_list(img)
+        device = next(self.model.parameters()).device
         imgs = [
             i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i
+            (i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i)
+            for i in imgs
+        ]
+        imgs = [
+            i.to(device) if isinstance(i, torch.Tensor) else i
             for i in imgs
         ]
         metas = self._ensure_list(img_metas) if img_metas is not None else []

@@ -226,6 +226,7 @@ def run_model(
     model = load_model(cfg, checkpoint, dataset.CLASSES, device)
 
     seg_model = build_seg_inference(model, dataset, cfg, args.dataset_config)
+    seg_model = seg_model.to(device)
     data_loader = build_seg_dataloader(dataset, dist=False)
     predictions = single_gpu_test(seg_model, data_loader, pre_eval=False)
 
