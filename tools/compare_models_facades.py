@@ -9,7 +9,7 @@ import sys
 import mmcv  # type: ignore
 import numpy as np
 import torch
-from hydra import compose, initialize
+from hydra import compose, initialize_config_dir
 from mmseg.apis import single_gpu_test
 from mmseg.core.evaluation.metrics import eval_metrics
 
@@ -253,8 +253,12 @@ if __name__ == "__main__":
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    initialize(config_path="configs", version_base=None)
-    cfg = compose(config_name=args.config)
+    config_dir = PROJECT_ROOT / "configs"
+    if not config_dir.is_dir():
+        raise FileNotFoundError(f"Hydra config directory not found: {config_dir}")
+
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name=args.config)
 
     dataset = build_seg_dataset(args.dataset_config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
