@@ -1,18 +1,34 @@
 import argparse
 import json
 import os
+from pathlib import Path
 from typing import Dict, List, Optional
 
-import mmcv
+import sys
+
+import mmcv  # type: ignore
 import numpy as np
 import torch
 from hydra import compose, initialize
 from mmseg.apis import single_gpu_test
 from mmseg.core.evaluation.metrics import eval_metrics
 
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+warnings.filterwarnings("ignore", category=FutureWarning, module="timm")
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from helpers.logger import get_logger
 from models import build_model
-from segmentation.evaluation import build_seg_dataset, build_seg_dataloader, build_seg_inference
+from segmentation.evaluation import (
+    build_seg_dataloader,
+    build_seg_dataset,
+    build_seg_inference,
+)
 
 STRUCTURAL_DAMAGE = {"CRACK", "SPALLING", "DELAMINATION", "MISSING_ELEMENT"}
 SURFACE_STAIN = {"WATER_STAIN", "EFFLORESCENCE", "CORROSION"}
@@ -27,9 +43,17 @@ def parse_args():
     parser.add_argument(
         "dataset_config", help="MMSegmentation dataset config for the test split"
     )
-    parser.add_argument("base_checkpoint", help="Path to the base model checkpoint")
-    parser.add_argument("finetuned_checkpoint", help="Path to the finetuned model checkpoint")
-    parser.add_argument("output_dir", help="Directory to store metrics and visualizations")
+    parser.add_argument(
+        "finetuned_checkpoint", help="Path to the finetuned model checkpoint"
+    )
+    parser.add_argument(
+        "output_dir", help="Directory to store metrics and visualizations"
+    )
+    parser.add_argument(
+        "--base-checkpoint",
+        default=None,
+        help="Optional path to a base model checkpoint; if omitted, use defaults",
+    )
     parser.add_argument(
         "--num-gradcam",
         type=int,
@@ -48,17 +72,28 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model(cfg, checkpoint_path: str, class_names: List[str], device: torch.device):
+def load_model(
+    cfg, checkpoint_path: Optional[str], class_names: List[str], device: torch.device
+):
     logger = get_logger()
     model = build_model(cfg.model, class_names=class_names)
-    state = torch.load(checkpoint_path, map_location="cpu")
-    if "state_dict" in state:
-        state = state["state_dict"]
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        logger.warning("Missing keys when loading %s: %s", checkpoint_path, missing)
-    if unexpected:
-        logger.warning("Unexpected keys when loading %s: %s", checkpoint_path, unexpected)
+    if checkpoint_path:
+        state = torch.load(checkpoint_path, map_location="cpu")
+        if "state_dict" in state:
+            state = state["state_dict"]
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            logger.warning(
+                "Missing keys when loading %s: %s", checkpoint_path, missing
+            )
+        if unexpected:
+            logger.warning(
+                "Unexpected keys when loading %s: %s", checkpoint_path, unexpected
+            )
+    else:
+        logger.info(
+            "No base checkpoint provided; using pretrained weights from the config"
+        )
     model.to(device)
     model.eval()
     return model
@@ -181,7 +216,7 @@ def run_model(
     cfg,
     dataset,
     device: torch.device,
-    checkpoint: str,
+    checkpoint: Optional[str],
     output_dir: str,
     background_id: Optional[int],
     ignore_index: int,
