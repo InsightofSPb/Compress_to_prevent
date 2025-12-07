@@ -74,15 +74,43 @@ def parse_args():
     return parser.parse_args()
 
 
+def _get_state_dict_from_checkpoint(logger, checkpoint_path: str) -> Dict:
+    state = torch.load(checkpoint_path, map_location="cpu")
+
+    if not isinstance(state, dict):
+        logger.warning(
+            "Checkpoint %s is not a dict; attempting to load directly", checkpoint_path
+        )
+        return state
+
+    candidate_keys = [
+        "state_dict",
+        "model_state",
+        "model",
+        "model_state_dict",
+        "params",
+        "weights",
+    ]
+
+    for key in candidate_keys:
+        if key in state and isinstance(state[key], dict):
+            logger.info("Using '%s' field from checkpoint %s", key, checkpoint_path)
+            return state[key]
+
+    # Some checkpoints store the state under a nested "state" key.
+    if "state" in state and isinstance(state["state"], dict):
+        logger.info("Using 'state' field from checkpoint %s", checkpoint_path)
+        return state["state"]
+
+    return state
+
 def load_model(
     cfg, checkpoint_path: Optional[str], class_names: List[str], device: torch.device
 ):
     logger = get_logger()
     model = build_model(cfg.model, class_names=class_names)
     if checkpoint_path:
-        state = torch.load(checkpoint_path, map_location="cpu")
-        if "state_dict" in state:
-            state = state["state_dict"]
+        state = _get_state_dict_from_checkpoint(logger, checkpoint_path)
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:
             logger.warning(
