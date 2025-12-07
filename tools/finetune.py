@@ -8,8 +8,9 @@ This script keeps the original evaluation metrics while providing:
 import argparse
 import datetime
 import json
+import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import mmcv
 import torch
@@ -18,6 +19,10 @@ import torch.nn.functional as F
 from hydra import compose, initialize
 from mmseg.datasets import build_dataloader, build_dataset
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from helpers.logger import get_logger
 from models import build_model
 
@@ -25,7 +30,7 @@ from models import build_model
 class IdentityHead(nn.Module):
     """Placeholder head that leaves embeddings unchanged."""
 
-    def forward(self, feats: torch.Tensor, logits: torch.Tensor | None = None) -> torch.Tensor:  # noqa: D401
+    def forward(self, feats: torch.Tensor, logits: Optional[torch.Tensor] = None) -> torch.Tensor:  # noqa: D401
         return feats
 
 
@@ -42,7 +47,7 @@ class EmbeddingMixer(nn.Module):
         self.act = nn.GELU()
         self.proj_out = nn.Conv2d(hidden_channels, channels, kernel_size=1)
 
-    def forward(self, feats: torch.Tensor, logits: torch.Tensor | None = None) -> torch.Tensor:  # noqa: D401
+    def forward(self, feats: torch.Tensor, logits: Optional[torch.Tensor] = None) -> torch.Tensor:  # noqa: D401
         mixed = self.proj_out(self.act(self.proj_in(feats)))
         return feats + mixed
 
@@ -53,7 +58,7 @@ class FineTuneWrapper(nn.Module):
     def __init__(
         self,
         base_model: nn.Module,
-        mixers: List[nn.Module] | None = None,
+        mixers: Optional[List[nn.Module]] = None,
         mix_strategy: str = "add",
     ) -> None:
         super().__init__()
@@ -109,7 +114,7 @@ def configure_trainable_layers(model: nn.Module, depth: int) -> None:
             param.requires_grad = True
 
 
-def build_dataloaders(train_cfg: str, batch_size: int, workers: int, val_cfg: str | None = None):
+def build_dataloaders(train_cfg: str, batch_size: int, workers: int, val_cfg: Optional[str] = None):
     train_cfg = mmcv.Config.fromfile(train_cfg)
     train_dataset = build_dataset(train_cfg.data.train)
 
