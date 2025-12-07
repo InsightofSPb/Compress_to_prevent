@@ -11,6 +11,7 @@ import json
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
+from collections import deque
 
 import mmcv #type: ignore
 import torch
@@ -18,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
 from mmseg.datasets import build_dataloader, build_dataset
+from tqdm import tqdm
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
@@ -162,7 +164,7 @@ def build_dataloaders(train_cfg: str, batch_size: int, workers: int, val_cfg: Op
 
     if val_cfg:
         val_cfg_obj = mmcv.Config.fromfile(val_cfg)
-        val_dataset = build_dataset(val_cfg_obj.data.val, dict(test_mode=True))
+        val_dataset = build_dataset(val_cfg_obj.data.val, dict(test_mode=False))
 
         if len(val_dataset) == 0:
             img_dir = val_cfg_obj.data.val.get("img_dir")
@@ -205,6 +207,10 @@ def evaluate(model: nn.Module, loader) -> dict:
     for data in loader:
         imgs = data["img"].data[0].cuda()
         logits, _ = model(imgs)
+
+        target_shape = data["gt_semantic_seg"].data[0].shape[-2:]
+        logits = F.interpolate(logits, size=target_shape, mode="bilinear", align_corners=False)
+
         preds = logits.argmax(dim=1).cpu().numpy()
         results.extend(list(preds))
     metrics = loader.dataset.evaluate(results, metric="mIoU", logger=get_logger())
@@ -237,7 +243,7 @@ def parse_args():
     parser.add_argument("--train-dataset-config", required=True, help="MMCV config with training data definition")
     parser.add_argument("--val-dataset-config", help="Optional MMCV config for validation")
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--unfreeze-depth", type=int, default=2, help="How many final transformer blocks to unfreeze")
@@ -300,7 +306,9 @@ def main():
     for epoch in range(1, args.epochs + 1):
         wrapper.train()
         total_loss = 0.0
-        for step, data in enumerate(train_loader, start=1):
+        loss_window = deque(maxlen=300)
+        progress = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch")
+        for data in progress:
             imgs = data["img"].data[0].cuda()
             targets = data["gt_semantic_seg"].data[0].long().squeeze(1).cuda()
 
@@ -310,11 +318,12 @@ def main():
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * imgs.size(0)
-            if step % 10 == 0:
-                logger.info(
-                    "Epoch %d | Step %d/%d | Loss: %.4f", epoch, step, len(train_loader), loss.item()
-                )
+            loss_value = loss.item()
+            loss_window.append(loss_value)
+            avg_recent = sum(loss_window) / len(loss_window)
+
+            total_loss += loss_value * imgs.size(0)
+            progress.set_postfix(current_loss=f"{loss_value:.4f}", avg_loss=f"{avg_recent:.4f}")
 
         avg_loss = total_loss / len(train_loader.dataset)
         logger.info("Epoch %d completed. Average loss: %.4f", epoch, avg_loss)
