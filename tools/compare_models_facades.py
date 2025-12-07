@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import sys
 
 import mmcv  # type: ignore
+from matplotlib import colormaps
 import numpy as np
 import torch
 from hydra import compose, initialize_config_dir
@@ -195,17 +196,34 @@ def save_overlays(
 
 def compute_gradcam(model, image_tensor: torch.Tensor, target_class: int, device: torch.device):
     model.eval()
-    image_tensor = image_tensor.to(device)
-    image_tensor.requires_grad = True
-    dino_feats, clip_feats, clf = model(image_tensor)
-    clip_feats.retain_grad()
-    clip_preds = torch.matmul(clip_feats, clf.T)  # H x W x C
-    target_map = clip_preds[..., target_class].mean()
-    model.zero_grad()
-    target_map.backward(retain_graph=True)
-    grads = clip_feats.grad
-    weights = grads.mean(dim=(0, 1))
-    cam = torch.relu((clip_feats * weights).sum(dim=-1))
+    with torch.enable_grad():
+        image_tensor = image_tensor.to(device)
+        if not image_tensor.is_floating_point():
+            image_tensor = image_tensor.float()
+        image_tensor.requires_grad_(True)
+
+        dino_feats, clip_feats, clf = model(image_tensor)
+
+        # Ensure the feature map used for CAM supports gradient computation even if
+        # the model returns a detached tensor (e.g., from inference-mode internals).
+        clip_feats = clip_feats.detach().requires_grad_(True)
+        clip_feats.retain_grad()
+
+        clip_preds = torch.matmul(clip_feats, clf.T)  # H x W x C
+        target_map = clip_preds[..., target_class].mean()
+        model.zero_grad()
+        target_map.backward(retain_graph=True)
+        grads = clip_feats.grad
+        weights = grads.mean(dim=(0, 1))
+        cam = torch.relu((clip_feats * weights).sum(dim=-1))
+
+        # Ensure the CAM is a 2D spatial map before resizing. Some models may
+        # include an extra batch/channel dimension; collapse any leading dims
+        # while preserving height/width for interpolation.
+        while cam.dim() > 2:
+            cam = cam.squeeze(0)
+        if cam.dim() == 1:
+            cam = cam.unsqueeze(0)
     cam = cam - cam.min()
     if cam.max() > 0:
         cam = cam / cam.max()
@@ -224,13 +242,16 @@ def save_gradcams(
         data = dataset[idx]
         image_tensor = data["img"].data  # DataContainer
         image_tensor = image_tensor.unsqueeze(0) if image_tensor.ndim == 3 else image_tensor
-        img_np = mmcv.imread(dataset.img_infos[idx]["filename"])[:, :, ::-1]
+        img_info = dataset.img_infos[idx]
+        img_path = resolve_image_path(img_info, dataset, idx)
+        img_np = mmcv.imread(img_path)[:, :, ::-1]
         for class_idx, class_name in enumerate(dataset.CLASSES):
             cam = compute_gradcam(model, image_tensor, class_idx, device)
             heatmap = mmcv.imresize(cam, (img_np.shape[1], img_np.shape[0]))
             heatmap = (heatmap - heatmap.min()) / (heatmap.max() + 1e-6)
             heatmap = np.uint8(255 * heatmap)
-            heatmap = mmcv.apply_color_map(heatmap, colormap="jet")
+            cmap = colormaps.get_cmap("jet")
+            heatmap = np.uint8(255 * cmap(heatmap / 255.0)[..., :3])
             blended = (0.6 * img_np + 0.4 * heatmap).astype(np.uint8)
             out_path = os.path.join(output_root, f"sample{idx:03d}_{class_name}.png")
             mmcv.imwrite(blended[:, :, ::-1], out_path)
@@ -263,9 +284,18 @@ def run_model(
 
     gradcam_dir = os.path.join(output_dir, f"{label}_gradcam")
     save_gradcams(model, dataset, gradcam_dir, args.num_gradcam, device)
-
+    overall_miou = (
+        float(metrics["mIoU"])
+        if "mIoU" in metrics
+        else float(np.nanmean(metrics.get("IoU", [])))
+    )
+    overall_mdice = (
+        float(metrics["mDice"])
+        if "mDice" in metrics
+        else float(np.nanmean(metrics.get("Dice", [])))
+    )
     summary = {
-        "overall": {"mIoU": float(metrics["mIoU"]), "F1": float(metrics["mDice"]),},
+        "overall": {"mIoU": overall_miou, "F1": overall_mdice},
         "per_class": {
             name: {"mIoU": float(metrics["IoU"][i]), "F1": float(metrics["Dice"][i])}
             for i, name in enumerate(dataset.CLASSES)
