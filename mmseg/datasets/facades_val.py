@@ -40,7 +40,7 @@ data = dict(
             dict(type="LoadImageFromFile"),
             dict(type="LoadAnnotations"),
             dict(type="DefaultFormatBundle"),
-            dict(type="Collect", keys=["img", "gt_semantic_seg"]),
+            dict(type="Collect", keys=["img", "gt_semantic_seg"], meta_keys=("filename", "ori_filename", "ori_shape", "img_shape", "pad_shape")),
         ],
     ),
 )
