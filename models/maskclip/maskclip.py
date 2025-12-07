@@ -46,7 +46,7 @@ class MaskClip(nn.Module):
         self.backbone.visual.transformer.resblocks[-2].register_forward_hook(hook_fn_forward)
         self._positional_embd = nn.Parameter(self.backbone.visual.positional_embedding.data.clone())
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def extract_feat(self, inputs: Tensor) -> Tuple[Tensor]:
         """Extract features from images."""
         pos_embed = self.backbone.visual.positional_embedding
@@ -84,8 +84,8 @@ class MaskClip(nn.Module):
         y = y.view(B, N, 3, C // 3).permute(2, 0, 1, 3).reshape(3 * B, N, C // 3)
         y = F.linear(y, block.attn.out_proj.weight, block.attn.out_proj.bias)
         q, k, v = y.tensor_split(3, dim=0)
-        v += x
-        v += block.mlp(block.ln_2(v))
+        v = v + x
+        v = v + block.mlp(block.ln_2(v))
         return v
 
 
@@ -122,6 +122,8 @@ class MaskClip(nn.Module):
     def forward(self, inputs: Tensor, return_feat=False) -> Tensor:
         """Encode images with backbone and decode into a semantic segmentation
         map of the same size as input."""
+        if not torch.is_floating_point(inputs):
+            inputs = inputs.float() / 255.0
         inputs = self.clip_T(inputs)
         x = self.extract_feat(inputs)
         if return_feat:

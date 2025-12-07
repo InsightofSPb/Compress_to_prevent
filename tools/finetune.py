@@ -189,6 +189,11 @@ def build_dataloaders(train_cfg: str, batch_size: int, workers: int, val_cfg: Op
 def compute_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     if logits.shape[-2:] != target.shape[-2:]:
         logits = F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
+    num_classes = logits.shape[1]
+    if target.min() < 0 or target.max() >= num_classes:
+        target = target.clone()
+        invalid_mask = (target < 0) | (target >= num_classes)
+        target[invalid_mask] = 255
     log_probs = torch.log(logits.clamp(min=1e-8))
     return F.nll_loss(log_probs, target, ignore_index=255)
 
