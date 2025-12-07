@@ -118,6 +118,14 @@ def build_dataloaders(train_cfg: str, batch_size: int, workers: int, val_cfg: Op
     train_cfg = mmcv.Config.fromfile(train_cfg)
     train_dataset = build_dataset(train_cfg.data.train)
 
+    if len(train_dataset) == 0:
+        img_dir = train_cfg.data.train.get("img_dir")
+        ann_dir = train_cfg.data.train.get("ann_dir")
+        raise ValueError(
+            "Training dataset is empty. Ensure img_dir and ann_dir point to folders with files: "
+            f"img_dir={img_dir}, ann_dir={ann_dir}"
+        )
+
     train_loader = build_dataloader(
         train_dataset,
         samples_per_gpu=batch_size,
@@ -131,6 +139,15 @@ def build_dataloaders(train_cfg: str, batch_size: int, workers: int, val_cfg: Op
     if val_cfg:
         val_cfg_obj = mmcv.Config.fromfile(val_cfg)
         val_dataset = build_dataset(val_cfg_obj.data.val, dict(test_mode=True))
+
+        if len(val_dataset) == 0:
+            img_dir = val_cfg_obj.data.val.get("img_dir")
+            ann_dir = val_cfg_obj.data.val.get("ann_dir")
+            raise ValueError(
+                "Validation dataset is empty. Ensure img_dir and ann_dir point to folders with files: "
+                f"img_dir={img_dir}, ann_dir={ann_dir}"
+            )
+
         val_loader = build_dataloader(
             val_dataset,
             samples_per_gpu=1,
