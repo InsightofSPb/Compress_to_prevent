@@ -28,7 +28,7 @@ palette = [
 ]
 
 data = dict(
-    samples_per_gpu=1,
+    samples_per_gpu=4,
     workers_per_gpu=2,
     test=dict(
         type="CustomDataset",
@@ -41,12 +41,21 @@ data = dict(
         palette=palette,
         pipeline=[
             dict(type="LoadImageFromFile"),
+            dict(type="RandomFlip", prob=0.0),
             dict(type="LoadAnnotations"),
             dict(type="DefaultFormatBundle"),
             dict(
                 type="Collect",
                 keys=["img", "gt_semantic_seg"],
-                meta_keys=("filename", "ori_filename", "ori_shape", "img_shape", "pad_shape"),
+                meta_keys=(
+                    "filename",
+                    "ori_filename",
+                    "ori_shape",
+                    "img_shape",
+                    "pad_shape",
+                    "flip",
+                    "flip_direction",
+                ),
             ),
         ],
     ),

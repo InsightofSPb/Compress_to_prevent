@@ -17,6 +17,7 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 warnings.filterwarnings("ignore", category=FutureWarning, module="timm")
+warnings.filterwarnings("ignore", category=UserWarning, module="scipy")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -147,6 +148,32 @@ def overlay_mask(
     overlay[valid] = (0.6 * overlay[valid] + 0.4 * color_mask[valid]).astype(np.uint8)
     return overlay
 
+def resolve_image_path(img_info, dataset, idx: int) -> str:
+    img_path = img_info.get("filename") or img_info.get("img_path")
+
+    # Some dataset entries may only store the image basename; resolve it against
+    # known dataset roots to ensure the file can be read.
+    if img_path and not os.path.isabs(img_path):
+        candidate = os.path.join(dataset.img_dir, os.path.basename(img_path))
+        if os.path.exists(candidate):
+            img_path = candidate
+        else:
+            ori_name = img_info.get("ori_filename")
+            if ori_name:
+                alt = os.path.join(dataset.img_dir, os.path.basename(ori_name))
+                if os.path.exists(alt):
+                    img_path = alt
+    if img_path is None:
+        img_suffix = img_info.get("img_suffix")
+        if img_suffix:
+            img_path = os.path.join(dataset.img_dir, img_suffix)
+
+    if not img_path or not os.path.exists(img_path):
+        raise FileNotFoundError(
+            f"Image not found for index {idx}: {img_path}. Checked dataset img_dir={dataset.img_dir}"
+        )
+    return img_path
+
 
 def save_overlays(
     dataset, predictions: List[np.ndarray], output_root: str, background_id: Optional[int], ignore_index: int
@@ -154,9 +181,7 @@ def save_overlays(
     os.makedirs(output_root, exist_ok=True)
     for idx, pred in enumerate(predictions):
         img_info = dataset.img_infos[idx]
-        img_path = img_info.get("filename", img_info.get("img_path"))
-        if img_path is None:
-            img_path = os.path.join(dataset.img_dir, img_info["img_suffix"])
+        img_path = resolve_image_path(img_info, dataset, idx)
         image = mmcv.imread(img_path)
         gt = dataset.get_gt_seg_map_by_idx(idx).astype(np.int64)
 
