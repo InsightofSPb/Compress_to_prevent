@@ -225,6 +225,46 @@ def compute_class_weights(loader, num_classes: int, ignore_index: int = 255) -> 
     return weights.float()
 
 
+def validate_class_coverage(
+    train_dataset, val_dataset, num_classes: int, logger
+) -> None:
+    """Validate that all stages see the same class layout, including background."""
+
+    train_classes = list(getattr(train_dataset, "CLASSES", []))
+    if len(train_classes) != num_classes:
+        raise ValueError(
+            f"Train dataset reports {len(train_classes)} classes,"
+            f" but {num_classes} were inferred."
+        )
+
+    if val_dataset is not None:
+        val_classes = list(getattr(val_dataset, "CLASSES", []))
+        if train_classes != val_classes:
+            raise ValueError(
+                "Train/val class lists differ; all classes (including background) must match."
+            )
+
+        val_ignore = getattr(val_dataset, "ignore_index", 255)
+        train_ignore = getattr(train_dataset, "ignore_index", 255)
+        if val_ignore != train_ignore:
+            logger.warning(
+                "Train ignore_index=%s but val ignore_index=%s; ensure background/ignored pixels align.",
+                train_ignore,
+                val_ignore,
+            )
+
+
+def log_parameter_counts(model: nn.Module, logger) -> None:
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(
+        "Model parameters: total=%d, trainable=%d, frozen=%d",
+        total_params,
+        trainable_params,
+        total_params - trainable_params,
+    )
+
+
 # ============================================================
 #                       EVALUATION
 # ============================================================
@@ -387,6 +427,8 @@ def main():
     class_names = train_loader.dataset.CLASSES
     num_classes = len(class_names)
 
+    validate_class_coverage(train_loader.dataset, val_loader.dataset if val_loader else None, num_classes, logger)
+
     # Здесь уже можно увидеть, "особенный" ли класс 0:
     logger.info("Class names (index -> name): %s", {i: n for i, n in enumerate(class_names)})
 
@@ -405,6 +447,8 @@ def main():
     wrapper = FineTuneWrapper(
         base_model, mixers=mixers, mix_strategy=args.mix_strategy
     ).cuda()
+
+    log_parameter_counts(wrapper, logger)
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, wrapper.parameters()),
