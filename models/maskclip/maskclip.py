@@ -124,6 +124,8 @@ class MaskClip(nn.Module):
         map of the same size as input."""
         if not torch.is_floating_point(inputs):
             inputs = inputs.float() / 255.0
+        if inputs.dim() == 4 and inputs.shape[1] == 1:
+            inputs = inputs.repeat(1, 3, 1, 1)
         inputs = self.clip_T(inputs)
         x = self.extract_feat(inputs)
         if return_feat:
