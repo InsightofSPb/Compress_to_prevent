@@ -345,13 +345,20 @@ def save_val_visualizations(epoch, model, val_loader, out_dir):
         gt = dataset.get_gt_seg_map_by_idx(idx)
 
         img_tensor = data["img"].data[0]
+        if img_tensor.dim() == 2:
+            img_tensor = img_tensor.unsqueeze(0)
         if img_tensor.dim() == 3 and img_tensor.size(0) == 1:
             img_tensor = img_tensor.expand(3, -1, -1)
 
         logits, _ = model(img_tensor.unsqueeze(0).cuda())
+        target_size = img.shape[:2]
+        logits = F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
+
         pred = logits.argmax(dim=1).squeeze(0).cpu().numpy()
 
-        gt_overlay = overlay_mask(img, gt, palette)
+        gt_resized = mmcv.imresize(gt.astype(np.uint8), target_size[::-1], interpolation="nearest")
+
+        gt_overlay = overlay_mask(img, gt_resized, palette)
         pred_overlay = overlay_mask(img, pred, palette)
 
         canvas = np.concatenate([img, gt_overlay, pred_overlay], axis=1)
