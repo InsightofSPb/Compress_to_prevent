@@ -30,10 +30,10 @@ def parse_args() -> argparse.Namespace:
         "--train-ratio", type=float, default=0.8, help="Portion of samples for the train split."
     )
     parser.add_argument(
-        "--val-ratio", type=float, default=0.1, help="Portion of samples for the validation split."
+        "--val-ratio", type=float, default=0.05, help="Portion of samples for the validation split."
     )
     parser.add_argument(
-        "--test-ratio", type=float, default=0.1, help="Portion of samples for the test split."
+        "--test-ratio", type=float, default=0.15, help="Portion of samples for the test split."
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for shuffling before the split."
