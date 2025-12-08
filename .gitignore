@@ -179,3 +179,4 @@ wandb/*
 datasets/SPb_facades/*
 data/*
 outputs/*
+*.txt

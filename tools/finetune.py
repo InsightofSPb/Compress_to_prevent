@@ -344,7 +344,11 @@ def save_val_visualizations(epoch, model, val_loader, out_dir):
         img = mmcv.imread(img_path)
         gt = dataset.get_gt_seg_map_by_idx(idx)
 
-        logits, _ = model(data["img"].data[0].unsqueeze(0).cuda())
+        img_tensor = data["img"].data[0]
+        if img_tensor.dim() == 3 and img_tensor.size(0) == 1:
+            img_tensor = img_tensor.expand(3, -1, -1)
+
+        logits, _ = model(img_tensor.unsqueeze(0).cuda())
         pred = logits.argmax(dim=1).squeeze(0).cpu().numpy()
 
         gt_overlay = overlay_mask(img, gt, palette)
