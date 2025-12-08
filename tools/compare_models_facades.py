@@ -113,6 +113,44 @@ def _get_state_dict_from_checkpoint(logger, checkpoint_path: str) -> Dict:
 
     return state
 
+def to_label_map(pred) -> np.ndarray:
+    """Convert model outputs (logits/probs/labels) to integer label maps."""
+
+    # Unwrap common container types from mmcv/mmseg outputs
+    if isinstance(pred, (list, tuple)) and len(pred) == 1:
+        pred = pred[0]
+
+    # Move tensors to CPU for numpy handling
+    if isinstance(pred, torch.Tensor):
+        pred_arr = pred.detach().cpu().numpy()
+    else:
+        pred_arr = np.asarray(pred)
+
+    print("RAW pred:", type(pred), pred_arr.shape, pred_arr.dtype)
+
+    # Remove batch dimension if present
+    if pred_arr.ndim == 4 and pred_arr.shape[0] == 1:
+        pred_arr = pred_arr.squeeze(0)
+
+    # Если это scores → argmax
+    if pred_arr.ndim == 3:
+        if pred_arr.shape[0] == len(dataset.CLASSES):   # C x H x W
+            pred_arr = pred_arr.argmax(axis=0)
+        elif pred_arr.shape[-1] == len(dataset.CLASSES):  # H x W x C
+            pred_arr = pred_arr.argmax(axis=-1)
+
+    # ❗ ЖЁСТКАЯ ГАРАНТИЯ: на выходе всегда int labels
+    if pred_arr.dtype != np.int64:
+        print("⚠️ Forcing argmax because dtype is", pred_arr.dtype)
+        pred_arr = pred_arr.argmax(axis=0)
+
+    pred_arr = pred_arr.astype(np.int64)
+
+    unique, counts = np.unique(pred_arr, return_counts=True)
+    print("FINAL labels:", dict(zip(unique.tolist(), counts.tolist())))
+
+    return pred_arr
+
 def load_model(
     cfg, checkpoint_path: Optional[str], class_names: List[str], device: torch.device
 ):
@@ -122,19 +160,23 @@ def load_model(
     if checkpoint_path:
         state = _get_state_dict_from_checkpoint(logger, checkpoint_path)
 
-        # ✅ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: убираем base_model.
+        # ✅ Убираем base_model.
         state = strip_prefix(state, prefix="base_model.")
 
         missing, unexpected = model.load_state_dict(state, strict=False)
 
-        if missing:
-            logger.warning(
-                "Missing keys when loading %s: %s", checkpoint_path, missing
+        print("\n=== CHECKPOINT LOAD DEBUG ===")
+        print("Checkpoint:", checkpoint_path)
+        print("Missing keys:", missing)
+        print("Unexpected keys:", unexpected)
+        print("=============================\n")
+
+        # ❗ КРИТИЧНО: если что-то не совпало — сразу падаем
+        if len(missing) > 0 or len(unexpected) > 0:
+            raise RuntimeError(
+                f"Checkpoint load error!\nMissing: {missing}\nUnexpected: {unexpected}"
             )
-        if unexpected:
-            logger.warning(
-                "Unexpected keys when loading %s: %s", checkpoint_path, unexpected
-            )
+
     else:
         logger.info(
             "No base checkpoint provided; using pretrained weights from the config"
@@ -183,13 +225,19 @@ def overlay_mask(
 ):
     overlay = image.copy()
     color_mask = np.zeros_like(image)
+
+    unique = np.unique(mask)
+    print("Overlay mask unique values:", unique)
+
     for idx, color in enumerate(palette):
         if idx == background_id:
             continue
         color_mask[mask == idx] = color
+
     valid = mask != ignore_index
     if background_id is not None:
         valid &= mask != background_id
+
     overlay[valid] = (0.6 * overlay[valid] + 0.4 * color_mask[valid]).astype(np.uint8)
     return overlay
 
@@ -313,21 +361,66 @@ def run_model(
 ):
     logger = get_logger()
     logger.info("Running evaluation for %s model", label)
+
+    print("\n==============================")
+    print("MODEL:", label)
+    print("Background ID:", background_id)
+    print("Ignore index:", ignore_index)
+    print("Classes:", dataset.CLASSES)
+    print("Num classes:", len(dataset.CLASSES))
+    print("Palette size:", len(dataset.PALETTE))
+    print("==============================\n")
+
     model = load_model(cfg, checkpoint, dataset.CLASSES, device)
 
     seg_model = build_seg_inference(model, dataset, cfg, args.dataset_config)
     seg_model = seg_model.to(device)
     data_loader = build_seg_dataloader(dataset, dist=False)
+
     predictions = single_gpu_test(seg_model, data_loader, pre_eval=False)
 
-    metrics = evaluate_predictions(dataset, predictions)
+    def to_label_map(pred) -> np.ndarray:
+        if isinstance(pred, (list, tuple)) and len(pred) == 1:
+            pred = pred[0]
+
+        if isinstance(pred, torch.Tensor):
+            pred_arr = pred.detach().cpu().numpy()
+        else:
+            pred_arr = np.asarray(pred)
+
+        print("RAW pred:", pred_arr.shape, pred_arr.dtype)
+
+        if pred_arr.ndim == 4 and pred_arr.shape[0] == 1:
+            pred_arr = pred_arr.squeeze(0)
+
+        if pred_arr.ndim == 3:
+            if pred_arr.shape[0] == len(dataset.CLASSES):
+                pred_arr = pred_arr.argmax(axis=0)
+            elif pred_arr.shape[-1] == len(dataset.CLASSES):
+                pred_arr = pred_arr.argmax(axis=-1)
+
+        if pred_arr.dtype != np.int64:
+            print("⚠️ Forcing argmax because dtype is", pred_arr.dtype)
+            pred_arr = pred_arr.argmax(axis=0)
+
+        pred_arr = pred_arr.astype(np.int64)
+
+        unique, counts = np.unique(pred_arr, return_counts=True)
+        print("FINAL labels:", dict(zip(unique.tolist(), counts.tolist())))
+
+        return pred_arr
+
+    label_maps = [to_label_map(pred) for pred in predictions]
+
+    metrics = evaluate_predictions(dataset, label_maps)
     grouped = group_metrics(metrics, list(dataset.CLASSES))
 
     overlay_dir = os.path.join(output_dir, f"{label}_overlays")
-    save_overlays(dataset, predictions, overlay_dir, background_id, ignore_index)
+    save_overlays(dataset, label_maps, overlay_dir, background_id, ignore_index)
 
     gradcam_dir = os.path.join(output_dir, f"{label}_gradcam")
     save_gradcams(model, dataset, gradcam_dir, args.num_gradcam, device)
+
     overall_miou = (
         float(metrics["mIoU"])
         if "mIoU" in metrics
@@ -338,6 +431,7 @@ def run_model(
         if "mDice" in metrics
         else float(np.nanmean(metrics.get("Dice", [])))
     )
+
     summary = {
         "overall": {"mIoU": overall_miou, "F1": overall_mdice},
         "per_class": {
@@ -346,6 +440,7 @@ def run_model(
         },
         "groups": grouped,
     }
+
     return summary
 
 

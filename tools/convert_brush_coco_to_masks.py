@@ -41,6 +41,7 @@ LOGGER = logging.getLogger("convert_coco")
 
 # Label Studio palette used by the user (name -> (id, rgb))
 LABELS = [
+    ("BACKGROUND", 0, (0x00, 0x00, 0x00)),
     ("CRACK", 1, (0xE5, 0x39, 0x35)),
     ("SPALLING", 2, (0x1E, 0x88, 0xE5)),
     ("DELAMINATION", 3, (0x43, 0xA0, 0x47)),

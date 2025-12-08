@@ -1,4 +1,5 @@
 classes = (
+    "BACKGROUND",
     "CRACK",
     "SPALLING",
     "DELAMINATION",
@@ -12,6 +13,7 @@ classes = (
 )
 
 palette = [
+    [0, 0, 0],
     [229, 57, 53],
     [30, 136, 229],
     [67, 160, 71],
