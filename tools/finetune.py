@@ -33,6 +33,12 @@ from helpers.logger import get_logger
 from models import build_model
 
 
+# ===================== Metric groups =====================
+STRUCTURAL_DAMAGE = {"CRACK", "SPALLING", "DELAMINATION", "MISSING_ELEMENT"}
+SURFACE_STAIN = {"WATER_STAIN", "EFFLORESCENCE", "CORROSION"}
+HUMAN_ACTIVITY = {"TEXT_OR_IMAGES", "REPAIRS"}
+
+
 # ============================================================
 #                       MODEL WRAPPERS
 # ============================================================
@@ -269,27 +275,127 @@ def log_parameter_counts(model: nn.Module, logger) -> None:
 #                       EVALUATION
 # ============================================================
 
+def _accumulate_confusion(confusion: torch.Tensor, preds: torch.Tensor, targets: torch.Tensor, num_classes: int, ignore_index: int) -> torch.Tensor:
+    with torch.no_grad():
+        preds = preds.view(-1)
+        targets = targets.view(-1)
+
+        valid_mask = targets != ignore_index
+        preds = preds[valid_mask]
+        targets = targets[valid_mask]
+
+        if preds.numel() == 0:
+            return confusion
+
+        combined = targets * num_classes + preds
+        hist = torch.bincount(combined, minlength=num_classes * num_classes)
+        confusion = confusion + hist.view(num_classes, num_classes)
+    return confusion
+
+
+def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result = np.true_divide(numerator, denominator)
+        result[~np.isfinite(result)] = 0.0
+    return result
+
+
+def _compute_group_metrics(confusion: np.ndarray, group_indices: List[int]) -> dict:
+    tp = confusion[group_indices, :][:, group_indices].sum()
+    fp = confusion[:, group_indices].sum() - tp
+    fn = confusion[group_indices, :].sum() - tp
+    iou = _safe_divide(tp, tp + fp + fn)
+    f1 = _safe_divide(2 * tp, 2 * tp + fp + fn)
+    acc = _safe_divide(tp, tp + fn)
+    return {"iou": float(iou), "f1": float(f1), "accuracy": float(acc)}
+
+
+def _compute_metrics_from_confusion(confusion: torch.Tensor, class_names: List[str]) -> dict:
+    confusion_np = confusion.cpu().numpy()
+    true_positives = np.diag(confusion_np)
+    false_positives = confusion_np.sum(axis=0) - true_positives
+    false_negatives = confusion_np.sum(axis=1) - true_positives
+
+    class_iou = _safe_divide(true_positives, true_positives + false_positives + false_negatives)
+    class_f1 = _safe_divide(2 * true_positives, 2 * true_positives + false_positives + false_negatives)
+    class_acc = _safe_divide(true_positives, true_positives + false_negatives)
+
+    class_metrics = {}
+    for idx, name in enumerate(class_names):
+        class_metrics[name] = {
+            "iou": float(class_iou[idx]),
+            "f1": float(class_f1[idx]),
+            "accuracy": float(class_acc[idx]),
+        }
+
+    miou = float(np.nanmean(class_iou))
+    mf1 = float(np.nanmean(class_f1))
+    macc = float(np.nanmean(class_acc))
+
+    name_to_idx = {name: idx for idx, name in enumerate(class_names)}
+    group_indices = {
+        "STRUCTURAL_DAMAGE": [name_to_idx[c] for c in STRUCTURAL_DAMAGE if c in name_to_idx],
+        "SURFACE_STAIN": [name_to_idx[c] for c in SURFACE_STAIN if c in name_to_idx],
+        "HUMAN_ACTIVITY": [name_to_idx[c] for c in HUMAN_ACTIVITY if c in name_to_idx],
+    }
+
+    group_metrics = {}
+    for group_name, indices in group_indices.items():
+        if not indices:
+            continue
+        group_metrics[group_name] = _compute_group_metrics(confusion_np, indices)
+
+    combined_indices = sorted({idx for indices in group_indices.values() for idx in indices})
+    if combined_indices:
+        group_metrics["COMBINED_GROUPS"] = _compute_group_metrics(confusion_np, combined_indices)
+
+    return {
+        "mIoU": miou,
+        "mF1": mf1,
+        "mAcc": macc,
+        "class_metrics": class_metrics,
+        "group_metrics": group_metrics,
+    }
+
+
 @torch.no_grad()
-def evaluate(model: nn.Module, loader) -> dict:
+def evaluate(
+    model: nn.Module,
+    loader,
+    class_names: List[str],
+    class_weights: Optional[torch.Tensor],
+    ignore_index: int,
+) -> Tuple[dict, float]:
     model.eval()
+    num_classes = len(class_names)
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64)
+    total_loss = 0.0
+
     results = []
     for data in loader:
         imgs = data["img"].data[0].cuda()
+        targets = data["gt_semantic_seg"].data[0].long().squeeze(1).cuda()
+
         logits, _ = model(imgs)
 
-        target_shape = data["gt_semantic_seg"].data[0].shape[-2:]
+        target_shape = targets.shape[-2:]
         logits = F.interpolate(logits, size=target_shape, mode="bilinear", align_corners=False)
 
-        preds = logits.argmax(dim=1).cpu().numpy()
-        results.extend(list(preds))
+        loss = compute_loss(logits, targets, class_weights, ignore_index=ignore_index)
+        total_loss += loss.item() * imgs.size(0)
 
-    metrics = loader.dataset.evaluate(results, metric="mIoU", logger=get_logger())
+        preds = logits.argmax(dim=1)
+        confusion = _accumulate_confusion(confusion, preds, targets, num_classes, ignore_index)
+        results.extend(list(preds.cpu().numpy()))
 
-    # Жёсткая проверка коллапса на первом примере
-    u, c = np.unique(results[0], return_counts=True)
-    print("[VAL DEBUG] First sample class dist:", dict(zip(u.tolist(), c.tolist())))
+    metrics = _compute_metrics_from_confusion(confusion, class_names)
+    val_loss = total_loss / len(loader.dataset)
 
-    return metrics
+    if results:
+        u, c = np.unique(results[0], return_counts=True)
+        print("[VAL DEBUG] First sample class dist:", dict(zip(u.tolist(), c.tolist())))
+
+    return metrics, val_loss
 
 
 # ============================================================
@@ -467,6 +573,7 @@ def main():
     )
 
     best_checkpoints: List[Tuple[float, Path]] = []
+    metrics_log_path = run_dir / "metrics.jsonl"
 
     for epoch in range(1, args.epochs + 1):
         wrapper.train()
@@ -498,9 +605,27 @@ def main():
         avg_loss = total_loss / len(train_loader.dataset)
         logger.info("Epoch %d avg loss: %.4f", epoch, avg_loss)
 
+        epoch_record = {
+            "epoch": epoch,
+            "train_loss": avg_loss,
+        }
+
         metrics = {}
         if val_loader:
-            metrics = evaluate(wrapper, val_loader)
+            metrics, val_loss = evaluate(
+                wrapper, val_loader, class_names, class_weights, ignore_index
+            )
+            epoch_record.update({
+                "val_loss": val_loss,
+                "metrics": metrics,
+            })
+            logger.info(
+                "Validation — mIoU: %.4f | mF1: %.4f | mAcc: %.4f | loss: %.4f",
+                metrics.get("mIoU", 0.0),
+                metrics.get("mF1", 0.0),
+                metrics.get("mAcc", 0.0),
+                val_loss,
+            )
 
             viz_dir = run_dir / "val_viz" / f"epoch_{epoch:03d}"
             save_val_visualizations(epoch, wrapper, val_loader, viz_dir)
@@ -508,6 +633,9 @@ def main():
         best_checkpoints = save_checkpoint(
             wrapper, optimizer, run_dir, epoch, metrics, avg_loss, best_checkpoints
         )
+
+        with metrics_log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(epoch_record, ensure_ascii=False) + "\n")
 
     logger.info("Training finished")
 
