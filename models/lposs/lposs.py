@@ -12,7 +12,18 @@ DINO_NORMALIZE = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
 @MODELS.register_module()
 class LPOSS(nn.Module):
-    def __init__(self, clip_backbone, class_names, vit_arch="vit_base", vit_patch_size=16, enc_type_feats="k"):
+    def __init__(
+        self,
+        clip_backbone,
+        class_names,
+        vit_arch="vit_base",
+        vit_patch_size=16,
+        enc_type_feats="k",
+        dino_repo=None,
+        dino_model=None,
+        dino_weights=None,
+        dino_source="github",
+    ):
         super(LPOSS, self).__init__()
 
         # ==== build MaskCLIP backbone =====
@@ -26,17 +37,36 @@ class LPOSS(nn.Module):
         self.dino_arch = vit_arch
         self.enc_type_feats = enc_type_feats
         self.dino_patch_size = vit_patch_size
-        if self.dino_arch == "vit_base":
-            self.dino_encoder = torch.hub.load('facebookresearch/dino:main', f'dino_vitb{self.dino_patch_size}')
+        self.dino_repo = dino_repo or "facebookresearch/dino:main"
+        self.dino_model = dino_model
+        self.dino_weights = dino_weights
+        self.dino_source = dino_source
+
+        load_kwargs = {}
+        if self.dino_weights:
+            load_kwargs["weights"] = self.dino_weights
+        if self.dino_source:
+            load_kwargs["source"] = self.dino_source
+
+        if self.dino_model:
+            self.dino_encoder = torch.hub.load(self.dino_repo, self.dino_model, **load_kwargs)
+        elif self.dino_arch == "vit_base":
+            self.dino_encoder = torch.hub.load(
+                self.dino_repo, f"dino_vitb{self.dino_patch_size}", **load_kwargs
+            )
         elif self.dino_arch == "vit_small":
-            self.dino_encoder = torch.hub.load('facebookresearch/dino:main', f'dino_vits{self.dino_patch_size}')
+            self.dino_encoder = torch.hub.load(
+                self.dino_repo, f"dino_vits{self.dino_patch_size}", **load_kwargs
+            )
         self.hook_features = {}
         def hook_fn_forward_qkv(module, input, output):
             self.hook_features["qkv"] = output
 
-        self.dino_encoder._modules["blocks"][-1]._modules["attn"]._modules[
-            "qkv"
-        ].register_forward_hook(hook_fn_forward_qkv)
+        attn = self.dino_encoder.blocks[-1].attn
+        qkv_layer = getattr(attn, "qkv", None)
+        if qkv_layer is None:
+            raise ValueError("Cannot locate qkv projection on the last attention block of the DINO encoder.")
+        qkv_layer.register_forward_hook(hook_fn_forward_qkv)
 
 
     def make_input_divisible(self, x: torch.Tensor, patch_size) -> torch.Tensor:

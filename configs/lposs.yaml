@@ -10,6 +10,11 @@ model:
   vit_arch: vit_base
   vit_patch_size: 16
   enc_type_feats: "v"
+  # Optional overrides to load DINOv3 (e.g., dinov3_vitb16) from a local clone via torch.hub
+  dino_repo: null          # set to the repo/dir passed to torch.hub.load, e.g., /path/to/dinov3
+  dino_model: null         # e.g., dinov3_vitb16
+  dino_weights: null       # checkpoint URL or local path
+  dino_source: github      # set to "local" when dino_repo points to a local clone
 alpha: 0.95
 gamma: 3.0
 k: 400
