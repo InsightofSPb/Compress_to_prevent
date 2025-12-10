@@ -7,6 +7,7 @@ import datetime
 import json
 import sys
 import os
+import cv2
 import random
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -294,9 +295,10 @@ def _accumulate_confusion(confusion: torch.Tensor, preds: torch.Tensor, targets:
 
 
 def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    num = np.asarray(numerator, dtype=np.float64)
+    den = np.asarray(denominator, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
-        result = np.true_divide(numerator, denominator)
-        result[~np.isfinite(result)] = 0.0
+        result = np.divide(num, den, out=np.zeros_like(num, dtype=np.float64), where=den != 0)
     return result
 
 
@@ -368,7 +370,8 @@ def evaluate(
 ) -> Tuple[dict, float]:
     model.eval()
     num_classes = len(class_names)
-    confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64)
+    device = next(model.parameters()).device
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
     total_loss = 0.0
 
     results = []
@@ -415,7 +418,6 @@ def overlay_mask(image, mask, palette, ignore_index=255):
 
 
 def draw_legend(img, classes, palette):
-    import cv2
     y = 20
     for i, name in enumerate(classes):
         color = palette[i]
@@ -508,8 +510,8 @@ def parse_args():
     parser.add_argument("config")
     parser.add_argument("--train-dataset-config", required=True)
     parser.add_argument("--val-dataset-config")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--unfreeze-depth", type=int, default=2)
