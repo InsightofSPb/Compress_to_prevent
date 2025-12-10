@@ -85,6 +85,28 @@ LPOSS+:
 torchrun main_eval.py lposs_plus.yaml --dataset {voc, coco_object, context, context59, coco_stuff, voc20, ade20k, cityscapes} [--measure_boundary]
 ```
 
+### Using DINOv3 backbones
+
+To swap the DINO encoder for a DINOv3 checkpoint with a similar parameter scale (e.g., `dinov3_vitb16` instead of `dino_vitb16`):
+
+1. Clone the [DINOv3 repository](https://github.com/facebookresearch/dinov3) locally.
+2. Download the desired checkpoint (e.g., `dinov3_vitb16_pretrain.pth` from the release page).
+3. In your config (`lposs.yaml`, `lposs_plus.yaml`, or `facades_raw.yaml`), override the model block:
+
+```yaml
+model:
+  dino_repo: /path/to/local/dinov3       # path to the local clone or hub repo string
+  dino_model: dinov3_vitb16              # stay in the same weight range as dino_vitb16
+  dino_weights: /path/to/dinov3_vitb16_pretrain.pth
+  dino_source: local                     # "github" if you want torch.hub to fetch from the repo URL
+```
+
+If you only set `dino_model: dinov3_*` and leave `dino_repo` unset, LPOSS will automatically point torch.hub to the official
+`facebookresearch/dinov3:main` entry and print the chosen repo/model when the backbone is loaded, so you can verify in the
+log that DINOv3 is being used.
+
+If you leave these fields as `null`, the original DINO v1 checkpoints are used automatically.
+
 ## Citation
 
 ```
