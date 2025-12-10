@@ -37,10 +37,17 @@ class LPOSS(nn.Module):
         self.dino_arch = vit_arch
         self.enc_type_feats = enc_type_feats
         self.dino_patch_size = vit_patch_size
-        self.dino_repo = dino_repo or "facebookresearch/dino:main"
         self.dino_model = dino_model
+        self.dino_repo = dino_repo
         self.dino_weights = dino_weights
         self.dino_source = dino_source
+
+        # If a DINOv3 model is requested but the repo is not set explicitly, default to the
+        # official DINOv3 torch.hub entry. Otherwise fall back to the original DINO repo.
+        if self.dino_repo is None and self.dino_model and self.dino_model.startswith("dinov3_"):
+            self.dino_repo = "facebookresearch/dinov3:main"
+        if self.dino_repo is None:
+            self.dino_repo = "facebookresearch/dino:main"
 
         load_kwargs = {}
         if self.dino_weights:
@@ -49,12 +56,19 @@ class LPOSS(nn.Module):
             load_kwargs["source"] = self.dino_source
 
         if self.dino_model:
+            print(f"Loading DINO backbone {self.dino_model} from {self.dino_repo} via torch.hub ({self.dino_source}).")
             self.dino_encoder = torch.hub.load(self.dino_repo, self.dino_model, **load_kwargs)
         elif self.dino_arch == "vit_base":
+            print(
+                f"Loading default DINO backbone dino_vitb{self.dino_patch_size} from {self.dino_repo} via torch.hub ({self.dino_source})."
+            )
             self.dino_encoder = torch.hub.load(
                 self.dino_repo, f"dino_vitb{self.dino_patch_size}", **load_kwargs
             )
         elif self.dino_arch == "vit_small":
+            print(
+                f"Loading default DINO backbone dino_vits{self.dino_patch_size} from {self.dino_repo} via torch.hub ({self.dino_source})."
+            )
             self.dino_encoder = torch.hub.load(
                 self.dino_repo, f"dino_vits{self.dino_patch_size}", **load_kwargs
             )

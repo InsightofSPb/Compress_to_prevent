@@ -101,6 +101,10 @@ model:
   dino_source: local                     # "github" if you want torch.hub to fetch from the repo URL
 ```
 
+If you only set `dino_model: dinov3_*` and leave `dino_repo` unset, LPOSS will automatically point torch.hub to the official
+`facebookresearch/dinov3:main` entry and print the chosen repo/model when the backbone is loaded, so you can verify in the
+log that DINOv3 is being used.
+
 If you leave these fields as `null`, the original DINO v1 checkpoints are used automatically.
 
 ## Citation
