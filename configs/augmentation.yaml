@@ -10,6 +10,7 @@ tiling:
   stride_h: 224
   stride_w: 224
   pad_mode: constant
+  min_content_ratio: 0.6
 
 paths:
   images: /home/sasha/LPOSS/datasets/SPb_facades/raw_images

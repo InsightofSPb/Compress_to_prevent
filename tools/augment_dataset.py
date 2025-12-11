@@ -61,11 +61,19 @@ def generate_tiles(
     stride_h: int,
     stride_w: int,
     pad_mode: str = "reflect",
+    min_content_ratio: float = 0.0,
 ):
     tile_idx = 0
     h, w = image.shape[:2]
     for y in range(0, h, stride_h):
         for x in range(0, w, stride_w):
+            content_h = min(tile_h, h - y)
+            content_w = min(tile_w, w - x)
+            total_area = tile_h * tile_w
+            if total_area > 0:
+                content_ratio = (content_h * content_w) / total_area
+                if content_ratio < min_content_ratio:
+                    continue
             img_tile = image[y : y + tile_h, x : x + tile_w]
             mask_tile = mask[y : y + tile_h, x : x + tile_w]
             img_tile = pad_tile(img_tile, tile_h, tile_w, is_mask=False, pad_mode=pad_mode)
@@ -314,6 +322,7 @@ def augment_dataset(config: Dict) -> None:
     stride_h = tiling_cfg.get("stride_h", tile_h)
     stride_w = tiling_cfg.get("stride_w", tile_w)
     pad_mode = tiling_cfg.get("pad_mode", "reflect")
+    min_content_ratio = tiling_cfg.get("min_content_ratio", 0.0)
 
     seed = config.get("seed", 42)
     random.seed(seed)
@@ -341,7 +350,16 @@ def augment_dataset(config: Dict) -> None:
 
         if tile_enabled and tile_h is not None and tile_w is not None:
             tiles = list(
-                generate_tiles(image, mask, tile_h, tile_w, stride_h, stride_w, pad_mode)
+                generate_tiles(
+                    image,
+                    mask,
+                    tile_h,
+                    tile_w,
+                    stride_h,
+                    stride_w,
+                    pad_mode,
+                    min_content_ratio,
+                )
             )
         else:
             tiles = [(None, image, mask)]
