@@ -55,14 +55,12 @@ def load_manifest(manifest_path: Path) -> pd.DataFrame:
         missing = ", ".join(sorted(required_columns - set(df.columns)))
         raise ValueError(f"Manifest missing required columns: {missing}")
 
-    if "image_path" in df.columns:
-        path_column = "image_path"
-    elif "full_path" in df.columns:
-        path_column = "full_path"
+    if "mask_path" in df.columns:
+        path_column = "mask_path"
     else:
         raise ValueError("Manifest must include either 'image_path' or 'full_path' column")
 
-    df = df.rename(columns={path_column: "image_path"})
+    df = df.rename(columns={path_column: "mask_path"})
     return df
 
 
@@ -140,10 +138,15 @@ def build_objects(labels: np.ndarray, facade_id: str, year: int, gray_image: np.
     return df
 
 
+from skimage.util import img_as_ubyte
+
 def save_outputs(base_dir: Path, year: int, labels: np.ndarray, objects: pd.DataFrame, overlay: np.ndarray):
     np.savez_compressed(base_dir / "spx" / f"{year}_labels.npz", labels=labels.astype(np.int32))
     objects.to_parquet(base_dir / "objs" / f"{year}_spx.parquet", index=False)
-    io.imsave(base_dir / "viz" / f"{year}_spx_overlay.png", overlay)
+
+    overlay_u8 = img_as_ubyte(overlay)  # float[0..1] -> uint8[0..255]
+    io.imsave(base_dir / "viz" / f"{year}_spx_overlay.png", overlay_u8, check_contrast=False)
+
 
 
 def log_quality(labels: np.ndarray, areas: pd.Series):
@@ -156,7 +159,7 @@ def log_quality(labels: np.ndarray, areas: pd.Series):
 
 
 def process_row(row: pd.Series, out_dir: Path):
-    image_path = Path(row["image_path"])
+    image_path = Path(row["mask_path"])
     if not image_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
