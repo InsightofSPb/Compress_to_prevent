@@ -5,24 +5,94 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import sys
+import types
+import warnings
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import mmcv  # type: ignore
 from matplotlib import colormaps
 import numpy as np
 import torch
+import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
+
+
+def _install_mmcv_ops_stub() -> None:
+    """Provide a minimal mmcv.ops fallback when compiled ops are missing.
+
+    When ``mmcv`` is installed without C++/CUDA extensions, importing
+    ``mmcv.ops`` raises ``ModuleNotFoundError: mmcv._ext``. For inference-only
+    workflows, we can supply lightweight Python implementations of the small
+    subset of ops that MMSegmentation imports. This stub keeps the import from
+    crashing while avoiding heavyweight builds of ``mmcv-full``.
+    """
+
+    try:
+        import mmcv.ops  # type: ignore  # noqa: F401
+        return
+    except ModuleNotFoundError as exc:
+        if exc.name != "mmcv._ext":
+            raise
+
+    ops_stub = types.ModuleType("mmcv.ops")
+
+    def _sigmoid_focal_loss(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        gamma: float = 2.0,
+        alpha: float = 0.5,
+        weight: Optional[torch.Tensor] = None,
+        reduction: str = "mean",
+    ) -> torch.Tensor:
+        pred_sigmoid = torch.sigmoid(pred)
+        target = target.type_as(pred)
+        ce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+        p_t = pred_sigmoid * target + (1 - pred_sigmoid) * (1 - target)
+        loss = ce_loss * torch.pow(1 - p_t, gamma)
+
+        if alpha >= 0:
+            alpha_t = alpha * target + (1 - alpha) * (1 - target)
+            loss = alpha_t * loss
+
+        if weight is not None:
+            loss = loss * weight
+
+        if reduction == "mean":
+            return loss.mean()
+        if reduction == "sum":
+            return loss.sum()
+        return loss
+
+    def _unavailable_op(*_, **__):  # pragma: no cover - runtime guard
+        raise RuntimeError(
+            "This operation requires mmcv-full with compiled extensions. "
+            "Install mmcv-full or switch to a model head that does not rely on it."
+        )
+
+    ops_stub.sigmoid_focal_loss = _sigmoid_focal_loss
+    ops_stub.CrissCrossAttention = _unavailable_op
+    ops_stub.point_sample = _unavailable_op
+    ops_stub.PSAMask = _unavailable_op
+
+    sys.modules["mmcv.ops"] = ops_stub
+    warnings.warn(
+        "mmcv._ext not found; installed lightweight mmcv.ops stub. "
+        "For full functionality (e.g., CrissCrossAttention), install mmcv-full.",
+        RuntimeWarning,
+    )
+
+
+_install_mmcv_ops_stub()
+
 from mmseg.apis import single_gpu_test
 from mmseg.core.evaluation.metrics import eval_metrics
-
-import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 warnings.filterwarnings("ignore", category=FutureWarning, module="timm")
 warnings.filterwarnings("ignore", category=UserWarning, module="scipy")
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from helpers.logger import get_logger
 from models import build_model
