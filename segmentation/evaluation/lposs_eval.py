@@ -25,6 +25,11 @@ if _cupy_spec is not None:
 else:
     cp = None
     coo_matrix = csr_matrix = diags = eye = s_linalg = None
+    log.warning(
+        "CuPy is not available; LPOSS graph refinement will be skipped and "
+        "fall back to raw predictions. Install cupy-cuda to enable full LPOSS "
+        "post-processing."
+    )
 
 import faiss
 import numpy as np
@@ -253,22 +258,43 @@ class LPOSS_Infrencer(EncoderDecoder):
         clip_feats = F.normalize(img_clip_feats, p=2, dim=-1)
         clip_preds = clip_feats @ clf.T
 
-        L = get_lposs_laplacian(dino_feats, torch.zeros((1, 4)).to(dino_feats.device), [(h, w)], sigma=self.config.sigma, pix_dist_pow=self.config.pix_dist_pow, k=self.config.k, gamma=self.config.gamma, alpha=self.config.alpha, patch_size=self.config.model.vit_patch_size)
-        
-        lp_preds = perform_lp(L, clip_preds)
+        if cp is None:
+            log.warning(
+                "CuPy is not installed; returning raw CLIP predictions without LPOSS graph refinement."
+            )
+            lp_preds = clip_preds
+        else:
+            L = get_lposs_laplacian(
+                dino_feats,
+                torch.zeros((1, 4)).to(dino_feats.device),
+                [(h, w)],
+                sigma=self.config.sigma,
+                pix_dist_pow=self.config.pix_dist_pow,
+                k=self.config.k,
+                gamma=self.config.gamma,
+                alpha=self.config.alpha,
+                patch_size=self.config.model.vit_patch_size,
+            )
+
+            lp_preds = perform_lp(L, clip_preds)
 
         preds = lp_preds.reshape((h, w, num_classes))
         preds = preds.unsqueeze(0)
         preds = preds.permute((0, 3, 1, 2))
 
         if self.config.pixel_refine:
-            preds = resize(preds, size=(h_img, w_img), mode='bilinear', align_corners=self.align_corners)
-            preds = preds[0, ...]
-            preds = preds.permute((1, 2, 0))
-            preds = preds.reshape((h_img*w_img, -1))
-            L = get_lposs_plus_laplacian(inputs, preds, tau=self.config.tau, neigh=self.config.r // 2, alpha=self.config.alpha)
-            preds = perform_lp(L, preds)
-            preds = preds.reshape((h_img, w_img, num_classes)).permute((2, 0, 1)).unsqueeze(0)
+            if cp is None:
+                log.warning(
+                    "CuPy is not installed; skipping pixel_refine LPOSS+ step."
+                )
+            else:
+                preds = resize(preds, size=(h_img, w_img), mode='bilinear', align_corners=self.align_corners)
+                preds = preds[0, ...]
+                preds = preds.permute((1, 2, 0))
+                preds = preds.reshape((h_img*w_img, -1))
+                L = get_lposs_plus_laplacian(inputs, preds, tau=self.config.tau, neigh=self.config.r // 2, alpha=self.config.alpha)
+                preds = perform_lp(L, preds)
+                preds = preds.reshape((h_img, w_img, num_classes)).permute((2, 0, 1)).unsqueeze(0)
 
         if preds.shape[1] > self.num_classes:
             preds = self.reduce_to_true_classes(preds)
@@ -357,10 +383,26 @@ class LPOSS_Infrencer(EncoderDecoder):
         dino_feats = F.normalize(dino_feats, p=2, dim=-1)
         clip_feats = F.normalize(clip_feats, p=2, dim=-1)
         clip_preds = clip_feats @ clf.T
-        
-        L = get_lposs_laplacian(dino_feats, locations, height_width, sigma=self.config.sigma, pix_dist_pow=self.config.pix_dist_pow, k=self.config.k, gamma=self.config.gamma, alpha=self.config.alpha, patch_size=self.config.model.vit_patch_size)
-        
-        lp_preds = perform_lp(L, clip_preds)
+
+        if cp is None:
+            log.warning(
+                "CuPy is not installed; returning raw CLIP predictions without LPOSS graph refinement."
+            )
+            lp_preds = clip_preds
+        else:
+            L = get_lposs_laplacian(
+                dino_feats,
+                locations,
+                height_width,
+                sigma=self.config.sigma,
+                pix_dist_pow=self.config.pix_dist_pow,
+                k=self.config.k,
+                gamma=self.config.gamma,
+                alpha=self.config.alpha,
+                patch_size=self.config.model.vit_patch_size,
+            )
+
+            lp_preds = perform_lp(L, clip_preds)
 
         # resize and overlap window predictions
         preds = inputs.new_zeros((batch_size, num_classes, h_img, w_img))
@@ -396,12 +438,17 @@ class LPOSS_Infrencer(EncoderDecoder):
 
         # apply lposs+
         if self.config.pixel_refine:
-            preds = preds[0, ...]
-            preds = preds.permute((1, 2, 0))
-            preds = preds.reshape((h_img*w_img, -1))
-            L = get_lposs_plus_laplacian(inputs, preds, tau=self.config.tau, neigh=self.config.r // 2, alpha=self.config.alpha)
-            preds = perform_lp(L, preds)
-            preds = preds.reshape((h_img, w_img, num_classes)).permute((2, 0, 1)).unsqueeze(0)
+            if cp is None:
+                log.warning(
+                    "CuPy is not installed; skipping pixel_refine LPOSS+ step."
+                )
+            else:
+                preds = preds[0, ...]
+                preds = preds.permute((1, 2, 0))
+                preds = preds.reshape((h_img*w_img, -1))
+                L = get_lposs_plus_laplacian(inputs, preds, tau=self.config.tau, neigh=self.config.r // 2, alpha=self.config.alpha)
+                preds = perform_lp(L, preds)
+                preds = preds.reshape((h_img, w_img, num_classes)).permute((2, 0, 1)).unsqueeze(0)
 
         # use original number of classes if class expansion was used
         if preds.shape[1] > self.num_classes:
