@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref-image", required=True, type=Path, help="reference image path")
     parser.add_argument("--out", required=True, type=Path, help="output directory")
 
-    # Coverage / std
+    # Coverage / std / ROI
     parser.add_argument(
         "--coverage-threshold",
         type=float,
@@ -32,10 +32,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--include-std", action="store_true", help="Include std deviation term in RGB delta")
     parser.add_argument("--std-weight", type=float, default=0.3, help="Weight for std term when --include-std is enabled")
-    parser.add_argument("--exclude-top-pct", type=float, default=0.20)
-    parser.add_argument("--exclude-bottom-pct", type=float, default=0.08)
-    parser.add_argument("--exclude-border-px", type=int, default=10)
-    parser.add_argument("--min-ref-std", type=float, default=8.0)
+
+    parser.add_argument("--exclude-top-pct", type=float, default=0.20, help="Exclude top fraction of image by centroid y")
+    parser.add_argument("--exclude-bottom-pct", type=float, default=0.08, help="Exclude bottom fraction of image by centroid y")
+    parser.add_argument("--exclude-border-px", type=int, default=10, help="Exclude border in pixels")
+    parser.add_argument("--min-ref-std", type=float, default=8.0, help="Reject flat regions by ref RGB std magnitude")
+
+    # Sky filter (HSV on ref mean RGB)
+    parser.add_argument(
+        "--disable-sky-filter",
+        action="store_true",
+        help="Disable sky-like superpixel filtering (HSV on ref mean color).",
+    )
+    parser.add_argument("--sky-h-low", type=int, default=80, help="Sky hue low (OpenCV HSV H in [0..179])")
+    parser.add_argument("--sky-h-high", type=int, default=140, help="Sky hue high (OpenCV HSV H in [0..179])")
+    parser.add_argument("--sky-s-min", type=int, default=25, help="Sky saturation min (HSV S in [0..255])")
+    parser.add_argument("--sky-v-min", type=int, default=140, help="Sky value min (HSV V in [0..255])")
 
     # Metrics
     parser.add_argument(
@@ -48,8 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global-color-align",
         action="store_true",
-        help="Align src Lab a,b globally to ref (median shift on valid superpixels). "
-             "Used for lab_ab_aligned and can also help others.",
+        help="Align src Lab a,b globally to ref (median shift on valid superpixels).",
     )
 
     # Heatmap normalization
@@ -62,10 +73,9 @@ def parse_args() -> argparse.Namespace:
         "--src-warp-image",
         type=Path,
         default=None,
-        help="Path to src image already warped into ref frame (same HxW as ref). "
-             "If provided, script will build a top-K gallery (ref vs warped).",
+        help="Path to src image already warped into ref frame (same HxW as ref).",
     )
-    parser.add_argument("--gallery-k", type=int, default=10, help="How many top superpixels to show in gallery")
+    parser.add_argument("--gallery-k", type=int, default=30, help="How many top superpixels to show in gallery")
     parser.add_argument("--gallery-pad", type=int, default=12, help="Padding (px) around superpixel bbox for crops")
     parser.add_argument("--gallery-tile", type=int, default=224, help="Tile size (px) for each crop in gallery")
     parser.add_argument("--gallery-gap", type=int, default=10, help="Gap (px) between ref and warped tiles")
@@ -95,14 +105,9 @@ def load_labels_npz(path: Path) -> np.ndarray:
 # Color / metric utils
 # -----------------------------
 def rgb_means_to_lab(means_rgb_0_255: np.ndarray) -> np.ndarray:
-    """
-    Convert Nx3 RGB means (0..255 floats) to Nx3 Lab (OpenCV: L,a,b in 0..255).
-    Robust to NaN/inf.
-    """
     means = np.array(means_rgb_0_255, dtype=np.float32)
     means = np.nan_to_num(means, nan=0.0, posinf=255.0, neginf=0.0)
     means_u8 = np.clip(means, 0, 255).astype(np.uint8)
-
     img = means_u8.reshape(1, -1, 3)
     lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
     return lab
@@ -115,13 +120,6 @@ def compute_metrics(
     do_align: bool,
     cov_thr: float,
 ) -> pd.DataFrame:
-    """
-    Adds:
-      delta_rgb, delta_std, delta_rgb_std,
-      mean_L_*, mean_a_*, mean_b_*_lab,
-      delta_lab_all, delta_lab_ab, delta_lab_ab_aligned
-    """
-    # RGB deltas
     delta_rgb = np.sqrt(
         (merged["mean_r_ref"] - merged["mean_r_src"]) ** 2
         + (merged["mean_g_ref"] - merged["mean_g_src"]) ** 2
@@ -138,7 +136,6 @@ def compute_metrics(
     merged["delta_std"] = delta_std
     merged["delta_rgb_std"] = delta_rgb + (std_weight * delta_std if include_std else 0.0)
 
-    # Lab deltas from mean RGB
     ref_means = merged[["mean_r_ref", "mean_g_ref", "mean_b_ref"]].to_numpy(dtype=np.float32)
     src_means = merged[["mean_r_src", "mean_g_src", "mean_b_src"]].to_numpy(dtype=np.float32)
 
@@ -160,7 +157,6 @@ def compute_metrics(
     merged["delta_lab_all"] = np.sqrt(dL ** 2 + da ** 2 + db ** 2)
     merged["delta_lab_ab"] = np.sqrt(da ** 2 + db ** 2)
 
-    # Aligned AB (median shift on valid superpixels)
     merged["delta_lab_ab_aligned"] = merged["delta_lab_ab"]
     if do_align:
         valid = merged["coverage"] >= cov_thr
@@ -214,7 +210,7 @@ def build_heatmap_image(
 
     norm, _, _ = normalize_values(heat_values, pct_low=pct_low, pct_high=pct_high)
     cmap = plt.get_cmap(cmap_name)
-    heat_rgb = cmap(norm)[..., :3]  # (H,W,3) float in [0,1]
+    heat_rgb = cmap(norm)[..., :3]
 
     ref_float = ref_image.astype(np.float32) / 255.0
     out = ref_float.copy()
@@ -308,7 +304,6 @@ def build_top_gallery(
         pair[:, 0:tile] = t_ref
         pair[:, tile + gap: tile + gap + tile] = t_src
 
-        # annotate
         cv2.putText(pair, f"id={lbl}  d={delta:.2f}", (5, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(pair, "ref", (5, tile - 8),
@@ -321,7 +316,6 @@ def build_top_gallery(
     if not rows:
         return
 
-    # canvas (stack rows)
     title_h = 34
     total_h = title_h + 2 * margin + len(rows) * tile + (len(rows) - 1) * gap
     total_w = 2 * margin + (tile * 2 + gap)
@@ -340,6 +334,28 @@ def build_top_gallery(
 
 
 # -----------------------------
+# Sky filter
+# -----------------------------
+def compute_is_sky_from_ref_means(
+    merged: pd.DataFrame,
+    h_low: int,
+    h_high: int,
+    s_min: int,
+    v_min: int,
+) -> np.ndarray:
+    ref_rgb = merged[["mean_r_ref", "mean_g_ref", "mean_b_ref"]].to_numpy(dtype=np.float32)
+    ref_rgb = np.nan_to_num(ref_rgb, nan=0.0, posinf=255.0, neginf=0.0)
+    ref_u8 = np.clip(ref_rgb, 0, 255).astype(np.uint8)
+
+    hsv = cv2.cvtColor(ref_u8.reshape(1, -1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
+    H = hsv[:, 0].astype(np.int32)
+    S = hsv[:, 1].astype(np.int32)
+    V = hsv[:, 2].astype(np.int32)
+
+    return (H >= h_low) & (H <= h_high) & (S >= s_min) & (V >= v_min)
+
+
+# -----------------------------
 # Main
 # -----------------------------
 def main() -> None:
@@ -347,19 +363,15 @@ def main() -> None:
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load features
     ref_df = pd.read_parquet(args.ref_features)
     src_df = pd.read_parquet(args.src_features)
 
-    # Merge on ref_label_id
     merged = ref_df.merge(src_df, on="ref_label_id", suffixes=("_ref", "_src"))
 
-    # coverage from src
     if "coverage_src" not in merged.columns:
         raise KeyError("Expected column `coverage_src` in merged df (from src features).")
     merged["coverage"] = merged["coverage_src"].astype(float)
 
-    # Compute metrics
     merged = compute_metrics(
         merged,
         include_std=args.include_std,
@@ -368,7 +380,6 @@ def main() -> None:
         cov_thr=args.coverage_threshold,
     )
 
-    # Choose main metric
     if args.metric == "rgb":
         merged["delta_main"] = merged["delta_rgb"]
     elif args.metric == "rgb_std":
@@ -382,12 +393,10 @@ def main() -> None:
     else:
         raise ValueError(f"Unknown metric: {args.metric}")
 
-    # Load labels + images for heatmaps/gallery
     labels = load_labels_npz(args.ref_labels)
-    props = regionprops_table(
-        labels,
-        properties=("label", "centroid", "bbox", "area"),
-    )
+
+    # IMPORTANT: rename area to a UNIQUE name to avoid collision with area_px_ref from features
+    props = regionprops_table(labels, properties=("label", "centroid", "bbox", "area"))
     spx_meta = pd.DataFrame(props).rename(columns={
         "label": "ref_label_id",
         "centroid-0": "cy",
@@ -396,36 +405,42 @@ def main() -> None:
         "bbox-1": "x1",
         "bbox-2": "y2",
         "bbox-3": "x2",
-        "area": "area_px_ref",
+        "area": "area_px_lbl",
     })
     merged = merged.merge(spx_meta, on="ref_label_id", how="left")
+
     ref_image = load_image_rgb(args.ref_image)
 
-    # ROI filtering (coverage + exclusions) -> NaN out for main metric
-    H, W = labels.shape[:2]
+    H_img, W_img = labels.shape[:2]
     roi_ok = np.ones(len(merged), dtype=bool)
 
-    # top/bottom exclusion
-    top_y = args.exclude_top_pct * H
-    bot_y = (1.0 - args.exclude_bottom_pct) * H
+    top_y = args.exclude_top_pct * H_img
+    bot_y = (1.0 - args.exclude_bottom_pct) * H_img
     roi_ok &= (merged["cy"] >= top_y) & (merged["cy"] <= bot_y)
 
-    # border exclusion
     b = args.exclude_border_px
-    roi_ok &= (merged["cx"] >= b) & (merged["cx"] <= (W - b))
-    roi_ok &= (merged["cy"] >= b) & (merged["cy"] <= (H - b))
+    roi_ok &= (merged["cx"] >= b) & (merged["cx"] <= (W_img - b))
+    roi_ok &= (merged["cy"] >= b) & (merged["cy"] <= (H_img - b))
 
-    # texture exclusion (убираем "плоские" области типа неба)
     ref_std = np.sqrt(
         merged["std_r_ref"]**2 + merged["std_g_ref"]**2 + merged["std_b_ref"]**2
     ) / np.sqrt(3.0)
     roi_ok &= (ref_std >= args.min_ref_std)
 
-    # итоговая маска
+    if not args.disable_sky_filter:
+        is_sky = compute_is_sky_from_ref_means(
+            merged,
+            h_low=args.sky_h_low,
+            h_high=args.sky_h_high,
+            s_min=args.sky_s_min,
+            v_min=args.sky_v_min,
+        )
+        roi_ok &= ~is_sky
+
     ok = (merged["coverage"] >= args.coverage_threshold) & roi_ok
     merged.loc[~ok, "delta_main"] = np.nan
 
-    # Save tables
+    # Save tables (robust: only keep columns that exist)
     keep_cols = [
         "ref_label_id", "coverage",
         "delta_main",
@@ -435,19 +450,23 @@ def main() -> None:
         "mean_r_src", "mean_g_src", "mean_b_src",
         "mean_L_ref", "mean_a_ref", "mean_b_ref_lab",
         "mean_L_src", "mean_a_src", "mean_b_src_lab",
+        "cx", "cy", "x1", "y1", "x2", "y2", "area_px_lbl",
+        # (если есть) площади из parquet’ов:
+        "area_px_ref", "area_px_src",
     ]
+    keep_cols = [c for c in keep_cols if c in merged.columns]
     merged[keep_cols].to_parquet(out_dir / "delta_full.parquet", index=False)
 
     filtered = merged.dropna(subset=["delta_main"]).copy()
     filtered.to_parquet(out_dir / "delta.parquet", index=False)
 
     top = filtered.sort_values("delta_main", ascending=False).head(100)
-    top[["ref_label_id", "coverage", "delta_main", "delta_rgb", "delta_lab_ab", "delta_lab_ab_aligned"]].to_csv(
-        out_dir / "top_changed.csv", index=False
-    )
+
+    top_cols = ["ref_label_id", "coverage", "delta_main", "delta_rgb", "delta_lab_ab", "delta_lab_ab_aligned"]
+    top_cols = [c for c in top_cols if c in top.columns]
+    top[top_cols].to_csv(out_dir / "top_changed.csv", index=False)
 
     # Heatmaps
-    # Coverage heatmap (coverage already in [0,1], normalize over full range)
     cov_map = dict(zip(merged["ref_label_id"].to_numpy(), merged["coverage"].to_numpy()))
     cov_img = build_heatmap_image(
         labels=labels,
@@ -460,7 +479,6 @@ def main() -> None:
     )
     cv2.imwrite(str(out_dir / "coverage_heatmap.png"), cv2.cvtColor(cov_img, cv2.COLOR_RGB2BGR))
 
-    # Delta heatmap (main metric)
     delta_map = dict(zip(merged["ref_label_id"].to_numpy(), merged["delta_main"].to_numpy()))
     delta_img = build_heatmap_image(
         labels=labels,
@@ -471,19 +489,18 @@ def main() -> None:
         alpha_heat=args.heat_alpha,
         cmap_name="inferno",
     )
-    # Save metric-specific name + backward-compatible name
     cv2.imwrite(str(out_dir / f"delta_{args.metric}.png"), cv2.cvtColor(delta_img, cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(out_dir / "delta_heatmap.png"), cv2.cvtColor(delta_img, cv2.COLOR_RGB2BGR))
 
     # Histograms
     save_histogram(merged["coverage"], out_dir / "coverage_hist.png", "Coverage distribution")
-    save_histogram(merged["delta_rgb"].where(ok), out_dir / "delta_rgb_hist.png", "Delta RGB (coverage-filtered)")
-    save_histogram(merged["delta_lab_ab"].where(ok), out_dir / "delta_lab_ab_hist.png", "Delta Lab AB (coverage-filtered)")
+    save_histogram(merged["delta_rgb"].where(ok), out_dir / "delta_rgb_hist.png", "Delta RGB (filtered)")
+    save_histogram(merged["delta_lab_ab"].where(ok), out_dir / "delta_lab_ab_hist.png", "Delta Lab AB (filtered)")
     if args.global_color_align:
         save_histogram(
             merged["delta_lab_ab_aligned"].where(ok),
             out_dir / "delta_lab_ab_aligned_hist.png",
-            "Delta Lab AB aligned (coverage-filtered)",
+            "Delta Lab AB aligned (filtered)",
         )
     save_histogram(merged["delta_main"], out_dir / "delta_hist.png", f"Delta main ({args.metric})")
 
