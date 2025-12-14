@@ -81,10 +81,20 @@ def load_overlay_image(spx_cache: Path, facade_id: str, year: int) -> Optional[n
 
 
 def load_geom(geom_dir: Path, facade_id: str, year_a: int, year_b: int) -> Tuple[str, Optional[np.ndarray]]:
-    geom_path = geom_dir / f"{facade_id}_{year_a}_{year_b}.json"
-    if not geom_path.exists():
-        LOGGER.warning("Geometry file not found for %s: %s", facade_id, geom_path)
+    geom_candidates = [
+        geom_dir / str(facade_id) / f"{year_a}_{year_b}.json",
+        geom_dir / f"{facade_id}_{year_a}_{year_b}.json",
+    ]
+
+    geom_path = next((p for p in geom_candidates if p.exists()), None)
+    if geom_path is None:
+        LOGGER.warning(
+            "Geometry file not found for %s. Tried: %s",
+            facade_id,
+            ", ".join(str(p) for p in geom_candidates),
+        )
         return "none", None
+
     with geom_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     status_quality = data.get("status_quality", "none") or "none"
