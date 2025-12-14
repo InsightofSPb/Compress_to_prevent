@@ -6,6 +6,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from skimage.measure import regionprops_table
 
 
 # -----------------------------
@@ -31,6 +32,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--include-std", action="store_true", help="Include std deviation term in RGB delta")
     parser.add_argument("--std-weight", type=float, default=0.3, help="Weight for std term when --include-std is enabled")
+    parser.add_argument("--exclude-top-pct", type=float, default=0.20)
+    parser.add_argument("--exclude-bottom-pct", type=float, default=0.08)
+    parser.add_argument("--exclude-border-px", type=int, default=10)
+    parser.add_argument("--min-ref-std", type=float, default=8.0)
 
     # Metrics
     parser.add_argument(
@@ -377,8 +382,47 @@ def main() -> None:
     else:
         raise ValueError(f"Unknown metric: {args.metric}")
 
-    # Coverage filter -> NaN out for main metric
-    ok = merged["coverage"] >= args.coverage_threshold
+    # Load labels + images for heatmaps/gallery
+    labels = load_labels_npz(args.ref_labels)
+    props = regionprops_table(
+        labels,
+        properties=("label", "centroid", "bbox", "area"),
+    )
+    spx_meta = pd.DataFrame(props).rename(columns={
+        "label": "ref_label_id",
+        "centroid-0": "cy",
+        "centroid-1": "cx",
+        "bbox-0": "y1",
+        "bbox-1": "x1",
+        "bbox-2": "y2",
+        "bbox-3": "x2",
+        "area": "area_px_ref",
+    })
+    merged = merged.merge(spx_meta, on="ref_label_id", how="left")
+    ref_image = load_image_rgb(args.ref_image)
+
+    # ROI filtering (coverage + exclusions) -> NaN out for main metric
+    H, W = labels.shape[:2]
+    roi_ok = np.ones(len(merged), dtype=bool)
+
+    # top/bottom exclusion
+    top_y = args.exclude_top_pct * H
+    bot_y = (1.0 - args.exclude_bottom_pct) * H
+    roi_ok &= (merged["cy"] >= top_y) & (merged["cy"] <= bot_y)
+
+    # border exclusion
+    b = args.exclude_border_px
+    roi_ok &= (merged["cx"] >= b) & (merged["cx"] <= (W - b))
+    roi_ok &= (merged["cy"] >= b) & (merged["cy"] <= (H - b))
+
+    # texture exclusion (убираем "плоские" области типа неба)
+    ref_std = np.sqrt(
+        merged["std_r_ref"]**2 + merged["std_g_ref"]**2 + merged["std_b_ref"]**2
+    ) / np.sqrt(3.0)
+    roi_ok &= (ref_std >= args.min_ref_std)
+
+    # итоговая маска
+    ok = (merged["coverage"] >= args.coverage_threshold) & roi_ok
     merged.loc[~ok, "delta_main"] = np.nan
 
     # Save tables
@@ -401,10 +445,6 @@ def main() -> None:
     top[["ref_label_id", "coverage", "delta_main", "delta_rgb", "delta_lab_ab", "delta_lab_ab_aligned"]].to_csv(
         out_dir / "top_changed.csv", index=False
     )
-
-    # Load labels + images for heatmaps/gallery
-    labels = load_labels_npz(args.ref_labels)
-    ref_image = load_image_rgb(args.ref_image)
 
     # Heatmaps
     # Coverage heatmap (coverage already in [0,1], normalize over full range)
