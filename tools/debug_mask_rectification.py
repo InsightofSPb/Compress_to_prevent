@@ -1,5 +1,7 @@
 import argparse
+import argparse
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -25,17 +27,23 @@ class DebugResult:
     year_a: str
     year_b: str
     status: str
+    status_quality: str
+    H: Optional[np.ndarray]
     num_matches: int
     num_inliers: int
     inlier_ratio: float
     iou_fg: float
     iou_edge: float
     overlay_path: str
+    geom_path: str
 
 
 STATUS_FAIL_MATCHES = "fail_not_enough_matches"
 STATUS_FAIL_H = "fail_homography"
 STATUS_SUCCESS = "success"
+QUALITY_STRONG = "strong"
+QUALITY_WEAK = "weak"
+QUALITY_NONE = "none"
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,7 +144,13 @@ def compute_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return float(intersection) / float(union)
 
 
-def make_overlay(mask_a: np.ndarray, mask_b: np.ndarray, warp_a: Optional[np.ndarray], warp_edge_a: Optional[np.ndarray], metrics_text: str) -> np.ndarray:
+def make_overlay(
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    warp_a: Optional[np.ndarray],
+    warp_edge_a: Optional[np.ndarray],
+    metrics_text: str,
+) -> np.ndarray:
     h = max(mask_a.shape[0], mask_b.shape[0])
     w = mask_a.shape[1] + mask_b.shape[1] + mask_b.shape[1]
     canvas = np.zeros((h, w), dtype=np.uint8)
@@ -185,12 +199,15 @@ def process_pair(entry: PairEntry, out_dir: Path, detector_method: str) -> Debug
             year_a=entry.year_a,
             year_b=entry.year_b,
             status="fail_load",
+            status_quality=QUALITY_NONE,
+            H=None,
             num_matches=0,
             num_inliers=0,
             inlier_ratio=0.0,
             iou_fg=0.0,
             iou_edge=0.0,
             overlay_path="",
+            geom_path="",
         )
 
     edge_a = compute_edges(mask_a_gray)
@@ -207,49 +224,93 @@ def process_pair(entry: PairEntry, out_dir: Path, detector_method: str) -> Debug
         metrics_text = f"matches:{num_matches}\nstatus:{STATUS_FAIL_MATCHES}"
         overlay = make_overlay(mask_a_gray, mask_b_gray, None, None, metrics_text)
         overlay_path = save_overlay(out_dir, entry.facade_id, entry.year_a, entry.year_b, overlay)
+        geom_path = save_geom(
+            out_dir,
+            entry.facade_id,
+            entry.year_a,
+            entry.year_b,
+            H=None,
+            num_matches=num_matches,
+            num_inliers=0,
+            inlier_ratio=0.0,
+            iou_fg=None,
+            iou_edge=None,
+            status_quality=QUALITY_NONE,
+        )
         return DebugResult(
             pair_id=entry.pair_id,
             facade_id=entry.facade_id,
             year_a=entry.year_a,
             year_b=entry.year_b,
             status=STATUS_FAIL_MATCHES,
+            status_quality=QUALITY_NONE,
+            H=None,
             num_matches=num_matches,
             num_inliers=0,
             inlier_ratio=0.0,
             iou_fg=0.0,
             iou_edge=0.0,
             overlay_path=overlay_path,
+            geom_path=geom_path,
         )
 
     H, num_inliers = find_homography(kp_a, kp_b, matches)
     inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0.0
+    quality = QUALITY_NONE
+    if H is not None:
+        if num_inliers >= 20:
+            quality = QUALITY_STRONG
+        elif num_inliers >= 12 and inlier_ratio >= 0.15:
+            quality = QUALITY_WEAK
 
-    if H is None or num_inliers < 20:
+    iou_fg = 0.0
+    iou_edge = 0.0
+    warp_a = None
+    warp_edge_a = None
+
+    if H is not None:
+        Hb, Wb = mask_b_gray.shape
+        warp_a = cv2.warpPerspective(mask_a_gray, H, (Wb, Hb))
+        warp_edge_a = cv2.warpPerspective(edge_a, H, (Wb, Hb))
+        if quality in {QUALITY_STRONG, QUALITY_WEAK}:
+            fg_a = foreground_mask(warp_a)
+            fg_b = foreground_mask(mask_b_gray)
+            iou_fg = compute_iou(fg_a, fg_b)
+            iou_edge = compute_iou(warp_edge_a > 0, edge_b > 0)
+
+    if H is None:
         metrics_text = f"matches:{num_matches}\ninliers:{num_inliers}\nstatus:{STATUS_FAIL_H}"
         overlay = make_overlay(mask_a_gray, mask_b_gray, None, None, metrics_text)
         overlay_path = save_overlay(out_dir, entry.facade_id, entry.year_a, entry.year_b, overlay)
+        geom_path = save_geom(
+            out_dir,
+            entry.facade_id,
+            entry.year_a,
+            entry.year_b,
+            H=None,
+            num_matches=num_matches,
+            num_inliers=num_inliers,
+            inlier_ratio=inlier_ratio,
+            iou_fg=None,
+            iou_edge=None,
+            status_quality=quality,
+        )
         return DebugResult(
             pair_id=entry.pair_id,
             facade_id=entry.facade_id,
             year_a=entry.year_a,
             year_b=entry.year_b,
             status=STATUS_FAIL_H,
+            status_quality=quality,
+            H=None,
             num_matches=num_matches,
             num_inliers=num_inliers,
             inlier_ratio=inlier_ratio,
             iou_fg=0.0,
             iou_edge=0.0,
             overlay_path=overlay_path,
+            geom_path=geom_path,
         )
-
-    Hb, Wb = mask_b_gray.shape
-    warp_a = cv2.warpPerspective(mask_a_gray, H, (Wb, Hb))
-    warp_edge_a = cv2.warpPerspective(edge_a, H, (Wb, Hb))
-
-    fg_a = foreground_mask(warp_a)
-    fg_b = foreground_mask(mask_b_gray)
-    iou_fg = compute_iou(fg_a, fg_b)
-    iou_edge = compute_iou(warp_edge_a > 0, edge_b > 0)
 
     metrics_text = (
         f"matches:{num_matches}\n"
@@ -257,23 +318,41 @@ def process_pair(entry: PairEntry, out_dir: Path, detector_method: str) -> Debug
         f"inlier_ratio:{inlier_ratio:.3f}\n"
         f"iou_fg:{iou_fg:.3f}\n"
         f"iou_edge:{iou_edge:.3f}\n"
-        f"status:{STATUS_SUCCESS}"
+        f"quality:{quality}"
     )
     overlay = make_overlay(mask_a_gray, mask_b_gray, warp_a, warp_edge_a, metrics_text)
     overlay_path = save_overlay(out_dir, entry.facade_id, entry.year_a, entry.year_b, overlay)
+
+    status = STATUS_SUCCESS if quality in {QUALITY_STRONG, QUALITY_WEAK} else STATUS_FAIL_H
+    geom_path = save_geom(
+        out_dir,
+        entry.facade_id,
+        entry.year_a,
+        entry.year_b,
+        H=H,
+        num_matches=num_matches,
+        num_inliers=num_inliers,
+        inlier_ratio=inlier_ratio,
+        iou_fg=iou_fg if quality in {QUALITY_STRONG, QUALITY_WEAK} else None,
+        iou_edge=iou_edge if quality in {QUALITY_STRONG, QUALITY_WEAK} else None,
+        status_quality=quality,
+    )
 
     return DebugResult(
         pair_id=entry.pair_id,
         facade_id=entry.facade_id,
         year_a=entry.year_a,
         year_b=entry.year_b,
-        status=STATUS_SUCCESS,
+        status=status,
+        status_quality=quality,
+        H=H,
         num_matches=num_matches,
         num_inliers=num_inliers,
         inlier_ratio=inlier_ratio,
         iou_fg=iou_fg,
         iou_edge=iou_edge,
         overlay_path=overlay_path,
+        geom_path=geom_path,
     )
 
 
@@ -286,6 +365,46 @@ def save_overlay(out_dir: Path, facade_id: str, year_a: str, year_b: str, overla
     return str(out_path)
 
 
+def save_geom(
+    out_dir: Path,
+    facade_id: str,
+    year_a: str,
+    year_b: str,
+    H: Optional[np.ndarray],
+    num_matches: int,
+    num_inliers: int,
+    inlier_ratio: float,
+    iou_fg: Optional[float],
+    iou_edge: Optional[float],
+    status_quality: str,
+) -> str:
+    geom_dir = out_dir / "geom" / facade_id
+    geom_dir.mkdir(parents=True, exist_ok=True)
+    out_path = geom_dir / f"{year_a}_{year_b}.json"
+
+    def _maybe_int(value: str):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+
+    payload = {
+        "facade_id": facade_id,
+        "year_a": _maybe_int(year_a),
+        "year_b": _maybe_int(year_b),
+        "H": H.tolist() if H is not None else None,
+        "num_matches": num_matches,
+        "num_inliers": num_inliers,
+        "inlier_ratio": float(inlier_ratio),
+        "iou_fg": None if iou_fg is None else float(iou_fg),
+        "iou_edge": None if iou_edge is None else float(iou_edge),
+        "status_quality": status_quality,
+    }
+
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    return str(out_path)
+
+
 def write_report(out_path: Path, results: Sequence[DebugResult]):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -294,12 +413,14 @@ def write_report(out_path: Path, results: Sequence[DebugResult]):
         "year_a",
         "year_b",
         "status",
+        "status_quality",
         "num_matches",
         "num_inliers",
         "inlier_ratio",
         "iou_fg",
         "iou_edge",
         "overlay_path",
+        "geom_path",
     ]
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -312,12 +433,14 @@ def write_report(out_path: Path, results: Sequence[DebugResult]):
                     "year_a": res.year_a,
                     "year_b": res.year_b,
                     "status": res.status,
+                    "status_quality": res.status_quality,
                     "num_matches": res.num_matches,
                     "num_inliers": res.num_inliers,
                     "inlier_ratio": f"{res.inlier_ratio:.6f}",
                     "iou_fg": f"{res.iou_fg:.6f}",
                     "iou_edge": f"{res.iou_edge:.6f}",
                     "overlay_path": res.overlay_path,
+                    "geom_path": res.geom_path,
                 }
             )
 
