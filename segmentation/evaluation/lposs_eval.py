@@ -5,6 +5,8 @@ import os
 import time
 from typing import List
 
+import importlib
+
 import torch
 from torch import Tensor
 import torch.nn.functional as F
@@ -15,9 +17,14 @@ from mmcv import ConfigDict
 from mmseg.ops import resize
 from mmseg.models import EncoderDecoder
 
-from cupyx.scipy.sparse import csr_matrix, diags, eye, coo_matrix
-from cupyx.scipy.sparse import linalg as s_linalg
-import cupy as cp
+_cupy_spec = importlib.util.find_spec("cupyx")
+if _cupy_spec is not None:
+    import cupy as cp
+    from cupyx.scipy.sparse import coo_matrix, csr_matrix, diags, eye
+    from cupyx.scipy.sparse import linalg as s_linalg
+else:
+    cp = None
+    coo_matrix = csr_matrix = diags = eye = s_linalg = None
 
 import faiss
 import numpy as np
@@ -25,6 +32,15 @@ import faiss.contrib.torch_utils
 from PIL import Image
 import numpy as np
 from kornia.color import rgb_to_lab
+
+
+def _require_cupy():
+    if cp is None:
+        raise ImportError(
+            "cupy/cupyx is required for LPOSS inference. Install a GPU-enabled CuPy "
+            "distribution (e.g., cupy-cuda) to enable the graph-based post-processing "
+            "steps."
+        )
 
 
 def reshape_windows(x):
@@ -37,6 +53,7 @@ def reshape_windows(x):
 
 
 def normalize_connection_graph(G):
+    _require_cupy()
     W = csr_matrix(G)
     W = W - diags(W.diagonal(), 0)
     S = W.sum(axis=1)
@@ -50,6 +67,7 @@ def normalize_connection_graph(G):
 
 
 def get_lposs_laplacian(feats, locations, height_width, sigma=0.0, pix_dist_pow=2, k=100, gamma=1.0, alpha=0.95, patch_size=16):
+    _require_cupy()
     idx_window = torch.cat([window * torch.ones((h*w, ), device=feats.device, dtype=torch.int64) for window, (h, w) in enumerate(height_width)])
     idx_h = torch.cat([torch.arange(h).view(-1,1).repeat(1, w).flatten() for h, w in height_width]).to(feats.device)
     idx_w = torch.cat([torch.arange(w).view(1,-1).repeat(h, 1).flatten() for h, w in height_width]).to(feats.device)
@@ -89,12 +107,14 @@ def get_lposs_laplacian(feats, locations, height_width, sigma=0.0, pix_dist_pow=
 
 
 def dfs_search(L, Y, tol=1e-6, maxiter=10):
+    _require_cupy()
     out = s_linalg.cg(L, Y, tol=tol, maxiter=maxiter)[0]
 
     return out
 
 
 def perform_lp(L, preds):
+    _require_cupy()
     lp_preds = cp.zeros(preds.shape)
     preds = cp.asarray(preds)
     for cls_idx, y_cls in enumerate(preds.T):
@@ -138,6 +158,7 @@ def get_pixel_connections(img, neigh=1):
 
 
 def get_lposs_plus_laplacian(img, preds, tau=0.1, neigh=6, alpha=0.95):
+    _require_cupy()
     rows, cols, pixel_pixel_data, locs = get_pixel_connections(img, neigh=neigh)
     pixel_pixel_data = torch.sqrt(pixel_pixel_data)
     pixel_pixel_data = torch.exp(-pixel_pixel_data / tau)
