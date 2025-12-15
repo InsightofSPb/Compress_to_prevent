@@ -169,7 +169,8 @@ def main() -> None:
 
     # Visual overlays
     save_overlay(ref_image, ref_labels, out_base / "ref_overlay.png")
-    save_overlay(src_warp, ref_labels, out_base / "warped_overlay.png")
+    warped_overlay_path = out_base / f"warped_overlay_{args.src_year}_to_{args.ref_year}.png"
+    save_overlay(src_warp, ref_labels, warped_overlay_path)
 
     # Helpful print (optional)
     print(f"[OK] Saved raw warp: {raw_warp_path}")
