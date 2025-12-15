@@ -241,13 +241,16 @@ def main() -> None:
         year_a = int(row["year_a"])
         year_b = int(row["year_b"])
 
-        year_prev = min(year_a, year_b)
-        year_next = max(year_a, year_b)
-        dt_years = year_next - year_prev
+        if year_a > year_b:
+            year_a, year_b = year_b, year_a
 
-        pair_dir = out_root / "pairs" / str(facade_id) / f"{year_prev}_{year_next}"
+        year_prev, year_next = year_a, year_b
+        ref_year, src_year = year_prev, year_next
+        dt_years = src_year - ref_year
 
-        geom_path, status = ensure_geom(args.geom_dir, str(facade_id), year_prev, year_next)
+        pair_dir = out_root / "pairs" / str(facade_id) / f"{ref_year}_{src_year}"
+
+        geom_path, status = ensure_geom(args.geom_dir, str(facade_id), ref_year, src_year)
         quality = ""
         if status != "ok":
             summary_rows.append(
@@ -273,7 +276,7 @@ def main() -> None:
 
         try:
             ref_img_path, _ = load_manifest_image(
-                args.temporal_manifest, str(facade_id), year_prev
+                args.temporal_manifest, str(facade_id), ref_year
             )
         except Exception as e:  # noqa: BLE001
             summary_rows.append(
@@ -301,8 +304,8 @@ def main() -> None:
             pair_dir=pair_dir,
             geom_json=geom_path,
             facade_id=str(facade_id),
-            ref_year=year_prev,
-            src_year=year_next,
+            ref_year=ref_year,
+            src_year=src_year,
         )
         if not ok_features:
             summary_rows.append(
@@ -330,8 +333,8 @@ def main() -> None:
             pair_dir=pair_dir,
             base_dir=base_dir,
             facade_id=str(facade_id),
-            ref_year=year_prev,
-            src_year=year_next,
+            ref_year=ref_year,
+            src_year=src_year,
             ref_image_path=ref_img_path,
         )
         if not ok_change:
