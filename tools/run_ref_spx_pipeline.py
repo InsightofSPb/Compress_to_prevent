@@ -240,16 +240,22 @@ def main() -> None:
         facade_id = row["facade_id"]
         year_a = int(row["year_a"])
         year_b = int(row["year_b"])
-        pair_dir = out_root / "pairs" / str(facade_id) / f"{year_a}_{year_b}"
 
-        geom_path, status = ensure_geom(args.geom_dir, str(facade_id), year_a, year_b)
+        year_prev = min(year_a, year_b)
+        year_next = max(year_a, year_b)
+        dt_years = year_next - year_prev
+
+        pair_dir = out_root / "pairs" / str(facade_id) / f"{year_prev}_{year_next}"
+
+        geom_path, status = ensure_geom(args.geom_dir, str(facade_id), year_prev, year_next)
         quality = ""
         if status != "ok":
             summary_rows.append(
                 {
                     "facade_id": facade_id,
-                    "year_a": year_a,
-                    "year_b": year_b,
+                    "year_prev": year_prev,
+                    "year_next": year_next,
+                    "dt_years": dt_years,
                     "quality": quality,
                     "num_labels": 0,
                     "num_valid": 0,
@@ -266,13 +272,16 @@ def main() -> None:
         quality, _ = read_geom(geom_path)
 
         try:
-            ref_img_path, _ = load_manifest_image(args.temporal_manifest, str(facade_id), year_b)
+            ref_img_path, _ = load_manifest_image(
+                args.temporal_manifest, str(facade_id), year_prev
+            )
         except Exception as e:  # noqa: BLE001
             summary_rows.append(
                 {
                     "facade_id": facade_id,
-                    "year_a": year_a,
-                    "year_b": year_b,
+                    "year_prev": year_prev,
+                    "year_next": year_next,
+                    "dt_years": dt_years,
                     "quality": quality,
                     "num_labels": 0,
                     "num_valid": 0,
@@ -292,15 +301,16 @@ def main() -> None:
             pair_dir=pair_dir,
             geom_json=geom_path,
             facade_id=str(facade_id),
-            ref_year=year_b,
-            src_year=year_a,
+            ref_year=year_prev,
+            src_year=year_next,
         )
         if not ok_features:
             summary_rows.append(
                 {
                     "facade_id": facade_id,
-                    "year_a": year_a,
-                    "year_b": year_b,
+                    "year_prev": year_prev,
+                    "year_next": year_next,
+                    "dt_years": dt_years,
                     "quality": quality,
                     "num_labels": 0,
                     "num_valid": 0,
@@ -320,16 +330,17 @@ def main() -> None:
             pair_dir=pair_dir,
             base_dir=base_dir,
             facade_id=str(facade_id),
-            ref_year=year_b,
-            src_year=year_a,
+            ref_year=year_prev,
+            src_year=year_next,
             ref_image_path=ref_img_path,
         )
         if not ok_change:
             summary_rows.append(
                 {
                     "facade_id": facade_id,
-                    "year_a": year_a,
-                    "year_b": year_b,
+                    "year_prev": year_prev,
+                    "year_next": year_next,
+                    "dt_years": dt_years,
                     "quality": quality,
                     "num_labels": 0,
                     "num_valid": 0,
@@ -353,8 +364,9 @@ def main() -> None:
         summary_rows.append(
             {
                 "facade_id": facade_id,
-                "year_a": year_a,
-                "year_b": year_b,
+                "year_prev": year_prev,
+                "year_next": year_next,
+                "dt_years": dt_years,
                 "quality": quality,
                 "num_labels": num_labels,
                 "num_valid": num_valid,
