@@ -301,14 +301,14 @@ def build_top_gallery(
         t_src = resize_and_pad(crop_src, tile)
 
         pair = np.zeros((tile, tile * 2 + gap, 3), dtype=np.uint8)
-        pair[:, 0:tile] = t_ref
-        pair[:, tile + gap: tile + gap + tile] = t_src
+        pair[:, 0:tile] = t_src
+        pair[:, tile + gap : tile + gap + tile] = t_ref
 
         cv2.putText(pair, f"id={lbl}  d={delta:.2f}", (5, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(pair, "ref", (5, tile - 8),
+        cv2.putText(pair, "src (warped)", (5, tile - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(pair, "warped", (tile + gap + 5, tile - 8),
+        cv2.putText(pair, "ref", (tile + gap + 5, tile - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
         rows.append(pair)
