@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
+import pandas as pd
 
 META_COLUMNS: Sequence[str] = (
     "facade_id",
@@ -43,6 +44,10 @@ def _coerce_value(value: str):
 
 
 def read_table(path: Path) -> List[Dict[str, object]]:
+    if path.suffix.lower() == ".parquet":
+        df = pd.read_parquet(path)
+        df = df.where(pd.notnull(df), None)
+        return df.to_dict("records")
     with path.open("r", newline="") as f:
         reader = csv.DictReader(f)
         rows: List[Dict[str, object]] = []
@@ -57,8 +62,19 @@ def ensure_step_idx(rows: List[Dict[str, object]], index_rows: List[Dict[str, ob
         return rows
     lookup: Dict[Tuple[object, object, object], int] = {}
     for idx_row in index_rows:
+        if "step_idx" not in idx_row:
+            continue
         key = (idx_row.get("facade_id"), idx_row.get("year_prev"), idx_row.get("year_next"))
         lookup[key] = int(idx_row.get("step_idx", len(lookup)))
+
+    if not lookup:
+        grouped: Dict[object, List[Dict[str, object]]] = {}
+        for row in rows:
+            grouped.setdefault(row.get("facade_id"), []).append(row)
+        for facade_id, group in grouped.items():
+            group_sorted = sorted(group, key=lambda r: (r.get("year_prev"), r.get("year_next")))
+            for idx, row in enumerate(group_sorted):
+                lookup[(facade_id, row.get("year_prev"), row.get("year_next"))] = idx
     for row in rows:
         key = (row.get("facade_id"), row.get("year_prev"), row.get("year_next"))
         if key not in lookup:
