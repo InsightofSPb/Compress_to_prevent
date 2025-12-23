@@ -76,6 +76,21 @@ def _prepare_spx_features(spx: pd.DataFrame) -> pd.DataFrame:
     return spx
 
 
+def _maybe_set_delta(
+    df: pd.DataFrame,
+    base_col: str,
+    out_col: str,
+    matched_mask: pd.Series,
+) -> None:
+    col_a = f"{base_col}_a"
+    col_b = f"{base_col}_b"
+    if col_a in df.columns and col_b in df.columns:
+        df[out_col] = df[col_b] - df[col_a]
+        df.loc[~matched_mask, out_col] = np.nan
+    else:
+        LOGGER.warning("Missing columns for delta feature: %s or %s", col_a, col_b)
+
+
 def build_aggregates(merged: pd.DataFrame) -> pd.DataFrame:
     keys = ["facade_id", "year_a", "year_b"]
     grouped = merged.groupby(keys, dropna=False)
@@ -98,23 +113,41 @@ def build_aggregates(merged: pd.DataFrame) -> pd.DataFrame:
     if "bpp_excess_b" in merged.columns:
         _add_agg(agg_defs, merged, "bpp_excess_b", "bpp_excess_b_p95", lambda s: _safe_percentile(s, 95))
 
-    _add_agg(agg_defs, merged, "p_damage", "p_damage_mean", "mean")
-    _add_agg(agg_defs, merged, "p_damage", "p_damage_p95", lambda s: _safe_percentile(s, 95))
+    _add_agg(agg_defs, merged, "p_damage_b", "p_damage_mean", "mean")
+    _add_agg(agg_defs, merged, "p_damage_b", "p_damage_p95", lambda s: _safe_percentile(s, 95))
 
-    _add_agg(agg_defs, merged, "entropy_norm_mean", "entropy_norm_mean_mean", "mean")
-    _add_agg(agg_defs, merged, "entropy_norm_mean", "entropy_norm_mean_p95", lambda s: _safe_percentile(s, 95))
+    _add_agg(agg_defs, merged, "entropy_norm_mean_b", "entropy_norm_mean_mean", "mean")
+    _add_agg(agg_defs, merged, "entropy_norm_mean_b", "entropy_norm_mean_p95", lambda s: _safe_percentile(s, 95))
 
-    _add_agg(agg_defs, merged, "margin_mean", "margin_mean_mean", "mean")
-    _add_agg(agg_defs, merged, "margin_mean", "margin_mean_p10", lambda s: _safe_percentile(s, 10))
+    _add_agg(agg_defs, merged, "margin_mean_b", "margin_mean_mean", "mean")
+    _add_agg(agg_defs, merged, "margin_mean_b", "margin_mean_p10", lambda s: _safe_percentile(s, 10))
 
     optional_mean_p = [
-        "mean_p_REPAIRS",
-        "mean_p_TEXT_OR_IMAGES",
-        "mean_p_ORNAMENT_INTACT",
+        "mean_p_REPAIRS_b",
+        "mean_p_TEXT_OR_IMAGES_b",
+        "mean_p_ORNAMENT_INTACT_b",
     ]
     for col in optional_mean_p:
         if col in merged.columns:
-            _add_agg(agg_defs, merged, col, f"{col}_mean", "mean")
+            _add_agg(agg_defs, merged, col, f"{col.replace('_b', '')}_mean", "mean")
+
+    _add_agg(agg_defs, merged, "delta_p_damage", "delta_p_damage_mean", "mean")
+    _add_agg(agg_defs, merged, "delta_p_damage", "delta_p_damage_p95", lambda s: _safe_percentile(s, 95))
+
+    _add_agg(agg_defs, merged, "delta_entropy", "delta_entropy_mean", "mean")
+    _add_agg(agg_defs, merged, "delta_entropy", "delta_entropy_p95", lambda s: _safe_percentile(s, 95))
+
+    _add_agg(agg_defs, merged, "delta_margin", "delta_margin_mean", "mean")
+    _add_agg(agg_defs, merged, "delta_margin", "delta_margin_p95", lambda s: _safe_percentile(s, 95))
+
+    _add_agg(agg_defs, merged, "delta_repairs", "delta_repairs_mean", "mean")
+    _add_agg(agg_defs, merged, "delta_repairs", "delta_repairs_p95", lambda s: _safe_percentile(s, 95))
+
+    _add_agg(agg_defs, merged, "delta_text_or_images", "delta_text_or_images_mean", "mean")
+    _add_agg(agg_defs, merged, "delta_text_or_images", "delta_text_or_images_p95", lambda s: _safe_percentile(s, 95))
+
+    _add_agg(agg_defs, merged, "delta_ornament_intact", "delta_ornament_intact_mean", "mean")
+    _add_agg(agg_defs, merged, "delta_ornament_intact", "delta_ornament_intact_p95", lambda s: _safe_percentile(s, 95))
 
     agg_df = grouped.agg(**agg_defs) if agg_defs else pd.DataFrame(index=grouped.size().index)
 
@@ -141,7 +174,51 @@ def main() -> None:
         missing = required_keys - set(spx_df.columns)
         raise ValueError(f"spx_features missing required columns: {sorted(missing)}")
 
-    merged = pair_df.merge(spx_df, on=["facade_id", "year_b", "obj_id_b"], how="left", suffixes=("", "_spx"))
+    lposs_cols = [
+        "p_damage",
+        "entropy_norm_mean",
+        "margin_mean",
+        "mean_p_REPAIRS",
+        "mean_p_TEXT_OR_IMAGES",
+        "mean_p_ORNAMENT_INTACT",
+    ]
+    spx_cols = [c for c in lposs_cols if c in spx_df.columns]
+    spx_b = spx_df[["facade_id", "year_b", "obj_id_b", *spx_cols]].copy()
+    merged = pair_df.merge(
+        spx_b,
+        on=["facade_id", "year_b", "obj_id_b"],
+        how="left",
+        suffixes=("", "_b"),
+    )
+    if spx_cols:
+        merged = merged.rename(columns={c: f"{c}_b" for c in spx_cols})
+
+    if "obj_id_a" not in pair_df.columns:
+        raise ValueError("pair_features missing required column obj_id_a for delta LPOSS features.")
+    spx_a = spx_df.rename(columns={"year_b": "year_a", "obj_id_b": "obj_id_a"})
+    spx_a = spx_a[["facade_id", "year_a", "obj_id_a", *spx_cols]].copy()
+    merged = merged.merge(
+        spx_a,
+        on=["facade_id", "year_a", "obj_id_a"],
+        how="left",
+        suffixes=("", "_a"),
+    )
+    if spx_cols:
+        merged = merged.rename(columns={c: f"{c}_a" for c in spx_cols if c in merged.columns})
+
+    if "pair_mode" in merged.columns:
+        matched_mask = merged["pair_mode"] == "matched"
+    else:
+        LOGGER.warning("pair_mode column missing; delta LPOSS features will be empty.")
+        matched_mask = pd.Series(False, index=merged.index)
+
+    _maybe_set_delta(merged, "p_damage", "delta_p_damage", matched_mask)
+    _maybe_set_delta(merged, "entropy_norm_mean", "delta_entropy", matched_mask)
+    _maybe_set_delta(merged, "margin_mean", "delta_margin", matched_mask)
+    _maybe_set_delta(merged, "mean_p_REPAIRS", "delta_repairs", matched_mask)
+    _maybe_set_delta(merged, "mean_p_TEXT_OR_IMAGES", "delta_text_or_images", matched_mask)
+    _maybe_set_delta(merged, "mean_p_ORNAMENT_INTACT", "delta_ornament_intact", matched_mask)
+
     agg_df = build_aggregates(merged)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
