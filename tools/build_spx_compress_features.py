@@ -158,9 +158,21 @@ def load_matches(match_dir: Path, facade_id: str, year_a: int, year_b: int) -> D
 
 
 def encode_crop(crop: np.ndarray, codec: str) -> int:
+    """Encode a crop in-memory and return encoded size in bytes.
+
+    We fix codec parameters for determinism across runs / Pillow versions.
+    """
     buffer = BytesIO()
     image = Image.fromarray(crop)
-    image.save(buffer, format=codec.upper())
+
+    codec_l = codec.lower()
+    save_kwargs: Dict[str, object] = {}
+    if codec_l == "png":
+        save_kwargs.update({"compress_level": 9, "optimize": False})
+    elif codec_l == "webp":
+        save_kwargs.update({"lossless": True, "quality": 100, "method": 6})
+
+    image.save(buffer, format=codec.upper(), **save_kwargs)
     return buffer.getbuffer().nbytes
 
 
@@ -189,8 +201,10 @@ def compute_bpp_excess(
 
     bytes_excess = max(bytes_real - bytes_base, 0)
     area_px = max(float(area_px), 1.0)
-    bpp_excess = 8.0 * bytes_excess / area_px
     bbox_area = max((x2 - x1) * (y2 - y1), 1)
+    denom_area = area_px if mode == "mask" else float(bbox_area)
+    denom_area = max(float(denom_area), 1.0)
+    bpp_excess = 8.0 * bytes_excess / denom_area
     bpp_bbox = 8.0 * bytes_real / float(bbox_area)
 
     return {
@@ -198,6 +212,7 @@ def compute_bpp_excess(
         "bytes_base": float(bytes_base),
         "bytes_excess": float(bytes_excess),
         "bpp_excess": float(bpp_excess),
+        "bpp_excess_denom": float(denom_area),
         "bpp_bbox": float(bpp_bbox),
     }
 
@@ -217,16 +232,56 @@ def resolve_lposs_config(args: argparse.Namespace) -> Optional[LpossConfig]:
     )
 
 
+def extract_class_names(dataset_cfg) -> List[str]:
+    """Best-effort extraction of class names from an mmcv/mmengine dataset config."""
+    candidates = []
+    candidates.append(dataset_cfg.get("classes", None))
+    metainfo = dataset_cfg.get("metainfo", None) or {}
+    if isinstance(metainfo, dict):
+        candidates.append(metainfo.get("classes", None))
+
+    for path in [
+        ("data", "train", "dataset", "classes"),
+        ("data", "train", "dataset", "metainfo", "classes"),
+        ("train_dataloader", "dataset", "classes"),
+        ("train_dataloader", "dataset", "metainfo", "classes"),
+        ("val_dataloader", "dataset", "classes"),
+        ("val_dataloader", "dataset", "metainfo", "classes"),
+    ]:
+        node = dataset_cfg
+        ok = True
+        for key in path:
+            if not hasattr(node, "get"):
+                ok = False
+                break
+            node = node.get(key, None)
+            if node is None:
+                ok = False
+                break
+        if ok:
+            candidates.append(node)
+
+    for cand in candidates:
+        if cand is None:
+            continue
+        if isinstance(cand, (list, tuple)) and cand and isinstance(cand[0], str):
+            return list(cand)
+
+    raise ValueError(
+        "Could not infer `classes` from LPOSS dataset config. "
+        "Please ensure it defines `classes = [...]` or `metainfo = dict(classes=[...])`."
+    )
+
 def build_lposs_model(lposs: LpossConfig):
+    """Load LPOSS segmentation model and build a reusable inferencer."""
     import torch
     from mmcv import Config
     from models import build_model
+    from segmentation.evaluation.lposs_eval import LPOSS_Infrencer
 
     cfg = Config.fromfile(str(lposs.config_path))
     dataset_cfg = Config.fromfile(str(lposs.dataset_config))
-    class_names = list(dataset_cfg.get("classes", []))
-    if not class_names:
-        raise ValueError("LPOSS dataset config must define `classes`.")
+    class_names = extract_class_names(dataset_cfg)
 
     model = build_model(cfg.model, class_names=class_names)
 
@@ -241,24 +296,25 @@ def build_lposs_model(lposs: LpossConfig):
     device = torch.device(lposs.device)
     model.to(device)
     model.eval()
-    return model, cfg, class_names
+    seg_model = LPOSS_Infrencer(model, cfg, num_classes=len(class_names), test_cfg={"mode": "whole"})
+    seg_model.to(device)
+    seg_model.eval()
+    return seg_model, class_names
 
 
 def lposs_predict_map(
     image: np.ndarray,
-    model,
-    cfg,
-    class_names: Sequence[str],
+    seg_model,
 ) -> np.ndarray:
+    """Run LPOSS inferencer once and return per-pixel class probabilities [H,W,C]."""
     import torch
-    from segmentation.evaluation.lposs_eval import LPOSS_Infrencer
 
     h, w = image.shape[:2]
     input_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
     if input_tensor.dtype != torch.uint8:
         input_tensor = input_tensor.to(torch.uint8)
 
-    device = next(model.parameters()).device
+    device = next(seg_model.parameters()).device
     input_tensor = input_tensor.to(device)
 
     metas = [
@@ -270,10 +326,6 @@ def lposs_predict_map(
             "flip_direction": None,
         }
     ]
-
-    seg_model = LPOSS_Infrencer(model, cfg, num_classes=len(class_names), test_cfg={"mode": "whole"})
-    seg_model.to(device)
-    seg_model.eval()
 
     with torch.no_grad():
         logits = seg_model.whole_inference(input_tensor, metas, rescale=True)
@@ -311,10 +363,13 @@ def compute_lposs_stats(
 
     top1_idx = np.argmax(probs_masked, axis=1)
     p_top1 = float(np.mean(np.take_along_axis(probs_masked, top1_idx[:, None], axis=1)))
-    cls_top1 = float(np.bincount(top1_idx, minlength=len(class_names)).argmax())
+    cls_top1_idx = int(np.bincount(top1_idx, minlength=len(class_names)).argmax())
+    cls_top1 = float(cls_top1_idx)
+    cls_top1_name = class_names[cls_top1_idx] if 0 <= cls_top1_idx < len(class_names) else ""
 
     entropy = -np.sum(probs_masked * np.log(np.clip(probs_masked, 1e-8, None)), axis=1)
     entropy_mean = float(np.mean(entropy))
+    entropy_norm_mean = float(entropy_mean / np.log(max(len(class_names), 2)))
 
     sorted_probs = np.sort(probs_masked, axis=1)
     margin_mean = float(np.mean(sorted_probs[:, -1] - sorted_probs[:, -2])) if sorted_probs.shape[1] > 1 else 0.0
@@ -328,7 +383,9 @@ def compute_lposs_stats(
         "p_damage": p_damage,
         "p_top1": p_top1,
         "cls_top1": cls_top1,
+        "cls_top1_name": cls_top1_name,
         "entropy_mean": entropy_mean,
+        "entropy_norm_mean": entropy_norm_mean,
         "margin_mean": margin_mean,
         **mean_class_probs,
     }
@@ -344,12 +401,11 @@ def compute_year_features(
 ) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     base_cache: Dict[Tuple[int, int, str], int] = {}
-    lposs_model = None
-    lposs_meta = None
+    lposs_inferencer = None
     lposs_classes: Optional[List[str]] = None
 
     if lposs_cfg is not None:
-        lposs_model, lposs_meta, lposs_classes = build_lposs_model(lposs_cfg)
+        lposs_inferencer, lposs_classes = build_lposs_model(lposs_cfg)
 
     for idx, row in manifest.iterrows():
         if limit is not None and idx >= limit:
@@ -366,8 +422,8 @@ def compute_year_features(
             raise ValueError(f"Label/image size mismatch for {facade_id} {year}")
 
         probs = None
-        if lposs_cfg is not None and lposs_model is not None and lposs_classes is not None:
-            probs = lposs_predict_map(image, lposs_model, lposs_meta, lposs_classes)
+        if lposs_cfg is not None and lposs_inferencer is not None and lposs_classes is not None:
+            probs = lposs_predict_map(image, lposs_inferencer)
 
         for _, obj in objs.iterrows():
             obj_id = int(obj["obj_id"])
