@@ -249,8 +249,8 @@ def main() -> None:
     else:
         df["risk_compression_raw"] = 0.0
 
-    sem_med, sem_iqr = compute_robust_stats(train_df["risk_semantic_raw"])
-    comp_med, comp_iqr = compute_robust_stats(train_df["risk_compression_raw"])
+    sem_med, sem_iqr = compute_robust_stats(df.loc[df["split"] == "train", "risk_semantic_raw"])
+    comp_med, comp_iqr = compute_robust_stats(df.loc[df["split"] == "train", "risk_compression_raw"])
 
     df["risk_semantic"] = (df["risk_semantic_raw"] - sem_med) / sem_iqr
     df["risk_compression"] = (df["risk_compression_raw"] - comp_med) / comp_iqr
