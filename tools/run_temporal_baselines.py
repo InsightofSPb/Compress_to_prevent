@@ -713,8 +713,8 @@ if __name__ == "__main__":
     supervised = build_supervised_table(merged_rows, args.target_column, base_feature_cols)
 
     # Add engineered numeric features into the feature list explicitly
-    feature_cols = base_feature_cols + ["dt_prev", "quality_score"]
-
+    feature_cols = base_feature_cols + ["dt_prev", "quality_score", "y_prev"]
+    
     if args.split_mode == "within_facade":
         splits = split_within_facade(supervised)
     else:

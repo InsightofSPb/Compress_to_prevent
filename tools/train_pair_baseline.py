@@ -132,16 +132,27 @@ def _split_facades(df: pd.DataFrame, seed: int, train_frac: float, val_frac: flo
     return df
 
 
-def _impute_from_train(
-    train_df: pd.DataFrame, df: pd.DataFrame, feature_cols: List[str]
-) -> Tuple[np.ndarray, pd.DataFrame]:
-    medians: Dict[str, float] = {}
+def _impute_from_train(train_df, df, feature_cols):
+    medians = {}
     for col in feature_cols:
-        medians[col] = float(train_df[col].median()) if col in train_df.columns else 0.0
+        s = pd.to_numeric(train_df[col], errors="coerce")
+        med = float(s.median()) if s.notna().any() else 0.0
+        if not np.isfinite(med):
+            med = 0.0
+        medians[col] = med
+
     filled = df.copy()
     for col in feature_cols:
-        filled[col] = pd.to_numeric(filled[col], errors="coerce").fillna(medians[col])
-    return filled[feature_cols].to_numpy(dtype=float), filled
+        filled[col] = (
+            pd.to_numeric(filled[col], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(medians[col])
+        )
+
+    X = filled[feature_cols].to_numpy(dtype=float)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    return X, filled
+
 
 
 def _evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
@@ -177,7 +188,15 @@ def _build_modes(df: pd.DataFrame) -> Dict[str, List[str]]:
         "bpp_excess_b_p95",
     ]
 
-    lposs_only = [c for c in lposs_cols if c in df.columns]
+    delta_cols = [
+    "delta_p_damage_mean","delta_p_damage_p95",
+    "delta_entropy_mean","delta_entropy_p95",
+    "delta_margin_mean","delta_margin_p95",
+    "delta_repairs_mean","delta_repairs_p95",
+    "delta_text_or_images_mean","delta_text_or_images_p95",
+    "delta_ornament_intact_mean","delta_ornament_intact_p95",
+    ]
+    lposs_only = [c for c in (lposs_cols + delta_cols) if c in df.columns]
     compress_only = [c for c in compress_cols if c in df.columns]
     full = _select_feature_columns(df)
     full = [c for c in full if c != "y_true"]
