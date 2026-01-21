@@ -10,6 +10,7 @@ import pandas as pd
 
 META_COLUMNS: Sequence[str] = (
     "facade_id",
+    "patch_id",
     "step_idx",
     "target_step",
     "year_prev",
@@ -35,9 +36,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split-mode",
         default="within_facade",
-        choices=("within_facade", "facade_disjoint"),
+        choices=("within_facade", "facade_disjoint", "within_patch", "patch_disjoint"),
         help="within_facade: last step per facade goes to test (old behavior). "
-             "facade_disjoint: facades are split into train/val/test with no overlap.",
+             "facade_disjoint: facades are split into train/val/test with no overlap. "
+             "within_patch: last step per patch goes to test (facade_id+patch_id). "
+             "patch_disjoint: patches are split into train/val/test with no overlap.",
+    )
+    parser.add_argument(
+        "--patch-disjoint-mode",
+        default="facade",
+        choices=("facade", "patch"),
+        help="Used only for split-mode=patch_disjoint. "
+             "facade: split by facade_id (patches within facades stay together). "
+             "patch: split by (facade_id, patch_id).",
     )
     parser.add_argument("--train-frac", default=0.7, type=float, help="Used only for split-mode=facade_disjoint")
     parser.add_argument("--val-frac", default=0.15, type=float, help="Used only for split-mode=facade_disjoint")
@@ -192,11 +203,11 @@ def build_supervised_table(rows: List[Dict[str, object]], target_column: str, fe
       - dt_prev: year_next - year_prev for src step
       - quality_score: {strong=1, weak=0, else None} for src step
     """
-    rows_sorted = sorted(rows, key=lambda r: (r.get("facade_id"), r.get("step_idx")))
+    rows_sorted = sorted(rows, key=lambda r: (r.get("facade_id"), r.get("patch_id"), r.get("step_idx")))
     supervised: List[Dict[str, object]] = []
     from itertools import groupby
 
-    for facade_id, group in groupby(rows_sorted, key=lambda r: r.get("facade_id")):
+    for (facade_id, patch_id), group in groupby(rows_sorted, key=lambda r: (r.get("facade_id"), r.get("patch_id"))):
         group_list = list(group)
         for idx in range(len(group_list) - 1):
             src = group_list[idx]
@@ -215,6 +226,7 @@ def build_supervised_table(rows: List[Dict[str, object]], target_column: str, fe
 
             entry: Dict[str, object] = {
                 "facade_id": facade_id,
+                "patch_id": patch_id,
                 "step_idx": int(src["step_idx"]),
                 "target_step": int(tgt.get("step_idx", int(src["step_idx"]) + 1)),
                 "year_t": tgt.get("year_prev", src.get("year_prev")),
@@ -234,13 +246,13 @@ def build_supervised_table(rows: List[Dict[str, object]], target_column: str, fe
     return supervised
 
 
-def split_within_facade(rows: List[Dict[str, object]]) -> Dict[str, List[Dict[str, object]]]:
-    """Old behavior: per facade, last sample -> test, previous -> val, rest -> train."""
+def split_within_group(rows: List[Dict[str, object]], group_key) -> Dict[str, List[Dict[str, object]]]:
+    """Within-group split: last sample -> test, previous -> val, rest -> train."""
     parts: Dict[str, List[Dict[str, object]]] = {"train": [], "val": [], "test": []}
     from itertools import groupby
 
-    rows_sorted = sorted(rows, key=lambda r: (r.get("facade_id"), r.get("target_step")))
-    for _, group in groupby(rows_sorted, key=lambda r: r.get("facade_id")):
+    rows_sorted = sorted(rows, key=lambda r: (group_key(r), r.get("target_step")))
+    for _, group in groupby(rows_sorted, key=lambda r: group_key(r)):
         g = list(group)
         if len(g) == 1:
             parts["test"].append(g[0])
@@ -254,31 +266,35 @@ def split_within_facade(rows: List[Dict[str, object]]) -> Dict[str, List[Dict[st
     return parts
 
 
-def split_facade_disjoint(
-    rows: List[Dict[str, object]], train_frac: float, val_frac: float, seed: int
+def split_disjoint(
+    rows: List[Dict[str, object]],
+    group_key,
+    train_frac: float,
+    val_frac: float,
+    seed: int,
 ) -> Dict[str, List[Dict[str, object]]]:
-    """Facades do not overlap across splits."""
-    facades = sorted({r.get("facade_id") for r in rows})
+    """Groups do not overlap across splits."""
+    groups = sorted({group_key(r) for r in rows}, key=lambda x: str(x))
     rng = random.Random(seed)
-    rng.shuffle(facades)
+    rng.shuffle(groups)
 
-    n = len(facades)
+    n = len(groups)
     n_train = max(1, int(round(train_frac * n)))
     n_val = max(0, int(round(val_frac * n)))
     # ensure at least one test facade when possible
     if n_train + n_val >= n and n > 1:
         n_val = max(0, n - n_train - 1)
 
-    train_set = set(facades[:n_train])
-    val_set = set(facades[n_train : n_train + n_val])
-    test_set = set(facades[n_train + n_val :])
+    train_set = set(groups[:n_train])
+    val_set = set(groups[n_train : n_train + n_val])
+    test_set = set(groups[n_train + n_val :])
 
     parts: Dict[str, List[Dict[str, object]]] = {"train": [], "val": [], "test": []}
     for r in rows:
-        fid = r.get("facade_id")
-        if fid in train_set:
+        key = group_key(r)
+        if key in train_set:
             parts["train"].append(r)
-        elif fid in val_set:
+        elif key in val_set:
             parts["val"].append(r)
         else:
             parts["test"].append(r)
@@ -716,9 +732,25 @@ if __name__ == "__main__":
     feature_cols = base_feature_cols + ["dt_prev", "quality_score", "y_prev"]
     
     if args.split_mode == "within_facade":
-        splits = split_within_facade(supervised)
+        splits = split_within_group(supervised, group_key=lambda r: r.get("facade_id"))
+    elif args.split_mode == "within_patch":
+        splits = split_within_group(supervised, group_key=lambda r: (r.get("facade_id"), r.get("patch_id")))
+    elif args.split_mode == "patch_disjoint":
+        if args.patch_disjoint_mode == "patch":
+            key_fn = lambda r: (r.get("facade_id"), r.get("patch_id"))
+        else:
+            key_fn = lambda r: r.get("facade_id")
+        splits = split_disjoint(
+            supervised, group_key=key_fn, train_frac=args.train_frac, val_frac=args.val_frac, seed=args.split_seed
+        )
     else:
-        splits = split_facade_disjoint(supervised, train_frac=args.train_frac, val_frac=args.val_frac, seed=args.split_seed)
+        splits = split_disjoint(
+            supervised,
+            group_key=lambda r: r.get("facade_id"),
+            train_frac=args.train_frac,
+            val_frac=args.val_frac,
+            seed=args.split_seed,
+        )
 
     if not splits["train"]:
         raise ValueError("Train split is empty; check your split parameters/data.")
