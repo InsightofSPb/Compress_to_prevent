@@ -77,6 +77,27 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated class names to report mean probabilities for.",
     )
+    parser.add_argument(
+        "--export-masks-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional output directory to export per-image prediction masks and overlays. "
+            "If set, the script saves original images, predicted masks, and overlays."
+        ),
+    )
+    parser.add_argument(
+        "--gt-mask-col",
+        type=str,
+        default="mask_path",
+        help="Manifest column name that stores ground-truth mask paths for overlay export.",
+    )
+    parser.add_argument(
+        "--overlay-alpha",
+        type=float,
+        default=0.55,
+        help="Alpha blending factor for overlay visualizations.",
+    )
     return parser.parse_args()
 
 
@@ -91,14 +112,15 @@ def load_manifest(manifest_path: Path) -> pd.DataFrame:
 
     if "image_path" in df.columns:
         path_col = "image_path"
-    elif "mask_path" in df.columns:
-        path_col = "mask_path"
     elif "full_path" in df.columns:
         path_col = "full_path"
+    elif "mask_path" in df.columns:
+        path_col = "mask_path"
     else:
         raise ValueError("Manifest must include image_path, mask_path, or full_path column")
 
-    df = df.rename(columns={path_col: "image_path"})
+    if path_col != "image_path":
+        df = df.rename(columns={path_col: "image_path"})
     return df
 
 
@@ -294,6 +316,74 @@ def extract_class_names(dataset_cfg) -> List[str]:
     )
 
 
+def extract_palette(dataset_cfg, num_classes: int) -> List[List[int]]:
+    candidates = []
+    candidates.append(dataset_cfg.get("palette", None))
+    metainfo = dataset_cfg.get("metainfo", None) or {}
+    if isinstance(metainfo, dict):
+        candidates.append(metainfo.get("palette", None))
+
+    for path in [
+        ("data", "train", "dataset", "palette"),
+        ("data", "train", "dataset", "metainfo", "palette"),
+        ("train_dataloader", "dataset", "palette"),
+        ("train_dataloader", "dataset", "metainfo", "palette"),
+        ("val_dataloader", "dataset", "palette"),
+        ("val_dataloader", "dataset", "metainfo", "palette"),
+    ]:
+        node = dataset_cfg
+        ok = True
+        for key in path:
+            if not hasattr(node, "get"):
+                ok = False
+                break
+            node = node.get(key, None)
+            if node is None:
+                ok = False
+                break
+        if ok:
+            candidates.append(node)
+
+    for cand in candidates:
+        if cand is None:
+            continue
+        if isinstance(cand, (list, tuple)) and cand and isinstance(cand[0], (list, tuple)):
+            return [list(map(int, row[:3])) for row in cand]
+
+    rng = np.random.default_rng(17)
+    palette = rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
+    palette[0] = np.array([0, 0, 0], dtype=np.uint8)
+    return palette.tolist()
+
+
+def _colorize_mask(mask: np.ndarray, palette: Sequence[Sequence[int]]) -> np.ndarray:
+    h, w = mask.shape
+    palette_arr = np.asarray(palette, dtype=np.uint8)
+    idx = np.clip(mask.astype(np.int64), 0, len(palette_arr) - 1)
+    colored = palette_arr[idx.reshape(-1)].reshape(h, w, 3)
+    return colored
+
+
+def _blend_overlay(image: np.ndarray, mask_rgb: np.ndarray, alpha: float) -> np.ndarray:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    img = image.astype(np.float32)
+    overlay = mask_rgb.astype(np.float32)
+    blended = img * (1.0 - alpha) + overlay * alpha
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def _save_image(path: Path, array: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(array).save(path)
+
+
+def _load_mask(path: Path) -> np.ndarray:
+    mask = io.imread(str(path))
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    return mask.astype(np.int32)
+
+
 # ---------------------------
 # LPOSS inference (no mmseg / no mmcv.ops)
 # ---------------------------
@@ -353,6 +443,7 @@ def build_lposs_model(lposs: LpossConfig):
     # 2) Dataset config -> class names
     dataset_cfg = Config.fromfile(str(lposs.dataset_config))
     class_names = extract_class_names(dataset_cfg)
+    palette = extract_palette(dataset_cfg, num_classes=len(class_names))
 
     # 3) Build base model
     base_model = build_model(cfg.model, class_names=class_names)
@@ -449,7 +540,7 @@ def build_lposs_model(lposs: LpossConfig):
     mean = [float(x) for x in list(mean)]
     std = [float(x) for x in list(std)]
 
-    return seg_model, class_names, (mean, std, bgr_to_rgb)
+    return seg_model, class_names, palette, (mean, std, bgr_to_rgb)
 
 
 def lposs_predict_map(image: np.ndarray, seg_model, norm_params) -> np.ndarray:
@@ -563,15 +654,22 @@ def compute_year_features(
     min_area: int,
     limit: Optional[int],
     lposs_cfg: Optional[LpossConfig],
+    export_masks_dir: Optional[Path],
+    gt_mask_col: str,
+    overlay_alpha: float,
 ) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     base_cache: Dict[Tuple[int, int, str], int] = {}
 
     lposs_inferencer = None
     lposs_classes: Optional[List[str]] = None
+    lposs_palette: Optional[List[List[int]]] = None
     lposs_norm = None
     if lposs_cfg is not None:
-        lposs_inferencer, lposs_classes, lposs_norm = build_lposs_model(lposs_cfg)
+        lposs_inferencer, lposs_classes, lposs_palette, lposs_norm = build_lposs_model(lposs_cfg)
+
+    if export_masks_dir is not None and lposs_cfg is None:
+        raise ValueError("--export-masks-dir requires --lposs-config and --lposs-checkpoint")
 
     manifest_sorted = manifest.sort_values(["facade_id", "year"]).reset_index(drop=True)
 
@@ -589,6 +687,39 @@ def compute_year_features(
         probs = None
         if lposs_cfg is not None and lposs_inferencer is not None and lposs_classes is not None and lposs_norm is not None:
             probs = lposs_predict_map(image, lposs_inferencer, lposs_norm)
+
+        if export_masks_dir is not None and probs is not None and lposs_classes is not None and lposs_palette is not None:
+            stem = Path(image_path).stem
+            file_tag = f"{facade_id}_{year}_{stem}"
+            pred_labels = np.argmax(probs, axis=-1).astype(np.uint8)
+
+            img_path = export_masks_dir / "images" / f"{file_tag}.png"
+            pred_mask_path = export_masks_dir / "pred_masks" / f"{file_tag}.png"
+            pred_overlay_path = export_masks_dir / "overlay_pred" / f"{file_tag}.png"
+            _save_image(img_path, image)
+            _save_image(pred_mask_path, pred_labels)
+
+            pred_rgb = _colorize_mask(pred_labels, lposs_palette)
+            pred_overlay = _blend_overlay(image, pred_rgb, overlay_alpha)
+            _save_image(pred_overlay_path, pred_overlay)
+
+            if gt_mask_col in r and pd.notna(r[gt_mask_col]):
+                gt_path = Path(str(r[gt_mask_col]))
+                if gt_path.exists():
+                    gt_mask = _load_mask(gt_path)
+                    gt_rgb = _colorize_mask(gt_mask, lposs_palette)
+                    gt_overlay = _blend_overlay(image, gt_rgb, overlay_alpha)
+                    gt_overlay_path = export_masks_dir / "overlay_gt" / f"{file_tag}.png"
+                    _save_image(gt_overlay_path, gt_overlay)
+                else:
+                    LOGGER.warning("GT mask not found: %s", gt_path)
+            else:
+                LOGGER.warning(
+                    "GT mask column '%s' missing or empty for %s %s; skipping GT overlay.",
+                    gt_mask_col,
+                    facade_id,
+                    year,
+                )
 
         for _, obj in objs.iterrows():
             obj_id = int(obj["obj_id"])
@@ -935,6 +1066,9 @@ def main() -> None:
         min_area=args.min_area,
         limit=args.limit,
         lposs_cfg=lposs_cfg,
+        export_masks_dir=args.export_masks_dir,
+        gt_mask_col=args.gt_mask_col,
+        overlay_alpha=args.overlay_alpha,
     )
 
     pair_features, quality_summary = compute_pair_features(
