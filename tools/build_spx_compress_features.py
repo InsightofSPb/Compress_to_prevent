@@ -60,6 +60,22 @@ def parse_args() -> argparse.Namespace:
         help="Minimum fraction of valid warped pixels inside the (year_b) superpixel mask to keep delta_bpp.",
     )
     parser.add_argument("--limit", default=None, type=int)
+    parser.add_argument(
+        "--mask-out-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory to save LPOSS predicted masks and overlay visualizations. "
+            "When set, saves original images, GT overlays (if mask_path exists), and "
+            "predicted overlays for each image."
+        ),
+    )
+    parser.add_argument(
+        "--overlay-alpha",
+        type=float,
+        default=0.5,
+        help="Alpha for mask overlays when saving visualization images.",
+    )
 
     parser.add_argument("--lposs-config", type=Path, default=None)
     parser.add_argument("--lposs-checkpoint", type=Path, default=None)
@@ -111,6 +127,83 @@ def read_image(path: str) -> np.ndarray:
     if img.dtype != np.uint8:
         img = np.clip(img, 0, 255).astype(np.uint8)
     return img
+
+
+def _ensure_uint8_rgb(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        image = np.stack([image, image, image], axis=-1)
+    if image.shape[-1] == 4:
+        image = image[..., :3]
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    return image
+
+
+def _make_colormap(num_classes: int) -> np.ndarray:
+    rng = np.random.RandomState(13)
+    colors = rng.randint(0, 255, size=(max(num_classes, 1), 3), dtype=np.uint8)
+    if num_classes > 0:
+        colors[0] = np.array([0, 0, 0], dtype=np.uint8)
+    return colors
+
+
+def _overlay_mask(image: np.ndarray, mask: np.ndarray, colors: np.ndarray, alpha: float) -> np.ndarray:
+    image = _ensure_uint8_rgb(image)
+    mask = mask.astype(np.int64)
+    mask = np.clip(mask, 0, colors.shape[0] - 1)
+    color_mask = colors[mask]
+    overlay = (1.0 - alpha) * image.astype(np.float32) + alpha * color_mask.astype(np.float32)
+    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
+def _save_lposs_visuals(
+    *,
+    image: np.ndarray,
+    probs: np.ndarray,
+    class_names: Sequence[str],
+    mask_path: Optional[str],
+    image_path: str,
+    output_dir: Path,
+    facade_id: str,
+    year: int,
+    overlay_alpha: float,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pred_dir = output_dir / "predicted_masks"
+    viz_dir = output_dir / "visualizations"
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    viz_dir.mkdir(parents=True, exist_ok=True)
+
+    base_name = f"{facade_id}_{year}_{Path(image_path).stem}"
+    image_rgb = _ensure_uint8_rgb(image)
+
+    pred_mask = np.argmax(probs, axis=-1).astype(np.uint8)
+    pred_colors = _make_colormap(len(class_names))
+    pred_color = pred_colors[pred_mask]
+
+    Image.fromarray(pred_mask).save(pred_dir / f"{base_name}_pred_mask.png")
+    Image.fromarray(pred_color).save(pred_dir / f"{base_name}_pred_mask_color.png")
+
+    Image.fromarray(image_rgb).save(viz_dir / f"{base_name}_image.png")
+    pred_overlay = _overlay_mask(image_rgb, pred_mask, pred_colors, overlay_alpha)
+    Image.fromarray(pred_overlay).save(viz_dir / f"{base_name}_overlay_pred.png")
+
+    if mask_path is None:
+        LOGGER.warning("Mask path missing for %s %s; skipping GT overlay.", facade_id, year)
+        return
+
+    try:
+        gt_mask = io.imread(mask_path)
+    except FileNotFoundError:
+        LOGGER.warning("GT mask not found at %s; skipping GT overlay.", mask_path)
+        return
+
+    if gt_mask.ndim == 3:
+        gt_mask = gt_mask[..., 0]
+    gt_mask = gt_mask.astype(np.int64)
+    gt_colors = _make_colormap(int(gt_mask.max()) + 1)
+    gt_overlay = _overlay_mask(image_rgb, gt_mask, gt_colors, overlay_alpha)
+    Image.fromarray(gt_overlay).save(viz_dir / f"{base_name}_overlay_gt.png")
 
 
 def load_labels(spx_cache: Path, facade_id: str, year: int) -> np.ndarray:
@@ -563,6 +656,8 @@ def compute_year_features(
     min_area: int,
     limit: Optional[int],
     lposs_cfg: Optional[LpossConfig],
+    mask_out_dir: Optional[Path],
+    overlay_alpha: float,
 ) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     base_cache: Dict[Tuple[int, int, str], int] = {}
@@ -581,6 +676,9 @@ def compute_year_features(
         facade_id = str(r["facade_id"])
         year = int(r["year"])
         image_path = str(r["image_path"])
+        mask_path = None
+        if "mask_path" in r and pd.notna(r["mask_path"]):
+            mask_path = str(r["mask_path"])
 
         image = read_image(image_path)
         labels = load_labels(spx_cache, facade_id, year)
@@ -589,6 +687,18 @@ def compute_year_features(
         probs = None
         if lposs_cfg is not None and lposs_inferencer is not None and lposs_classes is not None and lposs_norm is not None:
             probs = lposs_predict_map(image, lposs_inferencer, lposs_norm)
+            if mask_out_dir is not None:
+                _save_lposs_visuals(
+                    image=image,
+                    probs=probs,
+                    class_names=lposs_classes,
+                    mask_path=mask_path,
+                    image_path=image_path,
+                    output_dir=mask_out_dir,
+                    facade_id=facade_id,
+                    year=year,
+                    overlay_alpha=overlay_alpha,
+                )
 
         for _, obj in objs.iterrows():
             obj_id = int(obj["obj_id"])
@@ -925,6 +1035,8 @@ def main() -> None:
         raise ValueError(f"Pairs CSV missing required columns: {missing}")
 
     lposs_cfg = resolve_lposs_config(args)
+    if lposs_cfg is not None and args.mask_out_dir is None:
+        args.mask_out_dir = args.out_dir / "mask_outputs"
 
     spx_df = compute_year_features(
         manifest=manifest,
@@ -935,6 +1047,8 @@ def main() -> None:
         min_area=args.min_area,
         limit=args.limit,
         lposs_cfg=lposs_cfg,
+        mask_out_dir=args.mask_out_dir,
+        overlay_alpha=args.overlay_alpha,
     )
 
     pair_features, quality_summary = compute_pair_features(
