@@ -181,3 +181,4 @@ data/*
 outputs/*
 *.txt
 backup*
+.bash_history
