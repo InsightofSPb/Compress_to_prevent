@@ -124,6 +124,54 @@ def apply_cutmix(img1: np.ndarray, mask1: np.ndarray, img2: np.ndarray, mask2: n
     return img, mask
 
 
+def _sample_zoom_crop(
+    height: int,
+    width: int,
+    scale_range: Tuple[float, float],
+    ratio_range: Tuple[float, float],
+) -> Tuple[int, int]:
+    scale = random.uniform(*scale_range)
+    ratio = random.uniform(*ratio_range)
+    crop_h = int(round(height * np.sqrt(scale / ratio)))
+    crop_w = int(round(width * np.sqrt(scale * ratio)))
+    crop_h = int(np.clip(crop_h, 1, height))
+    crop_w = int(np.clip(crop_w, 1, width))
+    return crop_h, crop_w
+
+
+def apply_zoom(
+    image: np.ndarray,
+    mask: np.ndarray,
+    zoom_cfg: Dict,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if not zoom_cfg.get("enabled", False):
+        return image, mask
+    if random.random() >= zoom_cfg.get("p", 0.0):
+        return image, mask
+
+    h, w = image.shape[:2]
+    scale_range = (zoom_cfg.get("scale_min", 0.7), zoom_cfg.get("scale_max", 1.0))
+    ratio_range = (zoom_cfg.get("ratio_min", 0.9), zoom_cfg.get("ratio_max", 1.1))
+    crop_h, crop_w = _sample_zoom_crop(h, w, scale_range, ratio_range)
+
+    y0 = random.randint(0, h - crop_h) if h > crop_h else 0
+    x0 = random.randint(0, w - crop_w) if w > crop_w else 0
+
+    non_background = np.argwhere(mask > 0)
+    damage_center_prob = zoom_cfg.get("damage_center_prob", 0.0)
+    if non_background.size > 0 and random.random() < damage_center_prob:
+        cy, cx = non_background[np.random.randint(len(non_background))]
+        y0 = int(np.clip(cy - crop_h // 2, 0, h - crop_h))
+        x0 = int(np.clip(cx - crop_w // 2, 0, w - crop_w))
+
+    crop_img = image[y0 : y0 + crop_h, x0 : x0 + crop_w]
+    crop_mask = mask[y0 : y0 + crop_h, x0 : x0 + crop_w]
+
+    zoom_img = cv2.resize(crop_img, (w, h), interpolation=cv2.INTER_LINEAR)
+    zoom_mask = cv2.resize(crop_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    return zoom_img, zoom_mask
+
+
 def build_transforms(config: Dict) -> A.Compose:
     transforms: List[A.BasicTransform] = []
     size_cfg = config.get("size", {})
@@ -333,6 +381,7 @@ def augment_dataset(config: Dict) -> None:
 
     mixup_cfg = aug_cfg.get("mixup", {})
     cutmix_cfg = aug_cfg.get("cutmix", {})
+    zoom_cfg = aug_cfg.get("zoom", {})
 
     progress = tqdm(image_paths, desc="Augmenting images")
     for image_path in progress:
@@ -368,6 +417,7 @@ def augment_dataset(config: Dict) -> None:
             for idx in range(num_aug):
                 transformed = base_transform(image=tile_img, mask=tile_mask)
                 aug_img, aug_mask = transformed["image"], transformed["mask"]
+                aug_img, aug_mask = apply_zoom(aug_img, aug_mask, zoom_cfg)
 
                 partner_img, partner_mask = None, None
                 if mixup_cfg.get("p", 0) > 0 and random.random() < mixup_cfg["p"]:
