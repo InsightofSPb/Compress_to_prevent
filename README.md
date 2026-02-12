@@ -48,7 +48,7 @@ Key points:
 * Images are first split into 448×448 tiles (configurable via `tiling`) so that augmentations are applied on the same patch size the network expects; this avoids random crops that would otherwise change the spatial support post-augmentation.
 * When training on the pre-generated tiles, keep the dataloader pipeline free of extra augmentations so you do not stack online transforms on top of the offline ones.
 * If mask filenames differ from the image filenames, point `paths.pairs` in the config to a YAML/JSON dict mapping `image_name.png: mask_name.png` so the script can locate the right mask.
-* Augmentations include geometric/photometric transforms, weather effects from Albumentations, CutOut, MixUp, and CutMix. Counts/probabilities, output formats, and overlay transparency can all be tuned in the YAML file.
+* Augmentations include geometric/photometric transforms, weather effects from Albumentations, CutOut, MixUp, CutMix, and a soft zoom-in crop (`augmentations.zoom`) that crops a smaller area and resizes back to 448×448. Counts/probabilities, output formats, and overlay transparency can all be tuned in the YAML file.
 * A tqdm progress bar is shown while augmentations are generated so you can estimate runtime even with multiple augmentations per image.
 
 To split the augmented tiles (e.g., `data/facades_aug/images` and `data/facades_aug/masks`) into train/val/test subsets, use:
@@ -58,6 +58,8 @@ python tools/split_dataset.py --data-root data/facades_aug --train-ratio 0.8 --v
 ```
 
 By default the script writes the splits to `<data-root>/data_prepared/{train,val,test}/{images,masks}`. Adjust the ratios or the `--output-dir` as needed. Masks must share filenames with their corresponding images.
+
+For facade-specific fine-tuning recipes (full MaskCLIP unfreeze, LR groups, weighted CE/Focal+Dice), see `docs/train_facades.md`.
 
 ## Datasets
 

@@ -31,6 +31,14 @@ augmentations:
   size:
     resize: {height: 448, width: 448}
     random_crop: {height: 448, width: 448, p: 0.0}
+  zoom:
+    enabled: true
+    p: 0.35
+    scale_min: 0.7
+    scale_max: 1.0
+    ratio_min: 0.9
+    ratio_max: 1.1
+    damage_center_prob: 0.6
 
   geometric:
     horizontal_flip: 0.2

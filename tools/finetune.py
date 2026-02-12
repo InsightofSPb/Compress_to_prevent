@@ -9,6 +9,7 @@ import sys
 import os
 import cv2
 import random
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple
 from collections import deque
@@ -115,33 +116,72 @@ class FineTuneWrapper(nn.Module):
 #                       FREEZING
 # ============================================================
 
-def _freeze_module(module: nn.Module) -> None:
+def _set_requires_grad(module: nn.Module, is_trainable: bool) -> None:
     for param in module.parameters():
-        param.requires_grad = False
+        param.requires_grad = is_trainable
 
 
-def _unfreeze_last(blocks: nn.ModuleList, depth: int) -> None:
+def _apply_unfreeze_depth(blocks: nn.ModuleList, depth: int) -> None:
+    if depth == -1:
+        _set_requires_grad(blocks, True)
+        return
+
+    _set_requires_grad(blocks, False)
     if depth <= 0:
         return
-    for block in blocks:
-        _freeze_module(block)
+
     for block in blocks[-depth:]:
-        for param in block.parameters():
-            param.requires_grad = True
+        _set_requires_grad(block, True)
 
 
-def configure_trainable_layers(model: nn.Module, depth: int) -> None:
-    if hasattr(model, "clip_backbone"):
-        backbone = getattr(model.clip_backbone, "backbone", None)
-        if backbone is not None and hasattr(backbone.visual.transformer, "resblocks"):
-            _unfreeze_last(backbone.visual.transformer.resblocks, depth)
+def _resolve_maskclip_components(model: nn.Module) -> Tuple[Optional[nn.Module], Optional[nn.ModuleList], Optional[nn.Module]]:
+    clip_model = getattr(model, "clip_backbone", None)
+    if clip_model is None and hasattr(model, "backbone"):
+        clip_model = model
 
-    if hasattr(model, "dino_encoder") and hasattr(model.dino_encoder, "blocks"):
-        _unfreeze_last(model.dino_encoder.blocks, depth)
+    if clip_model is None:
+        return None, None, None
 
-    if hasattr(model, "decode_head"):
-        for param in model.decode_head.parameters():
-            param.requires_grad = True
+    visual_backbone = getattr(clip_model, "backbone", None)
+    if visual_backbone is None and hasattr(clip_model, "visual"):
+        visual_backbone = clip_model
+
+    resblocks = None
+    if (
+        visual_backbone is not None
+        and hasattr(visual_backbone, "visual")
+        and hasattr(visual_backbone.visual, "transformer")
+        and hasattr(visual_backbone.visual.transformer, "resblocks")
+    ):
+        resblocks = visual_backbone.visual.transformer.resblocks
+
+    decode_head = getattr(clip_model, "decode_head", None)
+    return clip_model, resblocks, decode_head
+
+
+def configure_trainable_layers(model: nn.Module, depth: int) -> Dict[str, int]:
+    trainable_stats = {"maskclip_backbone": 0, "head": 0, "other": 0}
+
+    _set_requires_grad(model, False)
+
+    _, resblocks, decode_head = _resolve_maskclip_components(model)
+    if resblocks is not None:
+        _apply_unfreeze_depth(resblocks, depth)
+
+    if decode_head is not None:
+        _set_requires_grad(decode_head, True)
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "decode_head" in name:
+            trainable_stats["head"] += param.numel()
+        elif "backbone.visual" in name:
+            trainable_stats["maskclip_backbone"] += param.numel()
+        else:
+            trainable_stats["other"] += param.numel()
+
+    return trainable_stats
 
 
 # ============================================================
@@ -184,51 +224,110 @@ def build_dataloaders(train_cfg: str, batch_size: int, workers: int, val_cfg: Op
 #                       LOSS + CLASS WEIGHTS
 # ============================================================
 
-def compute_loss(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    class_weights: Optional[torch.Tensor] = None,
-    ignore_index: int = 255,
-) -> torch.Tensor:
-    if logits.shape[-2:] != target.shape[-2:]:
-        logits = F.interpolate(
-            logits, size=target.shape[-2:], mode="bilinear", align_corners=False
-        )
-
-    num_classes = logits.shape[1]
-
+def _sanitize_targets(target: torch.Tensor, num_classes: int, ignore_index: int) -> torch.Tensor:
     if target.min() < 0 or target.max() >= num_classes:
         target = target.clone()
         invalid_mask = (target < 0) | (target >= num_classes)
         target[invalid_mask] = ignore_index
-
-    return F.cross_entropy(
-        logits,
-        target,
-        weight=class_weights,
-        ignore_index=ignore_index,
-    )
+    return target
 
 
-def compute_class_weights(loader, num_classes: int, ignore_index: int = 255) -> torch.Tensor:
+def multiclass_dice_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int = 255,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    num_classes = logits.shape[1]
+    probs = F.softmax(logits, dim=1)
+    valid_mask = (target != ignore_index).float()
+    safe_target = target.clone()
+    safe_target[target == ignore_index] = 0
+    one_hot = F.one_hot(safe_target, num_classes=num_classes).permute(0, 3, 1, 2).float()
+
+    valid_mask = valid_mask.unsqueeze(1)
+    probs = probs * valid_mask
+    one_hot = one_hot * valid_mask
+
+    intersection = (probs * one_hot).sum(dim=(0, 2, 3))
+    union = probs.sum(dim=(0, 2, 3)) + one_hot.sum(dim=(0, 2, 3))
+    dice = (2.0 * intersection + eps) / (union + eps)
+    return 1.0 - dice.mean()
+
+
+def focal_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    class_weights: Optional[torch.Tensor],
+    gamma: float,
+    ignore_index: int,
+) -> torch.Tensor:
+    ce = F.cross_entropy(logits, target, weight=class_weights, ignore_index=ignore_index, reduction="none")
+    valid_mask = (target != ignore_index)
+    pt = torch.exp(-ce)
+    focal = ((1 - pt) ** gamma) * ce
+    return focal[valid_mask].mean() if valid_mask.any() else ce.new_tensor(0.0)
+
+
+def compute_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    loss_cfg: Dict,
+    class_weights: Optional[torch.Tensor] = None,
+    ignore_index: int = 255,
+) -> torch.Tensor:
+    if logits.shape[-2:] != target.shape[-2:]:
+        logits = F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
+
+    num_classes = logits.shape[1]
+    target = _sanitize_targets(target, num_classes, ignore_index)
+
+    mode = loss_cfg.get("mode", "ce_weighted")
+    dice_weight = float(loss_cfg.get("dice_weight", 1.0))
+
+    if mode == "ce_weighted":
+        return F.cross_entropy(logits, target, weight=class_weights, ignore_index=ignore_index)
+
+    if mode == "ce_dice":
+        ce = F.cross_entropy(logits, target, weight=class_weights, ignore_index=ignore_index)
+        dice = multiclass_dice_loss(logits, target, ignore_index=ignore_index)
+        return ce + dice_weight * dice
+
+    if mode == "focal_dice":
+        gamma = float(loss_cfg.get("focal_gamma", 2.0))
+        fl = focal_loss(logits, target, class_weights, gamma=gamma, ignore_index=ignore_index)
+        dice = multiclass_dice_loss(logits, target, ignore_index=ignore_index)
+        return fl + dice_weight * dice
+
+    raise ValueError(f"Unsupported loss.mode: {mode}")
+
+
+def compute_class_weights(loader, num_classes: int, ignore_index: int = 255, mode: str = "inverse") -> torch.Tensor:
     pixel_counts = torch.zeros(num_classes, dtype=torch.float64)
 
     for data in loader:
-        gt = data["gt_semantic_seg"].data[0].squeeze(1)  # (B, H, W)
+        gt = data["gt_semantic_seg"].data[0].squeeze(1)
         for c in range(num_classes):
             pixel_counts[c] += (gt == c).sum().item()
 
-    # На всякий случай — игнорим индекс, если он вдруг попал в диапазон (обычно 255, но пусть будет защита)
     if 0 <= ignore_index < num_classes:
         pixel_counts[ignore_index] = 0.0
 
-    pixel_counts = pixel_counts + 1.0  # защита от деления на ноль
-    weights = 1.0 / pixel_counts
-    weights = weights / weights.mean()  # нормализация к среднему 1
+    counts = pixel_counts + 1.0
+    if mode == "median_freq":
+        freq = counts / counts.sum()
+        med = torch.median(freq)
+        weights = med / freq
+    elif mode == "effective_num":
+        beta = 0.999
+        effective_num = 1.0 - torch.pow(torch.tensor(beta, dtype=counts.dtype), counts)
+        weights = (1.0 - beta) / effective_num
+    else:
+        weights = 1.0 / counts
 
-    print("Class pixel counts:", pixel_counts.tolist())
-    print("Class weights:", weights.tolist())
-
+    if num_classes > 0:
+        weights[0] = 1.0
+    weights = weights / weights.mean()
     return weights.float()
 
 
@@ -270,6 +369,55 @@ def log_parameter_counts(model: nn.Module, logger) -> None:
         trainable_params,
         total_params - trainable_params,
     )
+
+
+def build_optimizer(
+    wrapper: nn.Module,
+    base_lr: float,
+    weight_decay: float,
+    backbone_lr_mult: float,
+    logger,
+):
+    backbone_params, head_params, other_params = [], [], []
+
+    for name, param in wrapper.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "base_model.backbone.visual" in name:
+            backbone_params.append(param)
+        elif "base_model.decode_head" in name or "mixers" in name:
+            head_params.append(param)
+        else:
+            other_params.append(param)
+
+    param_groups = []
+    if backbone_params:
+        param_groups.append({"name": "maskclip_backbone", "params": backbone_params, "lr": base_lr * backbone_lr_mult})
+    if head_params:
+        param_groups.append({"name": "head", "params": head_params, "lr": base_lr})
+    if other_params:
+        param_groups.append({"name": "other", "params": other_params, "lr": base_lr})
+
+    optimizer = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
+
+    for idx, group in enumerate(optimizer.param_groups):
+        num_params = sum(p.numel() for p in group["params"])
+        logger.info("Optimizer group %d (%s): lr=%g params=%d", idx, group.get("name", "unnamed"), group["lr"], num_params)
+
+    return optimizer
+
+
+def build_scheduler(optimizer, total_steps: int, warmup_steps: int):
+    warmup_steps = max(0, warmup_steps)
+
+    def _lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
 
 # ============================================================
@@ -365,6 +513,7 @@ def evaluate(
     model: nn.Module,
     loader,
     class_names: List[str],
+    loss_cfg: Dict,
     class_weights: Optional[torch.Tensor],
     ignore_index: int,
 ) -> Tuple[dict, float]:
@@ -384,7 +533,7 @@ def evaluate(
         target_shape = targets.shape[-2:]
         logits = F.interpolate(logits, size=target_shape, mode="bilinear", align_corners=False)
 
-        loss = compute_loss(logits, targets, class_weights, ignore_index=ignore_index)
+        loss = compute_loss(logits, targets, loss_cfg, class_weights, ignore_index=ignore_index)
         total_loss += loss.item() * imgs.size(0)
 
         preds = logits.argmax(dim=1)
@@ -513,10 +662,18 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
-    parser.add_argument("--unfreeze-depth", type=int, default=3)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--backbone-lr-mult", type=float, default=0.1)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--unfreeze-depth", type=int, default=0, help="-1 for full MaskCLIP unfreeze")
     parser.add_argument("--mix-strategy", choices=["add", "concat", "replace"], default="add")
     parser.add_argument("--use-embedding-mixer", action="store_true")
+    parser.add_argument("--loss-mode", choices=["ce_weighted", "ce_dice", "focal_dice"], default="ce_weighted")
+    parser.add_argument("--dice-weight", type=float, default=1.0)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--class-weights", default="auto", help='"auto", "none", or comma-separated values')
+    parser.add_argument("--class-weight-mode", choices=["inverse", "median_freq", "effective_num"], default="inverse")
     parser.add_argument("--output-root", default="outputs")
     return parser.parse_args()
 
@@ -551,12 +708,35 @@ def main():
     # Здесь уже можно увидеть, "особенный" ли класс 0:
     logger.info("Class names (index -> name): %s", {i: n for i, n in enumerate(class_names)})
 
-    # Веса классов по train-разметке
     ignore_index = getattr(train_loader.dataset, "ignore_index", 255)
-    class_weights = compute_class_weights(train_loader, num_classes, ignore_index).cuda()
+
+    if args.class_weights == "none":
+        class_weights = None
+    elif args.class_weights == "auto":
+        class_weights = compute_class_weights(
+            train_loader,
+            num_classes,
+            ignore_index,
+            mode=args.class_weight_mode,
+        ).cuda()
+    else:
+        parsed = [float(x.strip()) for x in args.class_weights.split(",") if x.strip()]
+        if len(parsed) != num_classes:
+            raise ValueError(f"Expected {num_classes} class weights, got {len(parsed)}")
+        class_weights = torch.tensor(parsed, dtype=torch.float32, device="cuda")
+
+    loss_cfg = {
+        "mode": args.loss_mode,
+        "dice_weight": args.dice_weight,
+        "focal_gamma": args.focal_gamma,
+    }
+    logger.info("Loss config: %s", loss_cfg)
+    if class_weights is not None:
+        logger.info("Class weights (%s): %s", args.class_weight_mode, class_weights.detach().cpu().tolist())
 
     base_model = build_model(cfg.model, class_names=class_names).cuda()
-    configure_trainable_layers(base_model, args.unfreeze_depth)
+    trainable_stats = configure_trainable_layers(base_model, args.unfreeze_depth)
+    logger.info("Trainable params by group after unfreeze depth=%d: %s", args.unfreeze_depth, trainable_stats)
 
     mixers: List[nn.Module] = []
     if args.use_embedding_mixer:
@@ -569,10 +749,15 @@ def main():
 
     log_parameter_counts(wrapper, logger)
 
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, wrapper.parameters()),
-        lr=args.learning_rate
+    optimizer = build_optimizer(
+        wrapper,
+        base_lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        backbone_lr_mult=args.backbone_lr_mult,
+        logger=logger,
     )
+    total_steps = args.epochs * len(train_loader)
+    scheduler = build_scheduler(optimizer, total_steps=total_steps, warmup_steps=args.warmup_steps)
 
     best_checkpoints: List[Tuple[float, Path]] = []
     metrics_log_path = run_dir / "metrics.jsonl"
@@ -589,9 +774,10 @@ def main():
 
             optimizer.zero_grad()
             logits, _ = wrapper(imgs)
-            loss = compute_loss(logits, targets, class_weights, ignore_index=ignore_index)
+            loss = compute_loss(logits, targets, loss_cfg, class_weights, ignore_index=ignore_index)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             loss_value = loss.item()
             loss_window.append(loss_value)
@@ -602,10 +788,12 @@ def main():
             progress.set_postfix(
                 loss=f"{loss_value:.4f}",
                 avg100=f"{avg_recent:.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
 
         avg_loss = total_loss / len(train_loader.dataset)
         logger.info("Epoch %d avg loss: %.4f", epoch, avg_loss)
+        logger.info("Epoch %d LR groups: %s", epoch, [group["lr"] for group in optimizer.param_groups])
 
         epoch_record = {
             "epoch": epoch,
@@ -615,7 +803,7 @@ def main():
         metrics = {}
         if val_loader:
             metrics, val_loss = evaluate(
-                wrapper, val_loader, class_names, class_weights, ignore_index
+                wrapper, val_loader, class_names, loss_cfg, class_weights, ignore_index
             )
             epoch_record.update({
                 "val_loss": val_loss,
