@@ -669,6 +669,7 @@ def draw_legend(img, classes, palette):
     return img
 
 
+
 @torch.no_grad()
 def save_val_visualizations(epoch, model, val_loader, out_dir):
     os.makedirs(out_dir, exist_ok=True)
