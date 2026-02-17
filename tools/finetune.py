@@ -11,8 +11,11 @@ import cv2
 import random
 import math
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from collections import deque
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import mmcv  # type: ignore
 import torch
@@ -302,33 +305,90 @@ def compute_loss(
     raise ValueError(f"Unsupported loss.mode: {mode}")
 
 
-def compute_class_weights(loader, num_classes: int, ignore_index: int = 255, mode: str = "inverse") -> torch.Tensor:
+def compute_class_weights(
+    loader,
+    num_classes: int,
+    ignore_index: int = 255,
+    mode: str = "inverse",
+    background_scale: float = 1.0,
+    clamp_max: float = 20.0,
+    class_names: Optional[List[str]] = None,
+    verbose: bool = True,
+) -> torch.Tensor:
     pixel_counts = torch.zeros(num_classes, dtype=torch.float64)
+    ignored_pixels = 0
 
     for data in loader:
-        gt = data["gt_semantic_seg"].data[0].squeeze(1)
-        for c in range(num_classes):
-            pixel_counts[c] += (gt == c).sum().item()
+        gt = data["gt_semantic_seg"].data[0].squeeze(1).to(torch.int64)  # (B,H,W)
+        flat_all = gt.reshape(-1)
 
-    if 0 <= ignore_index < num_classes:
-        pixel_counts[ignore_index] = 0.0
+        if ignore_index is not None:
+            ignored_pixels += (flat_all == ignore_index).sum().item()
+            flat = flat_all[flat_all != ignore_index]
+        else:
+            flat = flat_all
 
-    counts = pixel_counts + 1.0
+        flat = flat[(flat >= 0) & (flat < num_classes)]
+        if flat.numel() == 0:
+            continue
+
+        pixel_counts += torch.bincount(flat, minlength=num_classes).to(torch.float64)
+
+    labeled_total = pixel_counts.sum().item()
+    if labeled_total <= 0:
+        raise RuntimeError("No labeled pixels found while computing class weights.")
+
+    counts = pixel_counts + 1.0  # smoothing to avoid div-by-zero
+
     if mode == "median_freq":
-        freq = counts / counts.sum()
+        freq = counts / counts.sum().clamp_min(1.0)
         med = torch.median(freq)
         weights = med / freq
     elif mode == "effective_num":
         beta = 0.999
-        effective_num = 1.0 - torch.pow(torch.tensor(beta, dtype=counts.dtype), counts)
-        weights = (1.0 - beta) / effective_num
-    else:
+        beta_t = torch.tensor(beta, dtype=counts.dtype, device=counts.device)
+        effective_num = 1.0 - torch.pow(beta_t, counts)
+        weights = (1.0 - beta) / effective_num.clamp_min(1e-12)
+    else:  # "inverse"
         weights = 1.0 / counts
 
-    if num_classes > 0:
-        weights[0] = 1.0
-    weights = weights / weights.mean()
+    # Optional: down-weight BACKGROUND=0 if you want
+    if num_classes > 0 and background_scale != 1.0:
+        weights[0] *= float(background_scale)
+
+    # Only cap extreme large weights; do NOT force a lower bound
+    weights = torch.clamp(weights, max=float(clamp_max))
+    weights = weights / weights.mean().clamp_min(1e-12)
+
+    if verbose:
+        total_seen = labeled_total + float(ignored_pixels)
+
+        print("\n[CLASS WEIGHTS DEBUG]")
+        print(f"  num_classes      : {num_classes}")
+        print(f"  ignore_index     : {ignore_index}")
+        print(f"  total_pixels_seen: {int(total_seen)}")
+        print(f"  labeled_pixels   : {int(labeled_total)}")
+        print(f"  ignored_pixels   : {int(ignored_pixels)}")
+
+        freqs = (pixel_counts / max(1.0, labeled_total)).cpu().numpy()
+        w = weights.cpu().numpy()
+
+        order = np.argsort(-pixel_counts.cpu().numpy())
+        topk = min(10, num_classes)
+        print(f"  top-{topk} classes by pixel count:")
+        for i in order[:topk]:
+            name = class_names[i] if class_names and i < len(class_names) else str(i)
+            print(
+                f"    {i:2d} {name:16s} "
+                f"count={int(pixel_counts[i].item()):12d} freq={freqs[i]:.6f} weight={w[i]:.6f}"
+            )
+
+        print("  weights:", [float(x) for x in w.tolist()])
+        print()
+
     return weights.float()
+
+
 
 
 def validate_class_coverage(
@@ -370,7 +430,6 @@ def log_parameter_counts(model: nn.Module, logger) -> None:
         total_params - trainable_params,
     )
 
-
 def build_optimizer(
     wrapper: nn.Module,
     base_lr: float,
@@ -383,28 +442,61 @@ def build_optimizer(
     for name, param in wrapper.named_parameters():
         if not param.requires_grad:
             continue
-        if "base_model.backbone.visual" in name:
-            backbone_params.append(param)
-        elif "base_model.decode_head" in name or "mixers" in name:
+
+        # Head: decode_head + mixers
+        if ("decode_head" in name) or ("mixers" in name):
             head_params.append(param)
+
+        # Visual backbone: MaskCLIP/CLIP visual transformer blocks
+        elif ("clip_backbone.backbone.visual" in name) or ("backbone.visual" in name) or ("visual.transformer" in name):
+            backbone_params.append(param)
+
         else:
             other_params.append(param)
 
     param_groups = []
     if backbone_params:
-        param_groups.append({"name": "maskclip_backbone", "params": backbone_params, "lr": base_lr * backbone_lr_mult})
+        param_groups.append({
+            "name": "maskclip_backbone",
+            "params": backbone_params,
+            "lr": base_lr * backbone_lr_mult,
+        })
     if head_params:
-        param_groups.append({"name": "head", "params": head_params, "lr": base_lr})
+        param_groups.append({
+            "name": "head",
+            "params": head_params,
+            "lr": base_lr,
+        })
     if other_params:
-        param_groups.append({"name": "other", "params": other_params, "lr": base_lr})
+        param_groups.append({
+            "name": "other",
+            "params": other_params,
+            "lr": base_lr,
+        })
 
     optimizer = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
 
+    # --- logs + sanity ---
+    total_trainable = sum(p.numel() for p in wrapper.parameters() if p.requires_grad)
+    grouped = 0
+
     for idx, group in enumerate(optimizer.param_groups):
         num_params = sum(p.numel() for p in group["params"])
-        logger.info("Optimizer group %d (%s): lr=%g params=%d", idx, group.get("name", "unnamed"), group["lr"], num_params)
+        grouped += num_params
+        logger.info("Optimizer group %d (%s): lr=%g params=%d",
+                    idx, group.get("name", "unnamed"), group["lr"], num_params)
+
+    if grouped != total_trainable:
+        logger.warning("Grouped params (%d) != trainable params (%d). Something is off.",
+                       grouped, total_trainable)
+
+    if not backbone_params:
+        logger.warning("No backbone params matched patterns. Check name substrings.")
+    if not head_params:
+        logger.warning("No head params matched patterns. Check name substrings.")
 
     return optimizer
+
 
 
 def build_scheduler(optimizer, total_steps: int, warmup_steps: int):
@@ -629,25 +721,43 @@ def save_val_visualizations(epoch, model, val_loader, out_dir):
 #                       CHECKPOINT
 # ============================================================
 
-def save_checkpoint(model, optimizer, out_dir, epoch, metrics, average_loss, best_pool):
+def save_checkpoint(
+    model,
+    optimizer,
+    out_dir: Path,
+    epoch: int,
+    metrics: dict,
+    train_loss: float,
+    val_loss: Optional[float],
+    score_name: str,
+    score_value: float,
+    best_pool: List[Tuple[float, Path]],
+):
     checkpoint = {
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "epoch": epoch,
         "metrics": metrics,
-        "average_loss": average_loss,
+        "train_loss": float(train_loss),
+        "val_loss": float(val_loss) if val_loss is not None else None,
+        "selection_score_name": score_name,
+        "selection_score_value": float(score_value),
     }
 
-    ckpt_path = out_dir / f"epoch_{epoch:04d}_loss_{average_loss:.4f}.pth"
+    ckpt_path = out_dir / f"epoch_{epoch:04d}_{score_name}_{score_value:.4f}.pth"
     torch.save(checkpoint, ckpt_path)
 
-    best_pool.append((average_loss, ckpt_path))
+    # keep best K (smaller score = better, т.к. loss)
+    best_pool.append((score_value, ckpt_path))
     best_pool.sort(key=lambda x: x[0])
+
     while len(best_pool) > 3:
         _, old_path = best_pool.pop()
         if old_path.exists():
             old_path.unlink()
+
     return best_pool
+
 
 
 # ============================================================
@@ -659,8 +769,8 @@ def parse_args():
     parser.add_argument("config")
     parser.add_argument("--train-dataset-config", required=True)
     parser.add_argument("--val-dataset-config")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -676,7 +786,6 @@ def parse_args():
     parser.add_argument("--class-weight-mode", choices=["inverse", "median_freq", "effective_num"], default="inverse")
     parser.add_argument("--output-root", default="outputs")
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
@@ -704,8 +813,6 @@ def main():
     num_classes = len(class_names)
 
     validate_class_coverage(train_loader.dataset, val_loader.dataset if val_loader else None, num_classes, logger)
-
-    # Здесь уже можно увидеть, "особенный" ли класс 0:
     logger.info("Class names (index -> name): %s", {i: n for i, n in enumerate(class_names)})
 
     ignore_index = getattr(train_loader.dataset, "ignore_index", 255)
@@ -718,6 +825,8 @@ def main():
             num_classes,
             ignore_index,
             mode=args.class_weight_mode,
+            class_names=class_names,
+            verbose=True,
         ).cuda()
     else:
         parsed = [float(x.strip()) for x in args.class_weights.split(",") if x.strip()]
@@ -743,9 +852,18 @@ def main():
         channels = getattr(base_model.decode_head, "text_channels", 512)
         mixers.append(EmbeddingMixer(channels))
 
-    wrapper = FineTuneWrapper(
-        base_model, mixers=mixers, mix_strategy=args.mix_strategy
-    ).cuda()
+    wrapper = FineTuneWrapper(base_model, mixers=mixers, mix_strategy=args.mix_strategy).cuda()
+
+    # Optional debug: show some trainable names once
+    logger.info("=== Trainable parameter name samples ===")
+    shown = 0
+    for n, p in wrapper.named_parameters():
+        if p.requires_grad:
+            logger.info("trainable: %s | shape=%s", n, tuple(p.shape))
+            shown += 1
+            if shown >= 30:
+                break
+    logger.info("=== End samples ===")
 
     log_parameter_counts(wrapper, logger)
 
@@ -756,6 +874,7 @@ def main():
         backbone_lr_mult=args.backbone_lr_mult,
         logger=logger,
     )
+
     total_steps = args.epochs * len(train_loader)
     scheduler = build_scheduler(optimizer, total_steps=total_steps, warmup_steps=args.warmup_steps)
 
@@ -772,14 +891,14 @@ def main():
             imgs = data["img"].data[0].cuda()
             targets = data["gt_semantic_seg"].data[0].long().squeeze(1).cuda()
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             logits, _ = wrapper(imgs)
             loss = compute_loss(logits, targets, loss_cfg, class_weights, ignore_index=ignore_index)
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            loss_value = loss.item()
+            loss_value = float(loss.item())
             loss_window.append(loss_value)
             avg_recent = sum(loss_window) / len(loss_window)
 
@@ -791,43 +910,64 @@ def main():
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
 
-        avg_loss = total_loss / len(train_loader.dataset)
-        logger.info("Epoch %d avg loss: %.4f", epoch, avg_loss)
+        train_loss = total_loss / len(train_loader.dataset)
+        logger.info("Epoch %d train loss: %.4f", epoch, train_loss)
         logger.info("Epoch %d LR groups: %s", epoch, [group["lr"] for group in optimizer.param_groups])
 
         epoch_record = {
             "epoch": epoch,
-            "train_loss": avg_loss,
+            "train_loss": float(train_loss),
         }
 
-        metrics = {}
+        metrics: dict = {}
+        val_loss: Optional[float] = None
+
         if val_loader:
             metrics, val_loss = evaluate(
                 wrapper, val_loader, class_names, loss_cfg, class_weights, ignore_index
             )
             epoch_record.update({
-                "val_loss": val_loss,
+                "val_loss": float(val_loss),
                 "metrics": metrics,
             })
             logger.info(
-                "Validation — mIoU: %.4f | mF1: %.4f | mAcc: %.4f | loss: %.4f",
+                "Validation — mIoU: %.4f | mF1: %.4f | mAcc: %.4f | val_loss: %.4f",
                 metrics.get("mIoU", 0.0),
                 metrics.get("mF1", 0.0),
                 metrics.get("mAcc", 0.0),
-                val_loss,
+                float(val_loss),
             )
 
             viz_dir = run_dir / "val_viz" / f"epoch_{epoch:03d}"
             save_val_visualizations(epoch, wrapper, val_loader, viz_dir)
 
+        # ---- FIX: choose score for "best" by val_loss if available, else train_loss ----
+        if val_loader and val_loss is not None:
+            score_name = "val_loss"
+            score_value = float(val_loss)
+        else:
+            score_name = "train_loss"
+            score_value = float(train_loss)
+
         best_checkpoints = save_checkpoint(
-            wrapper, optimizer, run_dir, epoch, metrics, avg_loss, best_checkpoints
+            model=wrapper,
+            optimizer=optimizer,
+            out_dir=run_dir,
+            epoch=epoch,
+            metrics=metrics,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            score_name=score_name,
+            score_value=score_value,
+            best_pool=best_checkpoints,
         )
 
+        # log record
         with metrics_log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(epoch_record, ensure_ascii=False) + "\n")
 
     logger.info("Training finished")
+
 
 
 if __name__ == "__main__":
