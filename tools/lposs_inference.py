@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -18,6 +19,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models import build_model
+
+STRUCTURAL_DAMAGE = {"CRACK", "SPALLING", "DELAMINATION", "MISSING_ELEMENT"}
+SURFACE_STAIN = {"WATER_STAIN", "EFFLORESCENCE", "CORROSION"}
+HUMAN_ACTIVITY = {"TEXT_OR_IMAGES", "REPAIRS"}
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(
@@ -79,6 +84,27 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Overlap (in pixels) between tiles (default: 0).",
     )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Compute metrics from GT masks (requires --gt-images).",
+    )
+    parser.add_argument(
+        "--metrics-out",
+        default=None,
+        help="Optional path to write metrics JSON summary.",
+    )
+    parser.add_argument(
+        "--sanity-check",
+        action="store_true",
+        help="Print prediction/GT distributions for first N full images.",
+    )
+    parser.add_argument(
+        "--sanity-n",
+        type=int,
+        default=1,
+        help="How many full images to print sanity stats for (default: 1).",
+    )
     return parser.parse_args()
 
 
@@ -88,20 +114,6 @@ def _load_hydra_cfg(config_path: Path):
     with initialize_config_dir(config_dir=config_dir, version_base=None):
         cfg = compose(config_name=config_name)
     return cfg
-
-
-def _get_nested(obj, keys: Sequence[str], default=None):
-    cur = obj
-    for key in keys:
-        if cur is None:
-            return default
-        if hasattr(cur, "get"):
-            cur = cur.get(key, None)
-        elif isinstance(cur, dict):
-            cur = cur.get(key, None)
-        else:
-            cur = getattr(cur, key, None)
-    return default if cur is None else cur
 
 
 def extract_class_names(dataset_cfg) -> List[str]:
@@ -281,7 +293,7 @@ def build_lposs_inferencer(
     checkpoint_path: Path,
     dataset_config: Path,
     device: str,
-) -> Tuple[nn.Module, List[str], List[List[int]], Tuple[List[float], List[float], bool, int]]:
+) -> Tuple[nn.Module, List[str], List[List[int]], int]:
     cfg = _load_hydra_cfg(config_path)
     dataset_cfg = Config.fromfile(str(dataset_config))
     class_names = extract_class_names(dataset_cfg)
@@ -291,41 +303,21 @@ def build_lposs_inferencer(
     seg_model = FineTuneWrapper(base_model)
     load_checkpoint(seg_model, checkpoint_path)
 
-    dp = _get_nested(cfg, ["model", "data_preprocessor"], default=None) or _get_nested(
-        cfg, ["data_preprocessor"], default=None
-    )
-    mean = _get_nested(dp, ["mean"], default=[123.675, 116.28, 103.53])
-    std = _get_nested(dp, ["std"], default=[58.395, 57.12, 57.375])
-    bgr_to_rgb = bool(_get_nested(dp, ["bgr_to_rgb"], default=True))
-
-    mean = [float(x) for x in list(mean)]
-    std = [float(x) for x in list(std)]
-
     seg_model = seg_model.to(device)
     seg_model.eval()
 
     patch_size = _infer_patch_size(seg_model)
 
-    return seg_model, class_names, palette, (mean, std, bgr_to_rgb, patch_size)
+    return seg_model, class_names, palette, patch_size
 
 
 def lposs_predict_map(
     image: np.ndarray,
     seg_model: nn.Module,
-    norm_params: Tuple[List[float], List[float], bool, int],
+    patch_size: int,
 ) -> np.ndarray:
-    mean, std, bgr_to_rgb, patch_size = norm_params
-
-    img = image
-    if bgr_to_rgb is False:
-        img = img[..., ::-1].copy()
-
-    height, width = img.shape[:2]
-    x = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0)
-
-    mean_t = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
-    std_t = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
-    x = (x - mean_t) / std_t
+    height, width = image.shape[:2]
+    x = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0)
 
     patch_size = max(1, int(patch_size))
     pad_h = (patch_size - (height % patch_size)) % patch_size
@@ -347,6 +339,61 @@ def lposs_predict_map(
 
     probs = probs.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
     return probs
+
+
+def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    num = np.asarray(numerator, dtype=np.float64)
+    den = np.asarray(denominator, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.divide(num, den, out=np.zeros_like(num, dtype=np.float64), where=den != 0)
+
+
+def _compute_group_metrics(confusion: np.ndarray, group_indices: List[int]) -> dict:
+    tp = confusion[group_indices, :][:, group_indices].sum()
+    fp = confusion[:, group_indices].sum() - tp
+    fn = confusion[group_indices, :].sum() - tp
+    iou = _safe_divide(tp, tp + fp + fn)
+    f1 = _safe_divide(2 * tp, 2 * tp + fp + fn)
+    acc = _safe_divide(tp, tp + fn)
+    return {"iou": float(iou), "f1": float(f1), "accuracy": float(acc)}
+
+
+def _compute_metrics_from_confusion(confusion: np.ndarray, class_names: List[str]) -> dict:
+    true_positives = np.diag(confusion)
+    false_positives = confusion.sum(axis=0) - true_positives
+    false_negatives = confusion.sum(axis=1) - true_positives
+
+    class_iou = _safe_divide(true_positives, true_positives + false_positives + false_negatives)
+    class_f1 = _safe_divide(2 * true_positives, 2 * true_positives + false_positives + false_negatives)
+    class_acc = _safe_divide(true_positives, true_positives + false_negatives)
+
+    class_metrics = {}
+    for idx, name in enumerate(class_names):
+        class_metrics[name] = {
+            "iou": float(class_iou[idx]),
+            "f1": float(class_f1[idx]),
+            "accuracy": float(class_acc[idx]),
+        }
+
+    name_to_idx = {name: idx for idx, name in enumerate(class_names)}
+    group_indices = {
+        "STRUCTURAL_DAMAGE": [name_to_idx[c] for c in STRUCTURAL_DAMAGE if c in name_to_idx],
+        "SURFACE_STAIN": [name_to_idx[c] for c in SURFACE_STAIN if c in name_to_idx],
+        "HUMAN_ACTIVITY": [name_to_idx[c] for c in HUMAN_ACTIVITY if c in name_to_idx],
+    }
+
+    group_metrics = {}
+    for group_name, indices in group_indices.items():
+        if indices:
+            group_metrics[group_name] = _compute_group_metrics(confusion, indices)
+
+    return {
+        "mIoU": float(np.nanmean(class_iou)),
+        "mF1": float(np.nanmean(class_f1)),
+        "mAcc": float(np.nanmean(class_acc)),
+        "class_metrics": class_metrics,
+        "group_metrics": group_metrics,
+    }
 
 
 def overlay_mask(
@@ -456,13 +503,16 @@ def iter_tiles(
 def main() -> None:
     args = parse_args()
 
+    if args.eval and not args.gt_images:
+        raise ValueError("--eval requires --gt-images")
+
     images_path = Path(args.images)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     gt_dir = Path(args.gt_images) if args.gt_images else None
 
-    seg_model, class_names, palette, norm_params = build_lposs_inferencer(
+    seg_model, class_names, palette, patch_size = build_lposs_inferencer(
         config_path=Path(args.lposs_config),
         checkpoint_path=Path(args.lposs_checkpoint),
         dataset_config=Path(args.lposs_dataset_config),
@@ -485,6 +535,11 @@ def main() -> None:
     overlay_dir.mkdir(parents=True, exist_ok=True)
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
+    num_classes = len(class_names)
+    confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+    num_images_with_gt = 0
+    sanity_printed = 0
+
     for image_path in tqdm(image_paths, desc="Running inference", unit="image"):
         image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image_bgr is None:
@@ -492,7 +547,7 @@ def main() -> None:
             continue
 
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        probs = lposs_predict_map(image_rgb, seg_model, norm_params)
+        probs = lposs_predict_map(image_rgb, seg_model, patch_size)
         pred_mask = probs.argmax(axis=-1).astype(np.int64)
 
         pred_overlay = overlay_mask(image_rgb, pred_mask, palette, ignore_index)
@@ -500,6 +555,7 @@ def main() -> None:
         pred_out = overlay_dir / f"{image_path.stem}_pred{image_path.suffix}"
         cv2.imwrite(str(pred_out), cv2.cvtColor(pred_overlay, cv2.COLOR_RGB2BGR))
 
+        gt_mask_for_eval = None
         if gt_dir is not None:
             gt_path = resolve_gt_path(gt_dir, image_path)
             if gt_path is None:
@@ -507,26 +563,99 @@ def main() -> None:
             else:
                 gt_mask = load_mask(gt_path)
                 if gt_mask.shape[:2] != image_rgb.shape[:2]:
+                    LOGGER.warning(
+                        "Resizing GT mask for %s from %s to %s",
+                        image_path.name,
+                        gt_mask.shape[:2],
+                        image_rgb.shape[:2],
+                    )
                     gt_mask = cv2.resize(
                         gt_mask,
                         (image_rgb.shape[1], image_rgb.shape[0]),
                         interpolation=cv2.INTER_NEAREST,
                     )
+                gt_mask_for_eval = gt_mask
                 gt_overlay = overlay_mask(image_rgb, gt_mask, palette, ignore_index)
                 gt_overlay = add_legend(gt_overlay, class_names, palette)
                 gt_out = overlay_dir / f"{image_path.stem}_gt{image_path.suffix}"
                 cv2.imwrite(str(gt_out), cv2.cvtColor(gt_overlay, cv2.COLOR_RGB2BGR))
 
+        if args.eval:
+            if gt_mask_for_eval is None:
+                LOGGER.warning("Skipping metrics for %s: GT mask missing", image_path.name)
+            else:
+                valid = gt_mask_for_eval != ignore_index
+                if np.any(valid):
+                    gt_flat = gt_mask_for_eval[valid].reshape(-1)
+                    pred_flat = pred_mask[valid].reshape(-1)
+                    combined = gt_flat * num_classes + pred_flat
+                    hist = np.bincount(combined, minlength=num_classes * num_classes)
+                    confusion += hist.reshape(num_classes, num_classes)
+                num_images_with_gt += 1
+
+        if args.sanity_check and sanity_printed < max(0, args.sanity_n):
+            pred_unique, pred_counts = np.unique(pred_mask, return_counts=True)
+            pred_dist = {class_names[int(i)]: int(c) for i, c in zip(pred_unique, pred_counts)}
+            LOGGER.info("[SANITY] %s pred distribution: %s", image_path.name, pred_dist)
+            if gt_mask_for_eval is not None:
+                gt_unique, gt_counts = np.unique(gt_mask_for_eval, return_counts=True)
+                gt_dist = {
+                    (class_names[int(i)] if int(i) < len(class_names) else f"IGNORE_{int(i)}"): int(c)
+                    for i, c in zip(gt_unique, gt_counts)
+                }
+                ignored_frac = float((gt_mask_for_eval == ignore_index).mean())
+                LOGGER.info("[SANITY] %s gt distribution: %s", image_path.name, gt_dist)
+                LOGGER.info("[SANITY] %s gt ignored_frac: %.4f", image_path.name, ignored_frac)
+            sanity_printed += 1
+
         tile_root = tiles_dir / image_path.stem
         tile_root.mkdir(parents=True, exist_ok=True)
         tiles = iter_tiles(image_rgb, args.tile_size, args.tile_overlap)
         for (x, y), tile in tiles:
-            tile_probs = lposs_predict_map(tile, seg_model, norm_params)
+            tile_probs = lposs_predict_map(tile, seg_model, patch_size)
             tile_pred = tile_probs.argmax(axis=-1).astype(np.int64)
             tile_overlay = overlay_mask(tile, tile_pred, palette, ignore_index)
             tile_overlay = add_legend(tile_overlay, class_names, palette)
             tile_out = tile_root / f"{image_path.stem}_x{x}_y{y}_pred{image_path.suffix}"
             cv2.imwrite(str(tile_out), cv2.cvtColor(tile_overlay, cv2.COLOR_RGB2BGR))
+
+    if args.eval:
+        metrics = _compute_metrics_from_confusion(confusion, class_names)
+        LOGGER.info(
+            "Evaluation summary — mIoU: %.4f | mF1: %.4f | mAcc: %.4f",
+            metrics["mIoU"],
+            metrics["mF1"],
+            metrics["mAcc"],
+        )
+        sorted_by_iou = sorted(
+            metrics["class_metrics"].items(), key=lambda item: item[1]["iou"]
+        )
+        worst_k = min(5, len(sorted_by_iou))
+        LOGGER.info(
+            "Worst-%d classes by IoU: %s",
+            worst_k,
+            [
+                {"class": name, "iou": vals["iou"], "f1": vals["f1"], "accuracy": vals["accuracy"]}
+                for name, vals in sorted_by_iou[:worst_k]
+            ],
+        )
+
+        if args.metrics_out:
+            summary = {
+                "num_images_total": len(image_paths),
+                "num_images_with_gt": num_images_with_gt,
+                "checkpoint": str(args.lposs_checkpoint),
+                "dataset_config": str(args.lposs_dataset_config),
+                "mIoU": metrics["mIoU"],
+                "mF1": metrics["mF1"],
+                "mAcc": metrics["mAcc"],
+                "class_metrics": metrics["class_metrics"],
+                "group_metrics": metrics["group_metrics"],
+            }
+            metrics_out_path = Path(args.metrics_out)
+            metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            LOGGER.info("Saved metrics JSON to %s", metrics_out_path)
 
     LOGGER.info("Inference complete. Outputs saved to %s", out_dir)
 
