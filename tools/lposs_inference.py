@@ -312,18 +312,27 @@ def build_lposs_inferencer(
 
 
 def lposs_predict_map(
-    image: np.ndarray,
+    image_bgr: np.ndarray,
     seg_model: nn.Module,
     patch_size: int,
 ) -> np.ndarray:
-    height, width = image.shape[:2]
-    x = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0)
+    """
+    IMPORTANT: match training input as closely as possible.
+    In training (mmseg LoadImageFromFile without Normalize/to_rgb), the model likely sees BGR uint8.
+    Поэтому:
+      - не конвертим BGR->RGB перед моделью
+      - не форсим float() (чтобы не сломать ветвления по dtype внутри препроцессора/модели)
+    """
+    height, width = image_bgr.shape[:2]
+
+    # Keep dtype as-is (uint8) to mimic mmseg pipeline
+    x = torch.from_numpy(image_bgr).permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
 
     patch_size = max(1, int(patch_size))
     pad_h = (patch_size - (height % patch_size)) % patch_size
     pad_w = (patch_size - (width % patch_size)) % patch_size
     if pad_h or pad_w:
-        x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0)
 
     device = next(seg_model.parameters()).device
     x = x.to(device)
@@ -397,13 +406,13 @@ def _compute_metrics_from_confusion(confusion: np.ndarray, class_names: List[str
 
 
 def overlay_mask(
-    image: np.ndarray,
+    image_rgb: np.ndarray,
     mask: np.ndarray,
     palette: List[List[int]],
     ignore_index: int = 255,
 ) -> np.ndarray:
-    overlay = image.copy()
-    color_mask = np.zeros_like(image)
+    overlay = image_rgb.copy()
+    color_mask = np.zeros_like(image_rgb)
 
     for idx, color in enumerate(palette):
         color_mask[mask == idx] = color
@@ -484,18 +493,18 @@ def load_mask(mask_path: Path) -> np.ndarray:
 
 
 def iter_tiles(
-    image: np.ndarray,
+    image_rgb: np.ndarray,
     tile_size: int,
     overlap: int,
 ) -> List[Tuple[Tuple[int, int], np.ndarray]]:
-    height, width = image.shape[:2]
+    height, width = image_rgb.shape[:2]
     stride = max(1, tile_size - overlap)
     tiles = []
     for y in range(0, height, stride):
         for x in range(0, width, stride):
             y_end = min(y + tile_size, height)
             x_end = min(x + tile_size, width)
-            tile = image[y:y_end, x:x_end]
+            tile = image_rgb[y:y_end, x:x_end]
             tiles.append(((x, y), tile))
     return tiles
 
@@ -539,6 +548,7 @@ def main() -> None:
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
     num_images_with_gt = 0
     sanity_printed = 0
+    input_debug_printed = False
 
     for image_path in tqdm(image_paths, desc="Running inference", unit="image"):
         image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -546,11 +556,25 @@ def main() -> None:
             LOGGER.warning("Skipping unreadable image: %s", image_path)
             continue
 
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        probs = lposs_predict_map(image_rgb, seg_model, patch_size)
+        # For visualization ONLY
+        image_rgb_vis = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        # Model input (match training): BGR, keep dtype
+        if args.sanity_check and not input_debug_printed:
+            LOGGER.info(
+                "[SANITY] model input stats for %s: dtype=%s min=%s max=%s shape=%s (channel_order=BGR)",
+                image_path.name,
+                image_bgr.dtype,
+                int(image_bgr.min()),
+                int(image_bgr.max()),
+                tuple(image_bgr.shape),
+            )
+            input_debug_printed = True
+
+        probs = lposs_predict_map(image_bgr, seg_model, patch_size)
         pred_mask = probs.argmax(axis=-1).astype(np.int64)
 
-        pred_overlay = overlay_mask(image_rgb, pred_mask, palette, ignore_index)
+        pred_overlay = overlay_mask(image_rgb_vis, pred_mask, palette, ignore_index)
         pred_overlay = add_legend(pred_overlay, class_names, palette)
         pred_out = overlay_dir / f"{image_path.stem}_pred{image_path.suffix}"
         cv2.imwrite(str(pred_out), cv2.cvtColor(pred_overlay, cv2.COLOR_RGB2BGR))
@@ -562,20 +586,20 @@ def main() -> None:
                 LOGGER.warning("GT mask not found for %s", image_path.name)
             else:
                 gt_mask = load_mask(gt_path)
-                if gt_mask.shape[:2] != image_rgb.shape[:2]:
+                if gt_mask.shape[:2] != image_rgb_vis.shape[:2]:
                     LOGGER.warning(
                         "Resizing GT mask for %s from %s to %s",
                         image_path.name,
                         gt_mask.shape[:2],
-                        image_rgb.shape[:2],
+                        image_rgb_vis.shape[:2],
                     )
                     gt_mask = cv2.resize(
                         gt_mask,
-                        (image_rgb.shape[1], image_rgb.shape[0]),
+                        (image_rgb_vis.shape[1], image_rgb_vis.shape[0]),
                         interpolation=cv2.INTER_NEAREST,
                     )
                 gt_mask_for_eval = gt_mask
-                gt_overlay = overlay_mask(image_rgb, gt_mask, palette, ignore_index)
+                gt_overlay = overlay_mask(image_rgb_vis, gt_mask, palette, ignore_index)
                 gt_overlay = add_legend(gt_overlay, class_names, palette)
                 gt_out = overlay_dir / f"{image_path.stem}_gt{image_path.suffix}"
                 cv2.imwrite(str(gt_out), cv2.cvtColor(gt_overlay, cv2.COLOR_RGB2BGR))
@@ -608,13 +632,16 @@ def main() -> None:
                 LOGGER.info("[SANITY] %s gt ignored_frac: %.4f", image_path.name, ignored_frac)
             sanity_printed += 1
 
+        # Tiles for visualization/debug (keep as before: RGB tiles for overlays)
         tile_root = tiles_dir / image_path.stem
         tile_root.mkdir(parents=True, exist_ok=True)
-        tiles = iter_tiles(image_rgb, args.tile_size, args.tile_overlap)
-        for (x, y), tile in tiles:
-            tile_probs = lposs_predict_map(tile, seg_model, patch_size)
+        tiles = iter_tiles(image_rgb_vis, args.tile_size, args.tile_overlap)
+        for (x, y), tile_rgb in tiles:
+            # For model: convert this tile back to BGR to match training
+            tile_bgr = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2BGR)
+            tile_probs = lposs_predict_map(tile_bgr, seg_model, patch_size)
             tile_pred = tile_probs.argmax(axis=-1).astype(np.int64)
-            tile_overlay = overlay_mask(tile, tile_pred, palette, ignore_index)
+            tile_overlay = overlay_mask(tile_rgb, tile_pred, palette, ignore_index)
             tile_overlay = add_legend(tile_overlay, class_names, palette)
             tile_out = tile_root / f"{image_path.stem}_x{x}_y{y}_pred{image_path.suffix}"
             cv2.imwrite(str(tile_out), cv2.cvtColor(tile_overlay, cv2.COLOR_RGB2BGR))
