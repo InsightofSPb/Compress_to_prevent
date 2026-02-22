@@ -13,13 +13,13 @@ tiling:
   min_content_ratio: 0.6
 
 paths:
-  images: /home/sasha/LPOSS/datasets/SPb_facades/raw_images
-  masks: /home/sasha/LPOSS/datasets/SPb_facades/masks
+  images: /home/sasha/LPOSS/datasets/february_march_2026_data/images
+  masks: /home/sasha/LPOSS/datasets/february_march_2026_data/masks
   # Optional: path to YAML/JSON dict mapping image filename -> mask filename when names differ
   pairs: 
-  output_images: data/facades_aug/images
-  output_masks: data/facades_aug/masks
-  output_overlays: data/facades_aug/overlays
+  output_images: /home/sasha/LPOSS/datasets/february_march_2026_data/augmented/images
+  output_masks: /home/sasha/LPOSS/datasets/february_march_2026_data/augmented/masks
+  output_overlays: /home/sasha/LPOSS/datasets/february_march_2026_data/augmented/overlays
 
 save:
   suffix: aug
@@ -47,22 +47,28 @@ augmentations:
     shift_scale_rotate: {shift_limit: 0.05, scale_limit: 0.1, rotate_limit: 10, p: 0.25}
 
   photometric:
-    brightness_contrast: 0.25
-    brightness_limit: 0.15
-    contrast_limit: 0.15
-    hue_sat: 0.2
-    hue_shift_limit: 8
-    sat_shift_limit: 8
-    val_shift_limit: 8
-    rgb_shift: 0.1
-    r_shift: 6
-    g_shift: 6
-    b_shift: 6
-    gaussian_noise: 0.1
-    noise_var: [3.0, 12.0]
-    blur: 0.0
-    clahe: 0.0
-    clip_limit: 2.0
+    brightness_contrast: 0.40
+    brightness_limit: 0.22
+    contrast_limit: 0.22
+
+    hue_sat: 0.35
+    hue_shift_limit: 10
+    sat_shift_limit: 14
+    val_shift_limit: 10
+
+    rgb_shift: 0.20
+    r_shift: 10
+    g_shift: 10
+    b_shift: 10
+
+    gaussian_noise: 0.15
+    noise_var: [4.0, 18.0]
+
+  cutout:
+    p: 0.30
+    num_holes: 8
+    max_h_size: 56
+    max_w_size: 56
 
   weather:
     rain: 0.0

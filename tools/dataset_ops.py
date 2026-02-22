@@ -140,7 +140,113 @@ def apply_zoom(
 
 
 def build_transforms(config: Dict) -> A.Compose:
+    import inspect
+    import math
+
     transforms: List[A.BasicTransform] = []
+
+    def _gauss_noise_transform(photo_cfg: Dict):
+        """Version-compatible GaussNoise (albumentations 1.x / 2.x)."""
+        p = photo_cfg.get("gaussian_noise", 0)
+        if p <= 0:
+            return None
+
+        noise_var = photo_cfg.get("noise_var", (10.0, 50.0))
+        if isinstance(noise_var, (int, float)):
+            noise_var = (0.0, float(noise_var))
+        vmin, vmax = float(noise_var[0]), float(noise_var[1])
+        if vmin > vmax:
+            vmin, vmax = vmax, vmin
+
+        try:
+            sig = inspect.signature(A.GaussNoise.__init__)
+            params = sig.parameters
+
+            # Old API (albumentations 1.x)
+            if "var_limit" in params:
+                return A.GaussNoise(var_limit=(vmin, vmax), p=p)
+
+            # New API (albumentations 2.x): std_range (usually normalized [0..1])
+            if "std_range" in params:
+                # Convert variance (pixel^2) -> std (pixels), then normalize by 255
+                smin = max(0.0, math.sqrt(max(0.0, vmin)) / 255.0)
+                smax = max(smin, math.sqrt(max(0.0, vmax)) / 255.0)
+                kwargs = {"std_range": (smin, smax), "p": p}
+                if "mean_range" in params:
+                    kwargs["mean_range"] = (0.0, 0.0)
+                return A.GaussNoise(**kwargs)
+
+        except Exception:
+            # Fallback attempt (old API)
+            try:
+                return A.GaussNoise(var_limit=(vmin, vmax), p=p)
+            except Exception:
+                pass
+
+        # Last fallback: minimal constructor
+        return A.GaussNoise(p=p)
+
+    def _cutout_like_transform(cutout_cfg: Dict):
+        """Version-compatible Cutout/CoarseDropout."""
+        p = cutout_cfg.get("p", 0)
+        if not cutout_cfg or p <= 0:
+            return None
+
+        num_holes = int(cutout_cfg.get("num_holes", 8))
+        max_h = int(cutout_cfg.get("max_h_size", 32))
+        max_w = int(cutout_cfg.get("max_w_size", 32))
+        fill_value = cutout_cfg.get("fill_value", 0)
+
+        # Old API: Cutout exists
+        if hasattr(A, "Cutout"):
+            try:
+                return A.Cutout(
+                    num_holes=num_holes,
+                    max_h_size=max_h,
+                    max_w_size=max_w,
+                    fill_value=fill_value,
+                    p=p,
+                )
+            except Exception:
+                pass
+
+        # Newer API: use CoarseDropout
+        if hasattr(A, "CoarseDropout"):
+            sig = inspect.signature(A.CoarseDropout.__init__)
+            params = sig.parameters
+
+            # New API style (albumentations 2.x)
+            if "num_holes_range" in params:
+                kwargs = {
+                    "num_holes_range": (num_holes, num_holes),
+                    "hole_height_range": (1, max_h),
+                    "hole_width_range": (1, max_w),
+                    "p": p,
+                }
+                if "fill" in params:
+                    kwargs["fill"] = fill_value
+                elif "fill_value" in params:
+                    kwargs["fill_value"] = fill_value
+                return A.CoarseDropout(**kwargs)
+
+            # Old CoarseDropout API (albumentations 1.x)
+            kwargs = {
+                "max_holes": num_holes,
+                "min_holes": num_holes,
+                "max_height": max_h,
+                "max_width": max_w,
+                "min_height": 1,
+                "min_width": 1,
+                "p": p,
+            }
+            if "fill_value" in params:
+                kwargs["fill_value"] = fill_value
+            elif "fill" in params:
+                kwargs["fill"] = fill_value
+            return A.CoarseDropout(**kwargs)
+
+        return None
+
     size_cfg = config.get("size", {})
     if "resize" in size_cfg:
         resize_cfg = size_cfg["resize"]
@@ -151,6 +257,7 @@ def build_transforms(config: Dict) -> A.Compose:
                 interpolation=cv2.INTER_LINEAR,
             )
         )
+
     if "random_crop" in size_cfg and size_cfg["random_crop"].get("p", 0) > 0:
         crop_cfg = size_cfg["random_crop"]
         transforms.append(
@@ -168,6 +275,8 @@ def build_transforms(config: Dict) -> A.Compose:
         transforms.append(A.VerticalFlip(p=geo_cfg.get("vertical_flip", 0)))
     if geo_cfg.get("random_rotate90", 0) > 0:
         transforms.append(A.RandomRotate90(p=geo_cfg.get("random_rotate90", 0)))
+
+    # This warning is harmless; keeping ShiftScaleRotate for backward compatibility.
     if geo_cfg.get("shift_scale_rotate"):
         ssr = geo_cfg["shift_scale_rotate"]
         transforms.append(
@@ -189,6 +298,7 @@ def build_transforms(config: Dict) -> A.Compose:
                 p=photo_cfg.get("brightness_contrast", 0),
             )
         )
+
     if photo_cfg.get("hue_sat", 0) > 0:
         transforms.append(
             A.HueSaturationValue(
@@ -198,6 +308,7 @@ def build_transforms(config: Dict) -> A.Compose:
                 p=photo_cfg.get("hue_sat", 0),
             )
         )
+
     if photo_cfg.get("rgb_shift", 0) > 0:
         transforms.append(
             A.RGBShift(
@@ -207,14 +318,26 @@ def build_transforms(config: Dict) -> A.Compose:
                 p=photo_cfg.get("rgb_shift", 0),
             )
         )
-    if photo_cfg.get("gaussian_noise", 0) > 0:
-        transforms.append(
-            A.GaussNoise(var_limit=photo_cfg.get("noise_var", (10.0, 50.0)), p=photo_cfg.get("gaussian_noise", 0))
-        )
+
+    gauss_noise_tf = _gauss_noise_transform(photo_cfg)
+    if gauss_noise_tf is not None:
+        transforms.append(gauss_noise_tf)
+
     if photo_cfg.get("blur", 0) > 0:
-        transforms.append(A.Blur(blur_limit=photo_cfg.get("blur_limit", 3), p=photo_cfg.get("blur", 0)))
+        transforms.append(
+            A.Blur(
+                blur_limit=photo_cfg.get("blur_limit", 3),
+                p=photo_cfg.get("blur", 0),
+            )
+        )
+
     if photo_cfg.get("clahe", 0) > 0:
-        transforms.append(A.CLAHE(clip_limit=photo_cfg.get("clip_limit", 2.0), p=photo_cfg.get("clahe", 0)))
+        transforms.append(
+            A.CLAHE(
+                clip_limit=photo_cfg.get("clip_limit", 2.0),
+                p=photo_cfg.get("clahe", 0),
+            )
+        )
 
     weather_cfg = config.get("weather", {})
     if weather_cfg.get("rain", 0) > 0:
@@ -229,15 +352,8 @@ def build_transforms(config: Dict) -> A.Compose:
         transforms.append(A.RandomShadow(p=weather_cfg.get("shadow", 0)))
 
     cutout_cfg = config.get("cutout")
-    if cutout_cfg and cutout_cfg.get("p", 0) > 0:
-        transforms.append(
-            A.Cutout(
-                num_holes=cutout_cfg.get("num_holes", 8),
-                max_h_size=cutout_cfg.get("max_h_size", 32),
-                max_w_size=cutout_cfg.get("max_w_size", 32),
-                fill_value=cutout_cfg.get("fill_value", 0),
-                p=cutout_cfg.get("p", 0),
-            )
-        )
+    cutout_tf = _cutout_like_transform(cutout_cfg)
+    if cutout_tf is not None:
+        transforms.append(cutout_tf)
 
     return A.Compose(transforms, additional_targets={"mask": "mask"})
