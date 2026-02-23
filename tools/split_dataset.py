@@ -101,8 +101,31 @@ def load_tiling_defaults(config_path: Path) -> Dict[str, object]:
         "augmentations_per_image": int(cfg.get("augmentations_per_image", 1)),
         "augmentations": cfg.get("augmentations", {}),
         "seed": int(cfg.get("seed", 42)),
+        # чтобы overlay_cfg в run_protocol брался из конфига, а не только дефолты
+        "overlay_alpha": float(cfg.get("overlay_alpha", 0.45)),
+        "palette": cfg.get("palette", []),
     }
 
+def is_forced_test_row(row: Dict[str, object], test_years_set: set[int]) -> bool:
+    """
+    Правило "обязательного теста" для временного сплита:
+    - обычные исторические фото с year in test_years -> test
+    - НО PXL_/IMG_ (phone captures / отдельные разметки без истории) НЕ форсим в test
+      и разрешаем им попасть в train/val.
+    """
+    year = int(row["year"])
+    if year not in test_years_set:
+        return False
+
+    img_path_obj = row.get("image_path")
+    if isinstance(img_path_obj, Path):
+        stem = img_path_obj.stem
+    else:
+        # fallback на rel_image_path / string
+        rel_name = str(row.get("rel_image_path", ""))
+        stem = Path(rel_name).stem
+
+    return not (stem.startswith("PXL_") or stem.startswith("IMG_"))
 
 def collect_samples_from_root(data_root: Path, image_exts: Sequence[str]) -> List[Dict[str, object]]:
     images_dir = data_root / "images"
@@ -331,13 +354,23 @@ def split_by_group(rows: List[Dict[str, object]], group_key: str, val_ratio: flo
     return train_rows, val_rows
 
 
-def build_protocol_splits(protocol: str, rows: List[Dict[str, object]], test_years: Sequence[int], val_ratio: float, seed: int) -> Dict[str, List[Dict[str, object]]]:
+def build_protocol_splits(
+    protocol: str,
+    rows: List[Dict[str, object]],
+    test_years: Sequence[int],
+    val_ratio: float,
+    seed: int,
+) -> Dict[str, List[Dict[str, object]]]:
     test_years_set = set(test_years)
-    test_rows = [row for row in rows if int(row["year"]) in test_years_set]
+
+    # В test идут только "forced test" строки по новой логике
+    test_rows = [row for row in rows if is_forced_test_row(row, test_years_set)]
 
     if protocol == "A":
-        trainval_rows = [row for row in rows if int(row["year"]) not in test_years_set]
+        # Всё остальное -> pool train/val (включая PXL_/IMG_ даже если year=2025)
+        trainval_rows = [row for row in rows if not is_forced_test_row(row, test_years_set)]
         train_rows, val_rows = split_by_group(trainval_rows, "source_id", val_ratio, seed)
+
     elif protocol == "B":
         for row in rows:
             facade_id = str(row["facade_id"])
@@ -345,13 +378,20 @@ def build_protocol_splits(protocol: str, rows: List[Dict[str, object]], test_yea
                 raise RuntimeError(
                     f"Protocol B requires non-empty facade_id; got '{facade_id}' in {row['rel_image_path']}"
                 )
+
+        # Тестовые фасады определяем только по forced-test строкам
         test_facades = {str(row["facade_id"]) for row in test_rows}
+
+        # В train/val берём всё, что:
+        # 1) не forced-test
+        # 2) и не пересекается по facade_id с тестовыми фасадами (анти-лик в B)
         trainval_rows = [
             row
             for row in rows
-            if int(row["year"]) not in test_years_set and str(row["facade_id"]) not in test_facades
+            if (not is_forced_test_row(row, test_years_set)) and str(row["facade_id"]) not in test_facades
         ]
         train_rows, val_rows = split_by_group(trainval_rows, "facade_id", val_ratio, seed)
+
     else:
         raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -385,7 +425,19 @@ def tile_and_prepare(
     mixup_cfg: Optional[Dict[str, object]] = None,
     cutmix_cfg: Optional[Dict[str, object]] = None,
     overlay_cfg: Optional[Dict[str, object]] = None,
+    hires_cfg: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
+    """
+    hires_cfg ожидается примерно такой:
+      {
+        "prefixes": ["PXL_", "IMG_"],
+        "year": 2025,
+        "max_tiles": 40,
+        "non_overlap": True
+      }
+    """
+    import hashlib
+
     random.seed(seed)
     np.random.seed(seed)
 
@@ -397,6 +449,7 @@ def tile_and_prepare(
     mixup_cfg = mixup_cfg or {}
     cutmix_cfg = cutmix_cfg or {}
     overlay_cfg = overlay_cfg or {}
+    hires_cfg = hires_cfg or {}
 
     save_overlays = bool(overlay_cfg.get("enabled", False))
     overlay_alpha = float(overlay_cfg.get("alpha", 0.45))
@@ -407,7 +460,13 @@ def tile_and_prepare(
         split_overlays_dir.mkdir(parents=True, exist_ok=True)
 
     tile_manifest: List[Dict[str, object]] = []
-    stats = {"base_tiles": 0, "augmented_tiles": 0}
+    stats = {
+        "base_tiles": 0,
+        "augmented_tiles": 0,
+        "hires_sources_seen": 0,
+        "hires_sources_capped": 0,
+        "hires_tiles_dropped": 0,
+    }
 
     def _read_image_mask_pair(image_path: Path, mask_path: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -562,6 +621,77 @@ def tile_and_prepare(
         except TypeError:
             return apply_cutmix(img, mask, partner_img, partner_mask, alpha)
 
+    # ---------- HI-RES helpers (PXL_/IMG_) ----------
+    def _is_hires_row(row_obj: Dict[str, object]) -> bool:
+        # ограничиваем только train/val (как договаривались)
+        if split_name not in {"train", "val"}:
+            return False
+
+        try:
+            y = int(row_obj.get("year", -1))
+        except Exception:
+            return False
+
+        hires_year = int(hires_cfg.get("year", 2025))
+        if y != hires_year:
+            return False
+
+        prefixes = hires_cfg.get("prefixes", ["PXL_", "IMG_"])
+        if not isinstance(prefixes, (list, tuple)) or not prefixes:
+            prefixes = ["PXL_", "IMG_"]
+
+        img_path_obj = row_obj.get("image_path")
+        if isinstance(img_path_obj, Path):
+            stem = img_path_obj.stem
+        else:
+            stem = Path(str(row_obj.get("rel_image_path", ""))).stem
+
+        return any(stem.startswith(str(p)) for p in prefixes)
+
+    def _mask_content_score(mask_tile: np.ndarray) -> float:
+        """
+        Score = доля пикселей НЕ фона (label > 0) среди валидных.
+        ignore=255 исключаем из знаменателя.
+        """
+        m = mask_tile
+        if m is None:
+            return 0.0
+        if m.ndim == 3:
+            m = m[..., 0]
+        m = m.astype(np.int32, copy=False)
+
+        valid = (m != 255)
+        if not np.any(valid):
+            return 0.0
+
+        fg = (m > 0) & valid
+        return float(fg.sum() / valid.sum())
+
+    def _select_hires_tiles_by_content(
+        source_id: str,
+        tiles_all: List[Tuple[int, int, int, np.ndarray, np.ndarray]],
+        max_tiles: int,
+    ) -> List[Tuple[int, int, int, np.ndarray, np.ndarray]]:
+        """
+        Берём top-K тайлов по max-content, tie-break детерминированный от seed+source_id.
+        """
+        if max_tiles <= 0 or len(tiles_all) <= max_tiles:
+            return tiles_all
+
+        # стабильный tie-break на каждый source, чтобы результат не зависел от порядка обхода
+        h = hashlib.md5(f"{seed}::{source_id}".encode("utf-8")).hexdigest()
+        local_seed = int(h[:8], 16)
+        rng = random.Random(local_seed)
+
+        scored = []
+        for t in tiles_all:
+            tile_idx, x, y, img_t, msk_t = t
+            s = _mask_content_score(msk_t)
+            scored.append((s, rng.random(), t))  # rng.random() = deterministic tie-break
+
+        scored.sort(key=lambda z: (-z[0], z[1]))
+        return [t for _, _, t in scored[:max_tiles]]
+
     for row in rows:
         try:
             image_path = Path(row["image_path"])
@@ -578,16 +708,50 @@ def tile_and_prepare(
 
             image, mask = loaded
 
-            for tile_idx, x, y, image_tile, mask_tile in generate_tiles(
-                image=image,
-                mask=mask,
-                tile_h=int(tiling_cfg["tile_size"]),
-                tile_w=int(tiling_cfg["tile_size"]),
-                stride_h=int(tiling_cfg["stride"]),
-                stride_w=int(tiling_cfg["stride"]),
-                pad_mode=str(tiling_cfg["pad_mode"]),
-                min_content_ratio=float(tiling_cfg["min_content_ratio"]),
-            ):
+            tile_size = int(tiling_cfg["tile_size"])
+            base_stride = int(tiling_cfg["stride"])
+
+            is_hires = _is_hires_row(row)
+            if is_hires:
+                stats["hires_sources_seen"] += 1
+
+            # non-overlap для hires (если включено)
+            if is_hires and bool(hires_cfg.get("non_overlap", True)):
+                stride_h = tile_size
+                stride_w = tile_size
+            else:
+                stride_h = base_stride
+                stride_w = base_stride
+
+            tiles_all = list(
+                generate_tiles(
+                    image=image,
+                    mask=mask,
+                    tile_h=tile_size,
+                    tile_w=tile_size,
+                    stride_h=stride_h,
+                    stride_w=stride_w,
+                    pad_mode=str(tiling_cfg["pad_mode"]),
+                    min_content_ratio=float(tiling_cfg["min_content_ratio"]),
+                )
+            )
+
+            # cap по max-content для hires
+            if is_hires:
+                max_tiles = int(hires_cfg.get("max_tiles", 40))
+                if max_tiles > 0 and len(tiles_all) > max_tiles:
+                    before = len(tiles_all)
+                    tiles_all = _select_hires_tiles_by_content(
+                        source_id=str(row["source_id"]),
+                        tiles_all=tiles_all,
+                        max_tiles=max_tiles,
+                    )
+                    dropped = before - len(tiles_all)
+                    if dropped > 0:
+                        stats["hires_sources_capped"] += 1
+                        stats["hires_tiles_dropped"] += dropped
+
+            for tile_idx, x, y, image_tile, mask_tile in tiles_all:
                 # ---------- base tile ----------
                 tile_id = f"{row['source_id']}_x{x}_y{y}_tile{tile_idx}"
                 file_name = f"{tile_id}.png"
@@ -711,7 +875,6 @@ def tile_and_prepare(
 
     return tile_manifest, stats
 
-
 def year_distribution(rows: Iterable[Dict[str, object]]) -> Dict[str, int]:
     return dict(sorted(Counter(str(row["year"]) for row in rows).items()))
 
@@ -719,10 +882,12 @@ def year_distribution(rows: Iterable[Dict[str, object]]) -> Dict[str, int]:
 def run_sanity_checks(protocol: str, splits: Dict[str, List[Dict[str, object]]], test_years: Sequence[int]) -> None:
     test_years_set = set(test_years)
     train_val_rows = splits["train"] + splits["val"]
-    invalid_year_rows = [row for row in train_val_rows if int(row["year"]) in test_years_set]
-    if invalid_year_rows:
+
+    # В train/val запрещены только forced-test строки (а не любые year in test_years)
+    invalid_rows = [row for row in train_val_rows if is_forced_test_row(row, test_years_set)]
+    if invalid_rows:
         raise RuntimeError(
-            f"Found {len(invalid_year_rows)} train/val records with test years {sorted(test_years_set)}"
+            f"Found {len(invalid_rows)} train/val records that are forced to test by rule."
         )
 
     if protocol == "B":
@@ -784,7 +949,7 @@ def run_protocol(protocol: str, all_rows: List[Dict[str, object]], args: argpars
         leave=True,
     ) as protocol_pbar:
         for split_name in ("train", "val", "test"):
-            split_do_augment = split_name in {"train", "val"} and augment_enabled
+            split_do_augment = split_name in {"train"} and augment_enabled
             if split_do_augment and aug_transform is None:
                 aug_transform = build_transforms(tiling_defaults["augmentations"])
                 zoom_cfg = tiling_defaults["augmentations"].get("zoom", {})

@@ -10,9 +10,11 @@ import os
 import cv2
 import random
 import math
+import re
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any, Union
 from collections import deque
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -374,7 +376,7 @@ def compute_class_weights(
         w = weights.cpu().numpy()
 
         order = np.argsort(-pixel_counts.cpu().numpy())
-        topk = min(10, num_classes)
+        topk = min(11, num_classes)
         print(f"  top-{topk} classes by pixel count:")
         for i in order[:topk]:
             name = class_names[i] if class_names and i < len(class_names) else str(i)
@@ -387,8 +389,6 @@ def compute_class_weights(
         print()
 
     return weights.float()
-
-
 
 
 def validate_class_coverage(
@@ -429,6 +429,7 @@ def log_parameter_counts(model: nn.Module, logger) -> None:
         trainable_params,
         total_params - trainable_params,
     )
+
 
 def build_optimizer(
     wrapper: nn.Module,
@@ -498,7 +499,6 @@ def build_optimizer(
     return optimizer
 
 
-
 def build_scheduler(optimizer, total_steps: int, warmup_steps: int):
     warmup_steps = max(0, warmup_steps)
 
@@ -510,6 +510,593 @@ def build_scheduler(optimizer, total_steps: int, warmup_steps: int):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
+
+# ============================================================
+#                       YEAR RESOLUTION HELPERS
+# ============================================================
+
+# Keep this regex near the helpers section
+_YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+
+
+def _try_parse_year(value: Any) -> Optional[int]:
+    """
+    Conservative parser for explicit year-like values.
+
+    IMPORTANT:
+    - For strings, this function intentionally does NOT search arbitrary embedded
+      years inside long paths, to avoid false positives like:
+      .../february_march_2026_data/...
+    - Use `_extract_year_from_filename_patterns(...)` for filename-based parsing.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, (int, np.integer)):
+        year = int(value)
+        return year if 1900 <= year <= 2100 else None
+
+    if isinstance(value, float):
+        if float(value).is_integer():
+            year = int(value)
+            return year if 1900 <= year <= 2100 else None
+        return None
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+
+        # exact "2025"
+        if s.isdigit() and len(s) == 4:
+            year = int(s)
+            return year if 1900 <= year <= 2100 else None
+
+        # exact date-like strings e.g. "2025-02-23", "2025/02/23"
+        m = re.match(r"^\s*(19\d{2}|20\d{2})[-/\.]\d{1,2}[-/\.]\d{1,2}\s*$", s)
+        if m:
+            return int(m.group(1))
+
+        return None
+
+    return None
+
+
+def _extract_year_recursive(obj: Any) -> Optional[int]:
+    """
+    Safe recursive search for an explicitly stored year in nested metadata.
+    Does NOT parse arbitrary filenames/paths for embedded years.
+    """
+    if obj is None:
+        return None
+
+    # direct scalar year/date
+    y = _try_parse_year(obj)
+    if y is not None:
+        return y
+
+    if isinstance(obj, dict):
+        # Prefer explicit year-like keys
+        preferred_keys = (
+            "year", "img_year", "capture_year", "shot_year", "date_year",
+            "timestamp_year"
+        )
+        for k in preferred_keys:
+            if k in obj:
+                y = _extract_year_recursive(obj.get(k))
+                if y is not None:
+                    return y
+
+        # Common nested structures
+        nested_keys = ("img_info", "ann_info", "meta", "metadata", "extra", "info")
+        for k in nested_keys:
+            if k in obj:
+                y = _extract_year_recursive(obj.get(k))
+                if y is not None:
+                    return y
+
+        # Fallback over dict values (still safe because _try_parse_year is conservative)
+        for v in obj.values():
+            y = _extract_year_recursive(v)
+            if y is not None:
+                return y
+        return None
+
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            y = _extract_year_recursive(v)
+            if y is not None:
+                return y
+        return None
+
+    return None
+
+def _extract_year_from_filename_patterns(path_value: Any) -> Optional[int]:
+    """
+    Parse year from filename / basename ONLY (not full path), using dataset-specific
+    patterns and safe fallbacks.
+
+    Supported patterns (from your split/augmentation logic):
+    - ..._2025(.ext)               -> suffix year
+    - PXL_2025....                 -> year in PXL name
+    - photo_...2025-..-.._...      -> year from date in photo_* pattern
+    - IMG_*                        -> hardcoded 2025 (your rule)
+    - generic 19xx/20xx in basename (safe fallback)
+    """
+    if path_value is None:
+        return None
+
+    s = str(path_value).strip()
+    if not s:
+        return None
+
+    # Use basename only to avoid false year from directories like ".../2026_data/..."
+    base = os.path.basename(s.replace("\\", "/"))
+    if not base:
+        return None
+
+    stem = Path(base).stem  # filename without extension
+
+    # 1) Explicit suffix year: "..._2025"
+    m = re.search(r"_(19\d{2}|20\d{2})$", stem)
+    if m:
+        y = int(m.group(1))
+        if 1900 <= y <= 2100:
+            return y
+
+    # 2) PXL pattern: "PXL_2025...."
+    m = re.search(r"(?i)\bPXL[_-]?(19\d{2}|20\d{2})\b", stem)
+    if m:
+        y = int(m.group(1))
+        if 1900 <= y <= 2100:
+            return y
+
+    # 3) photo_*YYYY-MM-DD* pattern
+    #    Example: photo_...2025-01-31_...
+    m = re.search(r"(?i)\bphoto[_-].*?(19\d{2}|20\d{2})[-/\.]\d{1,2}[-/\.]\d{1,2}\b", stem)
+    if m:
+        y = int(m.group(1))
+        if 1900 <= y <= 2100:
+            return y
+
+    # 4) IMG_* pattern -> hardcoded 2025 (your rule)
+    #    Works for augmented/tiled names if they still contain token "IMG_"
+    if re.search(r"(?i)(?:^|[_-])IMG[_-]", stem) or stem.upper().startswith("IMG_") or "_IMG_" in stem.upper():
+        return 2025
+
+    # 5) Safe generic fallback: any year in basename/stem (NOT full path)
+    m = _YEAR_RE.search(stem)
+    if m:
+        y = int(m.group(1))
+        if 1900 <= y <= 2100:
+            return y
+
+    # Also check with extension included (rarely useful, but harmless)
+    m = _YEAR_RE.search(base)
+    if m:
+        y = int(m.group(1))
+        if 1900 <= y <= 2100:
+            return y
+
+    return None
+
+def _path_aliases(path_value: Any) -> List[str]:
+    if path_value is None:
+        return []
+    s = str(path_value)
+    if not s:
+        return []
+
+    aliases = set()
+    aliases.add(s)
+    aliases.add(s.replace("\\", "/"))
+    aliases.add(os.path.normpath(s))
+    aliases.add(os.path.normpath(s).replace("\\", "/"))
+
+    try:
+        p = Path(s)
+        aliases.add(p.name)
+        aliases.add(os.path.basename(s))
+        # strict=False avoids failure if file doesn't exist
+        aliases.add(str(p.resolve(strict=False)))
+        aliases.add(str(p.resolve(strict=False)).replace("\\", "/"))
+    except Exception:
+        aliases.add(os.path.basename(s))
+
+    # Also keep basename of normalized path
+    aliases.add(os.path.basename(os.path.normpath(s)))
+
+    return [a for a in aliases if isinstance(a, str) and a]
+
+
+def _register_path_year(lookup: Dict[str, int], path_value: Any, year: int, img_dir: Optional[str] = None) -> None:
+    if path_value is None:
+        return
+
+    for alias in _path_aliases(path_value):
+        lookup[alias] = int(year)
+
+    # If relative path and dataset has img_dir, register joined aliases too
+    try:
+        s = str(path_value)
+        if img_dir and s and not os.path.isabs(s):
+            joined = os.path.join(img_dir, s)
+            for alias in _path_aliases(joined):
+                lookup[alias] = int(year)
+    except Exception:
+        pass
+
+
+def _collect_year_lookup_from_dataset(dataset, lookup: Dict[str, int]) -> None:
+    if dataset is None:
+        return
+
+    # Handle wrappers like RepeatDataset / ConcatDataset
+    if hasattr(dataset, "dataset") and getattr(dataset, "dataset") is not None:
+        _collect_year_lookup_from_dataset(getattr(dataset, "dataset"), lookup)
+
+    if hasattr(dataset, "datasets") and getattr(dataset, "datasets") is not None:
+        for ds in getattr(dataset, "datasets"):
+            _collect_year_lookup_from_dataset(ds, lookup)
+
+    img_infos = getattr(dataset, "img_infos", None)
+    img_dir = getattr(dataset, "img_dir", None)
+    if not img_infos:
+        return
+
+    for info in img_infos:
+        if not isinstance(info, dict):
+            continue
+
+        # Collect common path candidates first
+        path_candidates: List[Any] = []
+        for k in ("filename", "img_path", "file_name", "ori_filename", "path"):
+            if k in info and info[k] is not None:
+                path_candidates.append(info[k])
+
+        nested_img_info = info.get("img_info")
+        if isinstance(nested_img_info, dict):
+            for k in ("filename", "img_path", "file_name", "ori_filename", "path"):
+                if k in nested_img_info and nested_img_info[k] is not None:
+                    path_candidates.append(nested_img_info[k])
+
+        # 1) Prefer explicit year in metadata
+        year = _extract_year_recursive(info)
+
+        # 2) If no explicit year, parse from filename patterns (basename only)
+        if year is None:
+            for candidate in path_candidates:
+                year = _extract_year_from_filename_patterns(candidate)
+                if year is not None:
+                    break
+
+        if year is None:
+            continue
+
+        for candidate in path_candidates:
+            _register_path_year(lookup, candidate, year, img_dir=img_dir)
+
+
+def build_year_lookup(dataset) -> Dict[str, int]:
+    lookup: Dict[str, int] = {}
+    _collect_year_lookup_from_dataset(dataset, lookup)
+    return lookup
+
+
+def _extract_batch_metas(data: dict) -> List[dict]:
+    img_metas = data.get("img_metas")
+    if img_metas is None:
+        return []
+
+    # mmcv DataContainer -> .data[0] is a list of meta dicts for the batch
+    try:
+        metas = img_metas.data[0]
+    except Exception:
+        metas = img_metas
+
+    if isinstance(metas, dict):
+        return [metas]
+    if isinstance(metas, (list, tuple)):
+        return [m for m in metas if isinstance(m, dict)]
+    return []
+
+
+def _resolve_year_from_meta(meta: dict, year_lookup: Optional[Dict[str, int]] = None) -> Optional[int]:
+    # 1) Explicit year in meta (best source, if Collect/meta_keys includes it)
+    if isinstance(meta, dict) and "year" in meta:
+        y = _extract_year_recursive({"year": meta.get("year")})
+        if y is not None:
+            return y
+
+    # 2) Build path candidates from common meta keys
+    path_candidates: List[Any] = []
+    for k in ("filename", "ori_filename", "img_path", "path"):
+        if k in meta and meta[k] is not None:
+            path_candidates.append(meta[k])
+
+    nested = meta.get("img_info")
+    if isinstance(nested, dict):
+        for k in ("filename", "ori_filename", "img_path", "path"):
+            if k in nested and nested[k] is not None:
+                path_candidates.append(nested[k])
+
+    # 3) Lookup by exact aliases (best fallback)
+    if year_lookup:
+        for p in path_candidates:
+            for alias in _path_aliases(p):
+                if alias in year_lookup:
+                    return int(year_lookup[alias])
+
+    # 4) Parse from filename patterns (basename only, safe)
+    for p in path_candidates:
+        y = _extract_year_from_filename_patterns(p)
+        if y is not None:
+            return y
+
+    # 5) Last safe attempt: recursive explicit-year search in meta (conservative only)
+    #    (won't parse arbitrary embedded years in paths)
+    return _extract_year_recursive(meta)
+@torch.no_grad()
+def build_train_tail_batch_summary(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    batch_loss_value: float,
+    batch_size: int,
+    class_names: List[str],
+    ignore_index: int,
+    batch_years: Optional[List[Optional[int]]] = None,
+) -> dict:
+    """
+    Build compact metric summary for one training batch.
+    Stores only confusion matrices + small counters (no full masks).
+
+    Robust to shape mismatch between preds and targets (e.g., logits/preds from lower-res head):
+    preds will be upsampled with nearest interpolation to target spatial size.
+    """
+    num_classes = len(class_names)
+
+    # Move only what's needed to CPU for compact aggregation
+    preds_cpu = preds.detach().to("cpu")
+    targets_cpu = targets.detach().to("cpu")
+    targets_cpu = _sanitize_targets(targets_cpu, num_classes, ignore_index)
+
+    # Ensure dtypes
+    if preds_cpu.dtype != torch.int64:
+        preds_cpu = preds_cpu.to(torch.int64)
+    if targets_cpu.dtype != torch.int64:
+        targets_cpu = targets_cpu.to(torch.int64)
+
+    # --- FIX: align spatial sizes before confusion accumulation ---
+    # Expected shapes: preds [B,H,W], targets [B,H,W]
+    # But preds may be [B,h,w] from non-upsampled logits.argmax(...)
+    if preds_cpu.ndim != 3 or targets_cpu.ndim != 3:
+        raise ValueError(
+            f"Expected preds/targets to be 3D [B,H,W], got preds={tuple(preds_cpu.shape)}, "
+            f"targets={tuple(targets_cpu.shape)}"
+        )
+
+    if preds_cpu.shape[0] != targets_cpu.shape[0]:
+        raise ValueError(
+            f"Batch mismatch in train-tail metrics: preds batch={preds_cpu.shape[0]} "
+            f"vs targets batch={targets_cpu.shape[0]}"
+        )
+
+    if preds_cpu.shape[-2:] != targets_cpu.shape[-2:]:
+        preds_cpu = F.interpolate(
+            preds_cpu.unsqueeze(1).float(),
+            size=targets_cpu.shape[-2:],
+            mode="nearest",
+        ).squeeze(1).to(torch.int64)
+
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64, device="cpu")
+    confusion = _accumulate_confusion(confusion, preds_cpu, targets_cpu, num_classes, ignore_index)
+
+    year_confusions: Dict[Union[int, str], torch.Tensor] = {}
+    year_image_counts: Dict[Union[int, str], int] = {}
+    unresolved_year_samples = 0
+
+    if batch_years is None:
+        batch_years = [None] * int(batch_size)
+
+    year_confusions, year_image_counts, unresolved_year_samples = _accumulate_per_year_confusions(
+        year_confusions=year_confusions,
+        year_image_counts=year_image_counts,
+        preds=preds_cpu,
+        targets=targets_cpu,
+        batch_years=batch_years,
+        num_classes=num_classes,
+        ignore_index=ignore_index,
+    )
+
+    return {
+        "confusion": confusion,  # CPU tensor
+        "loss_sum": float(batch_loss_value) * int(batch_size),
+        "num_samples": int(batch_size),
+        "year_confusions": year_confusions,      # dict[key] -> CPU confusion tensor
+        "year_image_counts": year_image_counts,  # dict[key] -> int
+        "num_samples_unresolved_year": int(unresolved_year_samples),
+    }
+
+
+def aggregate_train_tail_summaries(
+    summaries,
+    class_names: List[str],
+) -> Tuple[dict, float]:
+    """
+    Aggregate summaries for the last N training batches into the same metric format
+    as validation (plus metrics_by_year).
+    """
+    summaries = list(summaries)
+    if len(summaries) == 0:
+        empty_conf = torch.zeros((len(class_names), len(class_names)), dtype=torch.float64)
+        metrics = _compute_metrics_from_confusion(empty_conf, class_names)
+        metrics["metrics_by_year"] = {}
+        metrics["num_samples_unresolved_year"] = 0
+        metrics["window_num_batches"] = 0
+        metrics["window_num_samples"] = 0
+        return metrics, 0.0
+
+    num_classes = len(class_names)
+    total_confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64, device="cpu")
+    total_loss_sum = 0.0
+    total_samples = 0
+    unresolved_year_samples = 0
+
+    year_confusions: Dict[Union[int, str], torch.Tensor] = {}
+    year_image_counts: Dict[Union[int, str], int] = {}
+
+    for s in summaries:
+        total_confusion += s["confusion"]
+        total_loss_sum += float(s.get("loss_sum", 0.0))
+        total_samples += int(s.get("num_samples", 0))
+        unresolved_year_samples += int(s.get("num_samples_unresolved_year", 0))
+
+        # aggregate per-year confusions
+        for key, conf in s.get("year_confusions", {}).items():
+            if key not in year_confusions:
+                year_confusions[key] = conf.clone()
+            else:
+                year_confusions[key] += conf
+
+        # aggregate per-year image counts
+        for key, n in s.get("year_image_counts", {}).items():
+            year_image_counts[key] = int(year_image_counts.get(key, 0)) + int(n)
+
+    metrics = _compute_metrics_from_confusion(total_confusion, class_names)
+    metrics["metrics_by_year"] = _compute_metrics_by_year(year_confusions, year_image_counts, class_names)
+    metrics["num_samples_unresolved_year"] = int(unresolved_year_samples)
+    metrics["window_num_batches"] = int(len(summaries))
+    metrics["window_num_samples"] = int(total_samples)
+
+    avg_loss = total_loss_sum / max(1, total_samples)
+    return metrics, float(avg_loss)
+
+def resolve_batch_years(
+    data: dict,
+    batch_size: int,
+    year_lookup: Optional[Dict[str, int]] = None,
+) -> List[Optional[int]]:
+    metas = _extract_batch_metas(data)
+    years: List[Optional[int]] = []
+
+    for meta in metas:
+        years.append(_resolve_year_from_meta(meta, year_lookup=year_lookup))
+
+    # Safety: keep same length as batch
+    if len(years) < batch_size:
+        years.extend([None] * (batch_size - len(years)))
+    elif len(years) > batch_size:
+        years = years[:batch_size]
+
+    if len(years) == 0 and batch_size > 0:
+        years = [None] * batch_size
+
+    return years
+
+
+def _sort_year_metric_keys(keys: List[Union[int, str]]) -> List[Union[int, str]]:
+    def key_fn(x):
+        if isinstance(x, (int, np.integer)):
+            return (0, int(x), str(x))
+        sx = str(x)
+        if sx.isdigit():
+            return (0, int(sx), sx)
+        if sx.upper() == "UNKNOWN":
+            return (2, 9999, sx)
+        return (1, 9999, sx)
+    return sorted(keys, key=key_fn)
+
+
+def _accumulate_per_year_confusions(
+    year_confusions: Dict[Union[int, str], torch.Tensor],
+    year_image_counts: Dict[Union[int, str], int],
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    batch_years: List[Optional[int]],
+    num_classes: int,
+    ignore_index: int,
+) -> Tuple[Dict[Union[int, str], torch.Tensor], Dict[Union[int, str], int], int]:
+    unresolved = 0
+    bsz = preds.shape[0]
+    device = preds.device
+
+    for i in range(bsz):
+        y = batch_years[i] if i < len(batch_years) else None
+        if y is None:
+            key: Union[int, str] = "UNKNOWN"
+            unresolved += 1
+        else:
+            key = int(y)
+
+        if key not in year_confusions:
+            year_confusions[key] = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
+            year_image_counts[key] = 0
+
+        year_confusions[key] = _accumulate_confusion(
+            year_confusions[key], preds[i], targets[i], num_classes, ignore_index
+        )
+        year_image_counts[key] = int(year_image_counts.get(key, 0)) + 1
+
+    return year_confusions, year_image_counts, unresolved
+
+
+def _compute_metrics_by_year(
+    year_confusions: Dict[Union[int, str], torch.Tensor],
+    year_image_counts: Optional[Dict[Union[int, str], int]],
+    class_names: List[str],
+) -> Dict[str, dict]:
+    out: Dict[str, dict] = {}
+
+    for key in _sort_year_metric_keys(list(year_confusions.keys())):
+        conf = year_confusions[key]
+        m = _compute_metrics_from_confusion(conf, class_names)
+        m["num_images"] = int(year_image_counts.get(key, 0)) if year_image_counts is not None else None
+        m["num_labeled_pixels"] = int(conf.sum().item())
+        out[str(key)] = m
+
+    return out
+
+
+def log_metrics_overall_and_by_year(logger, split_name: str, metrics: dict, loss_value: Optional[float] = None) -> None:
+    if loss_value is None:
+        logger.info(
+            "%s — mIoU: %.4f | mF1: %.4f | mAcc: %.4f",
+            split_name,
+            metrics.get("mIoU", 0.0),
+            metrics.get("mF1", 0.0),
+            metrics.get("mAcc", 0.0),
+        )
+    else:
+        logger.info(
+            "%s — mIoU: %.4f | mF1: %.4f | mAcc: %.4f | loss: %.4f",
+            split_name,
+            metrics.get("mIoU", 0.0),
+            metrics.get("mF1", 0.0),
+            metrics.get("mAcc", 0.0),
+            float(loss_value),
+        )
+
+    by_year = metrics.get("metrics_by_year", {})
+    unresolved = int(metrics.get("num_samples_unresolved_year", 0))
+
+    if not by_year:
+        logger.info("%s per-year metrics: not available (year could not be resolved).", split_name)
+        return
+
+    logger.info("%s per-year metrics (%d years, unresolved samples=%d):", split_name, len(by_year), unresolved)
+    for year_key in _sort_year_metric_keys(list(by_year.keys())):
+        yk = str(year_key)
+        m = by_year[yk]
+        logger.info(
+            "  year=%s | mIoU=%.4f | mF1=%.4f | mAcc=%.4f | imgs=%s | labeled_px=%s",
+            yk,
+            m.get("mIoU", 0.0),
+            m.get("mF1", 0.0),
+            m.get("mAcc", 0.0),
+            m.get("num_images", 0),
+            m.get("num_labeled_pixels", 0),
+        )
 
 
 # ============================================================
@@ -608,6 +1195,7 @@ def evaluate(
     loss_cfg: Dict,
     class_weights: Optional[torch.Tensor],
     ignore_index: int,
+    year_lookup: Optional[Dict[str, int]] = None,
 ) -> Tuple[dict, float]:
     model.eval()
     num_classes = len(class_names)
@@ -615,10 +1203,17 @@ def evaluate(
     confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=device)
     total_loss = 0.0
 
-    results = []
+    # Per-year accumulators
+    year_confusions: Dict[Union[int, str], torch.Tensor] = {}
+    year_image_counts: Dict[Union[int, str], int] = {}
+    unresolved_year_samples = 0
+
+    # Keep only one tiny debug snapshot instead of storing all predictions
+    first_pred_hist: Optional[Dict[int, int]] = None
+
     for data in loader:
-        imgs = data["img"].data[0].cuda()
-        targets = data["gt_semantic_seg"].data[0].long().squeeze(1).cuda()
+        imgs = data["img"].data[0].cuda(non_blocking=True)
+        targets = data["gt_semantic_seg"].data[0].long().squeeze(1).cuda(non_blocking=True)
 
         logits, _ = model(imgs)
 
@@ -626,18 +1221,40 @@ def evaluate(
         logits = F.interpolate(logits, size=target_shape, mode="bilinear", align_corners=False)
 
         loss = compute_loss(logits, targets, loss_cfg, class_weights, ignore_index=ignore_index)
-        total_loss += loss.item() * imgs.size(0)
+        total_loss += float(loss.item()) * imgs.size(0)
 
         preds = logits.argmax(dim=1)
         confusion = _accumulate_confusion(confusion, preds, targets, num_classes, ignore_index)
-        results.extend(list(preds.cpu().numpy()))
+
+        # per-year confusion accumulation
+        batch_years = resolve_batch_years(data, batch_size=imgs.size(0), year_lookup=year_lookup)
+        year_confusions, year_image_counts, n_unres = _accumulate_per_year_confusions(
+            year_confusions=year_confusions,
+            year_image_counts=year_image_counts,
+            preds=preds,
+            targets=targets,
+            batch_years=batch_years,
+            num_classes=num_classes,
+            ignore_index=ignore_index,
+        )
+        unresolved_year_samples += int(n_unres)
+
+        # Debug only for the very first sample/batch
+        if first_pred_hist is None and preds.numel() > 0:
+            u, c = np.unique(preds[0].detach().cpu().numpy(), return_counts=True)
+            first_pred_hist = dict(zip(u.tolist(), c.tolist()))
+
+        # Explicit cleanup helps with fragmentation in long runs
+        del imgs, targets, logits, preds, loss
 
     metrics = _compute_metrics_from_confusion(confusion, class_names)
+    metrics["metrics_by_year"] = _compute_metrics_by_year(year_confusions, year_image_counts, class_names)
+    metrics["num_samples_unresolved_year"] = int(unresolved_year_samples)
+
     val_loss = total_loss / len(loader.dataset)
 
-    if results:
-        u, c = np.unique(results[0], return_counts=True)
-        print("[VAL DEBUG] First sample class dist:", dict(zip(u.tolist(), c.tolist())))
+    if first_pred_hist is not None:
+        print("[VAL DEBUG] First sample class dist:", first_pred_hist)
 
     return metrics, val_loss
 
@@ -667,7 +1284,6 @@ def draw_legend(img, classes, palette):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         y += 22
     return img
-
 
 
 @torch.no_grad()
@@ -738,8 +1354,8 @@ def save_checkpoint(
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "epoch": epoch,
-        "metrics": metrics,
-        "train_loss": float(train_loss),
+        "metrics": metrics,  # kept as validation metrics for backward compatibility
+        "train_loss": float(train_loss),  # optimization train loss (not train_eval_loss)
         "val_loss": float(val_loss) if val_loss is not None else None,
         "selection_score_name": score_name,
         "selection_score_value": float(score_value),
@@ -758,7 +1374,6 @@ def save_checkpoint(
             old_path.unlink()
 
     return best_pool
-
 
 
 # ============================================================
@@ -786,7 +1401,28 @@ def parse_args():
     parser.add_argument("--class-weights", default="auto", help='"auto", "none", or comma-separated values')
     parser.add_argument("--class-weight-mode", choices=["inverse", "median_freq", "effective_num"], default="inverse")
     parser.add_argument("--output-root", default="outputs")
+
+    # NEW: train metrics strategy to avoid extra full-pass load
+    parser.add_argument(
+        "--train-metrics-mode",
+        choices=["tail", "full", "none"],
+        default="tail",
+        help=(
+            "How to compute train metrics at epoch end: "
+            "'tail' = aggregate only last N training batches (cheap, default), "
+            "'full' = run full evaluate(train_loader) pass (expensive), "
+            "'none' = disable train metrics."
+        ),
+    )
+    parser.add_argument(
+        "--train-metrics-tail-batches",
+        type=int,
+        default=20,
+        help="Number of last training batches to aggregate when --train-metrics-mode tail.",
+    )
+
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -817,6 +1453,11 @@ def main():
     logger.info("Class names (index -> name): %s", {i: n for i, n in enumerate(class_names)})
 
     ignore_index = getattr(train_loader.dataset, "ignore_index", 255)
+
+    # Build year lookups once (for per-year metrics)
+    train_year_lookup = build_year_lookup(train_loader.dataset)
+    val_year_lookup = build_year_lookup(val_loader.dataset) if val_loader else {}
+    logger.info("Year lookup keys: train=%d, val=%d", len(train_year_lookup), len(val_year_lookup))
 
     if args.class_weights == "none":
         class_weights = None
@@ -887,10 +1528,15 @@ def main():
         total_loss = 0.0
         loss_window = deque(maxlen=100)
 
+        # NEW: store compact summaries only for the last N train batches
+        use_train_tail_metrics = (args.train_metrics_mode == "tail")
+        tail_n = max(1, int(args.train_metrics_tail_batches))
+        train_tail_summaries = deque(maxlen=tail_n) if use_train_tail_metrics else None
+
         progress = tqdm(train_loader, desc=f"Epoch {epoch}")
         for data in progress:
-            imgs = data["img"].data[0].cuda()
-            targets = data["gt_semantic_seg"].data[0].long().squeeze(1).cuda()
+            imgs = data["img"].data[0].cuda(non_blocking=True)
+            targets = data["gt_semantic_seg"].data[0].long().squeeze(1).cuda(non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             logits, _ = wrapper(imgs)
@@ -903,7 +1549,40 @@ def main():
             loss_window.append(loss_value)
             avg_recent = sum(loss_window) / len(loss_window)
 
-            total_loss += loss_value * imgs.size(0)
+            batch_size = int(imgs.size(0))
+            total_loss += loss_value * batch_size
+
+            # NEW: collect train-tail metrics on the fly (no extra forward pass, no full train eval)
+            if use_train_tail_metrics:
+                with torch.no_grad():
+                    metric_logits = logits.detach()
+                    if metric_logits.shape[-2:] != targets.shape[-2:]:
+                        metric_logits = F.interpolate(
+                            metric_logits,
+                            size=targets.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+
+                    preds = metric_logits.argmax(dim=1)
+
+                    batch_years = resolve_batch_years(
+                        data,
+                        batch_size=batch_size,
+                        year_lookup=train_year_lookup if len(train_year_lookup) > 0 else None,
+                    )
+                    batch_summary = build_train_tail_batch_summary(
+                        preds=preds,
+                        targets=targets,
+                        batch_loss_value=loss_value,
+                        batch_size=batch_size,
+                        class_names=class_names,
+                        ignore_index=ignore_index,
+                        batch_years=batch_years,
+                    )
+                    train_tail_summaries.append(batch_summary)
+
+                    del metric_logits
 
             progress.set_postfix(
                 loss=f"{loss_value:.4f}",
@@ -911,38 +1590,92 @@ def main():
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
 
+            # Help GC / CUDA allocator a bit in long epochs
+            del imgs, targets, logits, loss
+            if use_train_tail_metrics:
+                del preds
+
         train_loss = total_loss / len(train_loader.dataset)
-        logger.info("Epoch %d train loss: %.4f", epoch, train_loss)
+        logger.info("Epoch %d train loss (optimization): %.4f", epoch, train_loss)
         logger.info("Epoch %d LR groups: %s", epoch, [group["lr"] for group in optimizer.param_groups])
 
         epoch_record = {
             "epoch": epoch,
-            "train_loss": float(train_loss),
+            "train_loss": float(train_loss),  # optimization loss during training loop
         }
 
-        metrics: dict = {}
+        metrics: dict = {}  # validation metrics kept here for checkpoint compatibility
         val_loss: Optional[float] = None
 
+        # ---------------------------
+        # Train metrics
+        # ---------------------------
+        if args.train_metrics_mode == "full":
+            # Expensive: extra full pass over train (old behavior)
+            train_eval_metrics, train_eval_loss = evaluate(
+                wrapper,
+                train_loader,
+                class_names,
+                loss_cfg,
+                class_weights,
+                ignore_index,
+                year_lookup=train_year_lookup if len(train_year_lookup) > 0 else None,
+            )
+            epoch_record.update({
+                "train_eval_loss": float(train_eval_loss),
+                "train_metrics": train_eval_metrics,
+            })
+            log_metrics_overall_and_by_year(logger, "TrainEval(full)", train_eval_metrics, train_eval_loss)
+
+        elif args.train_metrics_mode == "tail":
+            # Cheap: aggregate only the last N batches already seen during training
+            train_tail_metrics, train_tail_loss = aggregate_train_tail_summaries(
+                train_tail_summaries,
+                class_names=class_names,
+            )
+            epoch_record.update({
+                "train_tail_eval_loss": float(train_tail_loss),
+                "train_tail_metrics": train_tail_metrics,
+                "train_tail_batches": int(train_tail_metrics.get("window_num_batches", 0)),
+                "train_tail_samples": int(train_tail_metrics.get("window_num_samples", 0)),
+            })
+            log_metrics_overall_and_by_year(
+                logger,
+                f"TrainTail(last_{train_tail_metrics.get('window_num_batches', 0)}_batches)",
+                train_tail_metrics,
+                train_tail_loss,
+            )
+        else:
+            logger.info("Train metrics are disabled (--train-metrics-mode none).")
+
+        # Optional: reduce allocator pressure before validation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # ---------------------------
+        # Validation metrics
+        # ---------------------------
         if val_loader:
             metrics, val_loss = evaluate(
-                wrapper, val_loader, class_names, loss_cfg, class_weights, ignore_index
+                wrapper,
+                val_loader,
+                class_names,
+                loss_cfg,
+                class_weights,
+                ignore_index,
+                year_lookup=val_year_lookup if len(val_year_lookup) > 0 else None,
             )
             epoch_record.update({
                 "val_loss": float(val_loss),
-                "metrics": metrics,
+                "metrics": metrics,  # validation metrics (legacy field name preserved)
             })
-            logger.info(
-                "Validation — mIoU: %.4f | mF1: %.4f | mAcc: %.4f | val_loss: %.4f",
-                metrics.get("mIoU", 0.0),
-                metrics.get("mF1", 0.0),
-                metrics.get("mAcc", 0.0),
-                float(val_loss),
-            )
+
+            log_metrics_overall_and_by_year(logger, "Validation", metrics, val_loss)
 
             viz_dir = run_dir / "val_viz" / f"epoch_{epoch:03d}"
             save_val_visualizations(epoch, wrapper, val_loader, viz_dir)
 
-        # ---- FIX: choose score for "best" by val_loss if available, else train_loss ----
+        # ---- choose score for "best" by val_loss if available, else train_loss ----
         if val_loader and val_loss is not None:
             score_name = "val_loss"
             score_value = float(val_loss)
@@ -968,7 +1701,6 @@ def main():
             f.write(json.dumps(epoch_record, ensure_ascii=False) + "\n")
 
     logger.info("Training finished")
-
 
 
 if __name__ == "__main__":

@@ -61,14 +61,8 @@ augmentations:
     g_shift: 10
     b_shift: 10
 
-    gaussian_noise: 0.15
-    noise_var: [4.0, 18.0]
-
-  cutout:
-    p: 0.30
-    num_holes: 8
-    max_h_size: 56
-    max_w_size: 56
+    gaussian_noise: 0.02
+    noise_var: [1.0, 2.0]
 
   weather:
     rain: 0.0
@@ -79,8 +73,8 @@ augmentations:
 
   cutout:
     num_holes: 8
-    max_h_size: 48
-    max_w_size: 48
+    max_h_size: 30
+    max_w_size: 30
     fill_value: 0
     p: 0.2
 
