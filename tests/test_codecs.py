@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from compression.codecs import benchmark_residual_codecs
-from compression.io import write_csv_rows
+from compression.io import read_csv_rows, write_csv_rows
 
 
 def _write_ppm(path: Path, width: int, height: int, value: int) -> None:
@@ -9,7 +9,7 @@ def _write_ppm(path: Path, width: int, height: int, value: int) -> None:
     path.write_bytes(f"P6\n{width} {height}\n255\n".encode("ascii") + payload)
 
 
-def test_codec_benchmark_csv_schema(tmp_path: Path) -> None:
+def test_codec_benchmark_schema_with_webp_fnlic(tmp_path: Path) -> None:
     residual_path = tmp_path / "r.ppm"
     _write_ppm(residual_path, 4, 4, 0)
 
@@ -21,7 +21,21 @@ def test_codec_benchmark_csv_schema(tmp_path: Path) -> None:
     )
 
     out_csv = tmp_path / "bench.csv"
-    rows = benchmark_residual_codecs(manifest, out_csv, codecs=["lzma"], level=1)
+    rows = benchmark_residual_codecs(manifest, out_csv, methods=["lzma", "webp", "fnlic"], level=1)
+    assert len(rows) == 3
 
-    assert len(rows) == 1
-    assert set(rows[0].keys()) == {"pair_id", "split", "codec", "level", "payload_bytes", "achieved_bits", "model_bits"}
+    table = read_csv_rows(out_csv)
+    assert set(table[0].keys()) == {
+        "pair_id",
+        "split",
+        "method",
+        "method_level",
+        "score_type",
+        "bit_length",
+        "payload_bits",
+        "status",
+        "notes",
+    }
+    assert all(row["score_type"] == "achieved_bits" for row in table)
+    assert any(row["method"] == "fnlic" and row["status"] == "ok" for row in table)
+    assert any(row["method"] == "webp" for row in table)

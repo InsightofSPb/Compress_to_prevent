@@ -71,12 +71,13 @@ def eval_change_tiles(
                     "split": row.get("split", "train"),
                     "tile_x": tile_x,
                     "tile_y": tile_y,
+                    "score_type": "change_score",
                     "tile_score": score,
                     "tile_size": tile_size,
                     "heatmap_pgm": str(pgm_path),
                 }
             )
 
-    fields = ["pair_id", "split", "tile_x", "tile_y", "tile_score", "tile_size", "heatmap_pgm"]
+    fields = ["pair_id", "split", "score_type", "tile_x", "tile_y", "tile_score", "tile_size", "heatmap_pgm"]
     write_csv_rows(out_scores_csv, fields, out_rows)
     return out_rows

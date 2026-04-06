@@ -1,3 +1,3 @@
-from .model import ByteEntropyModel
+from .model import ByteNGramEntropyModel, ByteUnigramEntropyModel
 
-__all__ = ["ByteEntropyModel"]
+__all__ = ["ByteNGramEntropyModel", "ByteUnigramEntropyModel"]

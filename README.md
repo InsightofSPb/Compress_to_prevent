@@ -126,18 +126,23 @@ This repository is based on ["CLIP-DINOiser: Teaching CLIP a few DINO tricks for
 
 ## Facade compression/change pipeline
 
-This repository now includes a facade-focused compression/change toolkit under `compression/` with thin CLIs under `cli/`.
+The repository includes a facade-focused compression/change branch under `compression/` with CLI entrypoints under `cli/`.
+
+Highlights:
+- stronger learned entropy baseline (`--model-mode bigram`) plus `unigram` ablation
+- explicit `score_type` (`achieved_bits` vs `model_bits`) and `bit_length` fields in outputs
+- codec methods: `zstd`, `lzma`, `webp`, `fnlic` (FNLIC-lite approximation documented)
 
 Quick start:
 
 ```bash
 python cli/make_facade_pairs.py --manifest-csv data/facades/manifest_images.csv --out-dir data/facades/compression/pairs
 python cli/build_facade_residual_dataset.py --pairs-csv data/facades/compression/pairs/pairs_all.csv --out-root data/facades/compression/residuals
-python cli/bench_facade_residual_codecs.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-csv outputs/compression/codec_bench.csv --codecs zstd,lzma
-python cli/train_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-out outputs/compression/entropy_model.json
-python cli/eval_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-path outputs/compression/entropy_model.json --split val --out-csv outputs/compression/entropy_val.csv
-python cli/eval_facade_change_tiles.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-scores-csv outputs/compression/tile_scores.csv --heatmap-dir outputs/compression/heatmaps
-python cli/eval_facade_change_metrics.py --tile-scores-csv outputs/compression/tile_scores.csv --labels-csv data/facades/compression/tile_labels.csv --out-csv outputs/compression/change_metrics.csv
+python cli/bench_facade_residual_codecs.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-csv outputs/compression/codec_bench.csv --methods zstd,lzma,webp,fnlic
+python cli/train_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-out outputs/compression/entropy_bigram.json --model-mode bigram
+python cli/eval_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-path outputs/compression/entropy_bigram.json --split val --out-csv outputs/compression/entropy_val.csv --tile-size 32 --tile-out-csv outputs/compression/entropy_val_tiles.csv
+python cli/eval_facade_change_tiles.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-scores-csv outputs/compression/change_tiles.csv --heatmap-dir outputs/compression/heatmaps
+python cli/eval_facade_change_metrics.py --tile-scores-csv outputs/compression/change_tiles.csv --labels-csv data/facades/compression/tile_labels.csv --out-csv outputs/compression/change_metrics.csv
 ```
 
-See `docs/compression_port.md` for full details and assumptions.
+See `docs/compression_port.md` and `docs/compression_baselines.md` for baseline semantics and the mini real-facade sanity workflow.

@@ -16,12 +16,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark residual codecs")
     parser.add_argument("--residual-manifest", type=Path, required=True)
     parser.add_argument("--out-csv", type=Path, required=True)
-    parser.add_argument("--codecs", type=str, default="zstd,lzma")
+    parser.add_argument("--methods", type=str, default="zstd,lzma,webp,fnlic")
     parser.add_argument("--level", type=int, default=3)
+    parser.add_argument("--strict", action="store_true", help="Fail if a method is unavailable")
     args = parser.parse_args()
 
-    codecs = [token.strip() for token in args.codecs.split(",") if token.strip()]
-    rows = benchmark_residual_codecs(args.residual_manifest, args.out_csv, codecs=codecs, level=args.level)
+    methods = [token.strip() for token in args.methods.split(",") if token.strip()]
+    rows = benchmark_residual_codecs(
+        args.residual_manifest,
+        args.out_csv,
+        methods=methods,
+        level=args.level,
+        strict=args.strict,
+    )
     print(f"Wrote {len(rows)} codec records to {args.out_csv}")
 
 

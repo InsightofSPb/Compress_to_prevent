@@ -57,10 +57,11 @@ def evaluate_change_metrics(tile_scores_csv: Path, labels_csv: Path, output_csv:
     roc_auc = _auc_roc(joined)
     ap = _average_precision(joined)
     summary = {
+        "score_type": "change_score",
         "n_tiles": float(len(joined)),
         "roc_auc": roc_auc,
         "average_precision": ap,
     }
 
-    write_csv_rows(output_csv, ["n_tiles", "roc_auc", "average_precision"], [summary])
+    write_csv_rows(output_csv, ["score_type", "n_tiles", "roc_auc", "average_precision"], [summary])
     return summary

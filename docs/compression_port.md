@@ -1,24 +1,16 @@
 # Facade compression/change toolkit port
 
-This document describes the first integrated compression/change toolkit in `Compress_to_prevent`.
+## Status after scaffold upgrade
 
-## What was ported
+The initial scaffold from PR #48 has been upgraded for paper-usable baseline work with:
 
-A minimal facade-first dependency closure was implemented in:
+- stronger learned entropy baseline option (`bigram`) in addition to `unigram`
+- explicit achieved-vs-model bit semantics in benchmark/eval CSVs (`score_type`, `bit_length`)
+- real WebP path when Pillow WebP support is available
+- FNLIC-inspired minimal path (`fnlic_lite_predictive+zstd`, with fallback to LZMA if zstd is unavailable)
+- mini real-facade sanity workflow recipe
 
-- `compression/` reusable logic
-- `cli/` thin runnable entrypoints
-
-The toolkit supports:
-
-1. temporal facade pair construction
-2. residual dataset building using `R_t = (I_t - I_{t-1->t}) mod 256`
-3. classical residual codec benchmarking (Zstd, LZMA, WebP/FNLIC stubs)
-4. byte-level learned entropy baseline train/eval/merge
-5. tile-wise residual change heatmap generation
-6. tile-level change metric evaluation
-
-## CLIs and example commands
+## Core CLIs
 
 ```bash
 python cli/make_facade_pairs.py \
@@ -32,44 +24,57 @@ python cli/build_facade_residual_dataset.py \
 python cli/bench_facade_residual_codecs.py \
   --residual-manifest data/facades/compression/residuals/residual_manifest.csv \
   --out-csv outputs/compression/codec_bench.csv \
-  --codecs zstd,lzma --level 3
+  --methods zstd,lzma,webp,fnlic --level 3
 
 python cli/train_residual_entropy.py \
   --residual-manifest data/facades/compression/residuals/residual_manifest.csv \
-  --model-out outputs/compression/entropy_model.json \
-  --train-split train
+  --model-out outputs/compression/entropy_bigram.json \
+  --model-mode bigram --train-split train
 
 python cli/eval_residual_entropy.py \
   --residual-manifest data/facades/compression/residuals/residual_manifest.csv \
-  --model-path outputs/compression/entropy_model.json \
+  --model-path outputs/compression/entropy_bigram.json \
   --split val \
-  --out-csv outputs/compression/entropy_val.csv
-
-python cli/merge_residual_entropy_scores.py \
-  --inputs outputs/compression/entropy_val_r.csv outputs/compression/entropy_val_g.csv outputs/compression/entropy_val_b.csv \
-  --out-csv outputs/compression/entropy_val_merged.csv
+  --out-csv outputs/compression/entropy_val.csv \
+  --tile-size 32 \
+  --tile-out-csv outputs/compression/entropy_val_tiles.csv
 
 python cli/eval_facade_change_tiles.py \
   --residual-manifest data/facades/compression/residuals/residual_manifest.csv \
-  --out-scores-csv outputs/compression/tile_scores.csv \
+  --out-scores-csv outputs/compression/change_tiles.csv \
   --heatmap-dir outputs/compression/heatmaps \
   --tile-size 32
 
 python cli/eval_facade_change_metrics.py \
-  --tile-scores-csv outputs/compression/tile_scores.csv \
+  --tile-scores-csv outputs/compression/change_tiles.csv \
   --labels-csv data/facades/compression/tile_labels.csv \
   --out-csv outputs/compression/change_metrics.csv
 ```
 
-## Adaptation assumptions
+## Achieved vs model bits
 
-- Pair construction expects a facade image manifest with at least image paths and split; if `year` is missing, it is inferred from a `_YYYY` stem suffix.
-- If `prev_aligned_path` is not provided yet, residual building falls back to `prev_image_path` and keeps the aligned-path field for later alignment pipeline integration.
-- LM baseline is a lightweight byte-unigram entropy model intended as a first baseline.
-- Tile labels are consumed from a simple CSV protocol: `pair_id,tile_x,tile_y,label`.
+- Classical codecs (`zstd`, `lzma`, `webp`, `fnlic`) emit `score_type=achieved_bits` with realized coded `bit_length`.
+- Learned entropy evaluations emit `score_type=model_bits` with `bit_length` computed from NLL.
+- CSV schemas intentionally avoid ambiguous generic `bits` fields.
 
-## Notes on next steps
+## Mini real-facade sanity workflow
 
-- Semantic-conditioned compression (C1) is intentionally not part of this port.
-- Temporal semantic branch redesign (S2) is intentionally not part of this port.
-- Current toolkit is designed to be the compression/change baseline that C1 and S2 will build on.
+Use `configs/compression/sanity_facade_mini.yaml` as the recipe root. Expected tiny manifest columns:
+
+- `facade_id`
+- `year`
+- `image_path`
+- `aligned_image_path` (or leave empty; fallback to previous image)
+- `split`
+
+For an example command sequence, see `docs/compression_baselines.md`.
+
+## Known implementation limits
+
+- WebP requires Pillow with WebP codec support; if unavailable, benchmark rows are marked `status=unsupported` with a diagnostic note.
+- FNLIC path is a documented minimal approximation (`fnlic_lite_predictive+zstd/lzma`) and not a full external FNLIC runtime.
+
+## Non-goals retained
+
+- No semantic-conditioned compressor (C1) in this stage.
+- No temporal semantic branch redesign (S2) in this stage.
