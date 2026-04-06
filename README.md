@@ -157,14 +157,15 @@ The repository now includes an S2 temporal semantic layer under `temporal_semant
 - `render_temporal_semantic_previews.py`
 
 Backends:
-- mandatory: `lposs`, `dinov2`, `clip`
+- fully working: `lposs`, `dinov2`, `clip`, `siglip2`
 - optional scaffold: `florence2` (experimental)
 
 Quick S2 run:
 
 ```bash
-python cli/export_temporal_semantic_artifacts.py --manifest-csv data/facades/sanity/manifest_mini.csv --out-dir outputs/temporal_semantics --backends lposs,dinov2,clip --tile-size 32
-python cli/build_temporal_semantic_features.py --pairs-csv data/facades/compression/pairs/pairs_all.csv --artifact-index-csv outputs/temporal_semantics/artifact_index.csv --out-csv outputs/temporal_semantics/pair_tile_features.csv --backends lposs,dinov2,clip --tile-size 32
+python cli/export_temporal_semantic_artifacts.py --list-backends
+python cli/export_temporal_semantic_artifacts.py --manifest-csv data/facades/sanity/manifest_mini.csv --out-dir outputs/temporal_semantics --backends lposs,dinov2,clip,siglip2 --tile-size 32
+python cli/build_temporal_semantic_features.py --pairs-csv data/facades/compression/pairs/pairs_all.csv --artifact-index-csv outputs/temporal_semantics/artifact_index.csv --out-csv outputs/temporal_semantics/pair_tile_features.csv --backends lposs,dinov2,clip,siglip2 --tile-size 32
 python cli/eval_temporal_semantic_features.py --features-csv outputs/temporal_semantics/pair_tile_features.csv --out-summary-csv outputs/temporal_semantics/summary.csv --out-topk-csv outputs/temporal_semantics/topk_tiles.csv
 python cli/render_temporal_semantic_previews.py --features-csv outputs/temporal_semantics/pair_tile_features.csv --pairs-csv data/facades/compression/pairs/pairs_all.csv --out-dir outputs/temporal_semantics/previews --tile-size 32
 ```

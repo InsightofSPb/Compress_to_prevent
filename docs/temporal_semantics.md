@@ -12,6 +12,7 @@ S2 exports semantic artifacts per image, then computes per-tile temporal semanti
 - `lposs` (project semantic branch proxy artifacts: mask/probabilities/features/overlay)
 - `dinov2` (standalone dense feature proxy backend)
 - `clip` (additional standalone dense feature proxy backend)
+- `siglip2` (SigLIP2-like dense patch proxy backend)
 
 ### Experimental
 - `florence2` scaffold only (`status=experimental`, no dense extraction yet)
@@ -19,10 +20,12 @@ S2 exports semantic artifacts per image, then computes per-tile temporal semanti
 ## Artifact export workflow
 
 ```bash
+python cli/export_temporal_semantic_artifacts.py --list-backends
+
 python cli/export_temporal_semantic_artifacts.py \
   --manifest-csv data/facades/sanity/manifest_mini.csv \
   --out-dir outputs/temporal_semantics \
-  --backends lposs,dinov2,clip \
+  --backends lposs,dinov2,clip,siglip2 \
   --tile-size 32
 ```
 
@@ -39,7 +42,7 @@ python cli/build_temporal_semantic_features.py \
   --pairs-csv data/facades/compression/pairs/pairs_all.csv \
   --artifact-index-csv outputs/temporal_semantics/artifact_index.csv \
   --out-csv outputs/temporal_semantics/pair_tile_features.csv \
-  --backends lposs,dinov2,clip \
+  --backends lposs,dinov2,clip,siglip2 \
   --tile-size 32
 ```
 
