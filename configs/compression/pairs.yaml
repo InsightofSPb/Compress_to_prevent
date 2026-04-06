@@ -1,0 +1,4 @@
+pairs:
+  manifest_csv: data/facades/manifest_images.csv
+  out_dir: data/facades/compression/pairs
+  pair_mode: consecutive

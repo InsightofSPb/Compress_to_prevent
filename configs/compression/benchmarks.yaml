@@ -1,0 +1,7 @@
+benchmarks:
+  residual_manifest: data/facades/compression/residuals/residual_manifest.csv
+  out_csv: outputs/compression/codec_bench.csv
+  codecs: [zstd, lzma, webp, fnlic]
+  level: 3
+tiles:
+  tile_size: 32
