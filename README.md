@@ -171,3 +171,17 @@ python cli/render_temporal_semantic_previews.py --features-csv outputs/temporal_
 ```
 
 See `docs/temporal_semantics.md` for details.
+
+
+## Semantic-conditioned residual codec (C1)
+
+A first C1 implementation now exists under `compression/conditioned/` with CLIs:
+- `cli/train_semantic_conditioned_codec.py`
+- `cli/eval_semantic_conditioned_codec.py`
+- `cli/render_semantic_conditioned_codec_previews.py`
+
+C1 reuses S2 artifacts/feature tables as context (`lposs`, `dinov2`, `clip`, `siglip2`, temporal semantic features, fused semantic score), supports context modes (`none`, `lposs_only`, `features_only`, `temporal_semantic_only`, `full`, `custom`) and two conditioning mechanisms (`concat_context`, `film_context`).
+
+Outputs are explicitly model-estimated (`model_bits`, `nll_bits`, `bits_per_byte`) and not arithmetic-coded achieved bits.
+
+See `docs/semantic_conditioned_codec.md` for usage, ablation setup, and examples.
