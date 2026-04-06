@@ -22,7 +22,7 @@ def test_artifact_index_schema(tmp_path: Path) -> None:
     _write_ppm(img, 4, 4, (10, 20, 30))
     manifest = tmp_path / "manifest.csv"
     write_csv_rows(manifest, ["sample_id", "image_path", "split"], [{"sample_id": "s1", "image_path": str(img), "split": "train"}])
-    export_semantic_artifacts(manifest, ["lposs", "dinov2", "clip"], tmp_path / "out", tile_size=2)
+    export_semantic_artifacts(manifest, ["lposs", "dinov2", "clip", "siglip2"], tmp_path / "out", tile_size=2)
 
     rows = read_csv_rows(tmp_path / "out" / "artifact_index.csv")
     assert set(rows[0].keys()) == {
@@ -113,5 +113,5 @@ def test_fused_semantic_score_schema(tmp_path: Path) -> None:
 
 def test_backend_registry_dispatch() -> None:
     reg = default_registry()
-    assert set(["lposs", "dinov2", "clip", "florence2"]).issubset(set(reg.names()))
+    assert set(["lposs", "dinov2", "clip", "siglip2", "florence2"]).issubset(set(reg.names()))
     assert reg.create("lposs").name == "lposs"

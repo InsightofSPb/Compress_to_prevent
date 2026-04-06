@@ -62,3 +62,7 @@ def export_semantic_artifacts(
 
     write_index(out_dir / "artifact_index.csv", rows)
     return rows
+
+
+def list_available_backends() -> list[str]:
+    return default_registry().names()
