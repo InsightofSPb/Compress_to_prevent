@@ -123,3 +123,50 @@ If you leave these fields as `null`, the original DINO v1 checkpoints are used a
 ## Acknowledgments
 
 This repository is based on ["CLIP-DINOiser: Teaching CLIP a few DINO tricks for Open-Vocabulary Semantic Segmentation"](https://github.com/wysoczanska/clip_dinoiser). Thanks to the authors!
+
+## Facade compression/change pipeline
+
+The repository includes a facade-focused compression/change branch under `compression/` with CLI entrypoints under `cli/`.
+
+Highlights:
+- stronger learned entropy baseline (`--model-mode bigram`) plus `unigram` ablation
+- explicit `score_type` (`achieved_bits` vs `model_bits`) and `bit_length` fields in outputs
+- codec methods: `zstd`, `lzma`, `webp`, `fnlic` (FNLIC-lite approximation documented)
+
+Quick start:
+
+```bash
+python cli/make_facade_pairs.py --manifest-csv data/facades/manifest_images.csv --out-dir data/facades/compression/pairs
+python cli/build_facade_residual_dataset.py --pairs-csv data/facades/compression/pairs/pairs_all.csv --out-root data/facades/compression/residuals
+python cli/bench_facade_residual_codecs.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-csv outputs/compression/codec_bench.csv --methods zstd,lzma,webp,fnlic
+python cli/train_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-out outputs/compression/entropy_bigram.json --model-mode bigram
+python cli/eval_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-path outputs/compression/entropy_bigram.json --split val --out-csv outputs/compression/entropy_val.csv --tile-size 32 --tile-out-csv outputs/compression/entropy_val_tiles.csv
+python cli/eval_facade_change_tiles.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-scores-csv outputs/compression/change_tiles.csv --heatmap-dir outputs/compression/heatmaps
+python cli/eval_facade_change_metrics.py --tile-scores-csv outputs/compression/change_tiles.csv --labels-csv data/facades/compression/tile_labels.csv --out-csv outputs/compression/change_metrics.csv
+```
+
+See `docs/compression_port.md` and `docs/compression_baselines.md` for baseline semantics and the mini real-facade sanity workflow.
+
+## Temporal semantics (S2)
+
+The repository now includes an S2 temporal semantic layer under `temporal_semantics/` with CLI entrypoints in `cli/`:
+
+- `export_temporal_semantic_artifacts.py`
+- `build_temporal_semantic_features.py`
+- `eval_temporal_semantic_features.py`
+- `render_temporal_semantic_previews.py`
+
+Backends:
+- mandatory: `lposs`, `dinov2`, `clip`
+- optional scaffold: `florence2` (experimental)
+
+Quick S2 run:
+
+```bash
+python cli/export_temporal_semantic_artifacts.py --manifest-csv data/facades/sanity/manifest_mini.csv --out-dir outputs/temporal_semantics --backends lposs,dinov2,clip --tile-size 32
+python cli/build_temporal_semantic_features.py --pairs-csv data/facades/compression/pairs/pairs_all.csv --artifact-index-csv outputs/temporal_semantics/artifact_index.csv --out-csv outputs/temporal_semantics/pair_tile_features.csv --backends lposs,dinov2,clip --tile-size 32
+python cli/eval_temporal_semantic_features.py --features-csv outputs/temporal_semantics/pair_tile_features.csv --out-summary-csv outputs/temporal_semantics/summary.csv --out-topk-csv outputs/temporal_semantics/topk_tiles.csv
+python cli/render_temporal_semantic_previews.py --features-csv outputs/temporal_semantics/pair_tile_features.csv --pairs-csv data/facades/compression/pairs/pairs_all.csv --out-dir outputs/temporal_semantics/previews --tile-size 32
+```
+
+See `docs/temporal_semantics.md` for details.
