@@ -1,0 +1,13 @@
+sanity:
+  # Build this manifest from a tiny real facade subset (6-12 images total)
+  manifest_csv: data/facades/sanity/manifest_mini.csv
+  pairs_dir: outputs/sanity_facade/pairs
+  residual_dir: outputs/sanity_facade/residuals
+  codec_csv: outputs/sanity_facade/codec_bench.csv
+  entropy_model: outputs/sanity_facade/entropy_bigram.json
+  entropy_eval_csv: outputs/sanity_facade/entropy_eval.csv
+  entropy_tile_csv: outputs/sanity_facade/entropy_tiles.csv
+  change_tile_csv: outputs/sanity_facade/change_tiles.csv
+  heatmap_dir: outputs/sanity_facade/heatmaps
+  labels_csv: data/facades/sanity/tile_labels_mini.csv
+  metrics_csv: outputs/sanity_facade/change_metrics.csv
