@@ -123,3 +123,21 @@ If you leave these fields as `null`, the original DINO v1 checkpoints are used a
 ## Acknowledgments
 
 This repository is based on ["CLIP-DINOiser: Teaching CLIP a few DINO tricks for Open-Vocabulary Semantic Segmentation"](https://github.com/wysoczanska/clip_dinoiser). Thanks to the authors!
+
+## Facade compression/change pipeline
+
+This repository now includes a facade-focused compression/change toolkit under `compression/` with thin CLIs under `cli/`.
+
+Quick start:
+
+```bash
+python cli/make_facade_pairs.py --manifest-csv data/facades/manifest_images.csv --out-dir data/facades/compression/pairs
+python cli/build_facade_residual_dataset.py --pairs-csv data/facades/compression/pairs/pairs_all.csv --out-root data/facades/compression/residuals
+python cli/bench_facade_residual_codecs.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-csv outputs/compression/codec_bench.csv --codecs zstd,lzma
+python cli/train_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-out outputs/compression/entropy_model.json
+python cli/eval_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-path outputs/compression/entropy_model.json --split val --out-csv outputs/compression/entropy_val.csv
+python cli/eval_facade_change_tiles.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-scores-csv outputs/compression/tile_scores.csv --heatmap-dir outputs/compression/heatmaps
+python cli/eval_facade_change_metrics.py --tile-scores-csv outputs/compression/tile_scores.csv --labels-csv data/facades/compression/tile_labels.csv --out-csv outputs/compression/change_metrics.csv
+```
+
+See `docs/compression_port.md` for full details and assumptions.

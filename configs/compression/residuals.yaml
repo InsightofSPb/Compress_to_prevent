@@ -1,0 +1,4 @@
+residuals:
+  pairs_csv: data/facades/compression/pairs/pairs_all.csv
+  out_root: data/facades/compression/residuals
+  formula: "R_t = (I_t - I_{t-1->t}) mod 256"
