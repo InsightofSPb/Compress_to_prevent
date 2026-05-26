@@ -1,0 +1,15 @@
+artifacts:
+  manifest_csv: data/facades/sanity/manifest_mini.csv
+  out_dir: outputs/temporal_semantics
+  backends: [lposs, dinov2, clip]
+  tile_size: 32
+features:
+  pairs_csv: data/facades/compression/pairs/pairs_all.csv
+  artifact_index_csv: outputs/temporal_semantics/artifact_index.csv
+  out_csv: outputs/temporal_semantics/pair_tile_features.csv
+  tile_size: 32
+evaluation:
+  summary_csv: outputs/temporal_semantics/summary.csv
+  topk_csv: outputs/temporal_semantics/topk_tiles.csv
+previews:
+  out_dir: outputs/temporal_semantics/previews
