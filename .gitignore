@@ -182,3 +182,4 @@ outputs/*
 *.txt
 backup*
 .bash_history
+datasets/
