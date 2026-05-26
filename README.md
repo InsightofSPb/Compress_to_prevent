@@ -185,3 +185,7 @@ C1 reuses S2 artifacts/feature tables as context (`lposs`, `dinov2`, `clip`, `si
 Outputs are explicitly model-estimated (`model_bits`, `nll_bits`, `bits_per_byte`) and not arithmetic-coded achieved bits.
 
 See `docs/semantic_conditioned_codec.md` for usage, ablation setup, and examples.
+
+## Facade quantitative evaluation
+
+For quantitative facade heatmap evaluation (proposed + RGB/gray diff + SSIM + DINOv2 + LPIPS), see `docs/facade_evaluation.md`.
