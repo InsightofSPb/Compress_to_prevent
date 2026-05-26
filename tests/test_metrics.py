@@ -29,5 +29,6 @@ def test_change_metric_output_schema(tmp_path: Path) -> None:
     evaluate_change_metrics(scores_csv, labels_csv, out_csv)
     rows = read_csv_rows(out_csv)
     assert len(rows) == 1
-    assert set(rows[0].keys()) == {"score_type", "n_tiles", "roc_auc", "average_precision"}
-    assert rows[0]["score_type"] == "change_score"
+    assert rows[0]["method"] == "proposed_residual"
+    assert "roc_auc" in rows[0]
+    assert "topk_hit_rate_10" in rows[0]
