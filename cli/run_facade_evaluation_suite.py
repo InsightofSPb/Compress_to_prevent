@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from compression.baselines import compute_baseline_tile_scores
-from compression.io import read_csv_rows, write_csv_rows
+from compression.io import write_csv_rows
 from compression.metrics import evaluate_change_metrics
 from compression.tiles import eval_change_tiles
 
@@ -27,11 +27,13 @@ def main() -> None:
     parser.add_argument("--dinov2-model-name", type=str, default="dinov2_vitb14")
     parser.add_argument("--dinov2-cache-dir", type=Path)
     parser.add_argument("--dinov2-weights-path", type=Path)
+    parser.add_argument("--dinov2-repo-dir", type=Path)
     parser.add_argument("--lpips-net", type=str, default="alex")
     parser.add_argument("--temporal-features-csv", type=Path)
     parser.add_argument("--artifact-index-csv", type=Path)
     parser.add_argument("--skip-deep-baselines", action="store_true")
-    parser.add_argument("--include-proposed", action="store_true", default=True)
+    parser.add_argument("--include-proposed", dest="include_proposed", action="store_true", default=True)
+    parser.add_argument("--no-include-proposed", dest="include_proposed", action="store_false")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -47,7 +49,7 @@ def main() -> None:
         for r in proposed_rows:
             r["method"] = "proposed_residual"
             if r.get("score_type") == "change_score":
-                r["score_type"] = "baseline_change_score"
+                r["score_type"] = "residual_change_score"
         all_rows.extend(proposed_rows)
 
     methods = [m.strip() for m in args.baseline_methods.split(",") if m.strip()]
@@ -62,6 +64,7 @@ def main() -> None:
         dinov2_cache_dir=args.dinov2_cache_dir,
         dinov2_weights_path=args.dinov2_weights_path,
         lpips_net=args.lpips_net,
+        dinov2_repo_dir=args.dinov2_repo_dir,
         temporal_features_csv=args.temporal_features_csv,
         artifact_index_csv=args.artifact_index_csv,
         skip_deep_baselines=args.skip_deep_baselines,

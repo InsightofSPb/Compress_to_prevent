@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--dinov2-model-name", type=str, default="dinov2_vitb14")
     parser.add_argument("--dinov2-cache-dir", type=Path)
     parser.add_argument("--dinov2-weights-path", type=Path)
+    parser.add_argument("--dinov2-repo-dir", type=Path)
     parser.add_argument("--lpips-net", type=str, default="alex")
     parser.add_argument("--temporal-features-csv", type=Path)
     parser.add_argument("--artifact-index-csv", type=Path)
@@ -41,6 +42,7 @@ def main() -> None:
         dinov2_cache_dir=args.dinov2_cache_dir,
         dinov2_weights_path=args.dinov2_weights_path,
         lpips_net=args.lpips_net,
+        dinov2_repo_dir=args.dinov2_repo_dir,
         temporal_features_csv=args.temporal_features_csv,
         artifact_index_csv=args.artifact_index_csv,
         skip_deep_baselines=args.skip_deep_baselines,

@@ -1,3 +1,6 @@
+import pytest
+pytest.importorskip("numpy")
+
 from pathlib import Path
 
 from compression.baselines import compute_baseline_tile_scores

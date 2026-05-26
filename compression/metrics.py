@@ -13,7 +13,18 @@ def _auc_roc(scores_labels: List[tuple[float, int]]) -> float:
     if pos == 0 or neg == 0:
         return 0.0
     ranked = sorted(scores_labels, key=lambda x: x[0])
-    rank_sum = sum(i for i, (_, l) in enumerate(ranked, 1) if l == 1)
+    rank_sum = 0.0
+    i = 0
+    n = len(ranked)
+    while i < n:
+        j = i
+        score = ranked[i][0]
+        while j < n and ranked[j][0] == score:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0
+        n_pos_tie = sum(lbl for _, lbl in ranked[i:j])
+        rank_sum += avg_rank * n_pos_tie
+        i = j
     return float((rank_sum - (pos * (pos + 1) / 2.0)) / (pos * neg))
 
 
@@ -22,8 +33,7 @@ def _average_precision(scores_labels: List[tuple[float, int]]) -> float:
     if positives == 0:
         return 0.0
     ranked = sorted(scores_labels, key=lambda x: x[0], reverse=True)
-    tp = 0
-    fp = 0
+    tp = fp = 0
     ap_acc = 0.0
     for _, label in ranked:
         if label == 1:
@@ -68,14 +78,15 @@ def _best_f1(ranked: List[Tuple[float, int]]) -> Tuple[float, float]:
 
 
 def _topk_hit_rate(pair_rows: Dict[str, List[Tuple[float, int]]], k: int) -> float:
-    if not pair_rows:
+    eligible = {pid: rows for pid, rows in pair_rows.items() if any(lbl == 1 for _, lbl in rows)}
+    if not eligible:
         return 0.0
     hits = 0
-    for rows in pair_rows.values():
+    for rows in eligible.values():
         ranked = sorted(rows, key=lambda x: x[0], reverse=True)[:k]
         if any(label == 1 for _, label in ranked):
             hits += 1
-    return float(hits / len(pair_rows))
+    return float(hits / len(eligible))
 
 
 def evaluate_change_metrics(tile_scores_csv: Path, labels_csv: Path, output_csv: Path) -> Dict[str, float]:

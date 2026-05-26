@@ -40,7 +40,7 @@ python cli/run_facade_evaluation_suite.py \
 
 ## DINOv2 and LPIPS notes
 
-- DINOv2 baseline (`dinov2_patch_cosine`) uses `torch.hub` loading (`facebookresearch/dinov2`) and supports `--dinov2-cache-dir` and `--dinov2-weights-path`.
+- DINOv2 baseline (`dinov2_patch_cosine`) uses `torch.hub` loading (`facebookresearch/dinov2`) and supports `--dinov2-cache-dir`, `--dinov2-weights-path`, and `--dinov2-repo-dir` (for offline/local torch.hub loading).
 - LPIPS baseline (`lpips_change`) uses `lpips` package (`--lpips-net alex` by default).
 - Full mode fails with actionable errors if missing dependencies/models.
 
@@ -70,3 +70,8 @@ python cli/eval_facade_baseline_tiles.py \
   --out-scores-csv outputs/sanity_facade/baseline_tiles_full.csv \
   --tile-size 32 --device cuda
 ```
+
+
+Notes:
+- Proposed residual rows are tagged as `residual_change_score` in merged suite outputs.
+- Use `--no-include-proposed` if you want baseline-only summary runs.
