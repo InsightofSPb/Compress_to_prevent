@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 import cv2
 import numpy as np
+from tqdm.auto import tqdm
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--invalid-label", type=int, default=255)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--no-progress", action="store_true", help="Disable bootstrap progress bar.")
     return parser.parse_args()
 
 
@@ -199,7 +201,14 @@ def main() -> None:
     for method in comparators:
         distributions[method] = {metric: [] for metric in metric_names}
 
-    for _ in range(args.n_bootstrap):
+    bootstrap_iter = tqdm(
+        range(args.n_bootstrap),
+        total=args.n_bootstrap,
+        desc="Pair bootstrap",
+        unit="rep",
+        disable=args.no_progress,
+    )
+    for _ in bootstrap_iter:
         selected = rng.choice(pair_ids, size=len(pair_ids), replace=True).tolist()
         anchor_rows = [row for pair_id in selected for row in by_method_pair[args.anchor_method][pair_id]]
         anchor_values = metric_values(anchor_rows, top_fraction)
@@ -210,6 +219,12 @@ def main() -> None:
                 left, right = anchor_values.get(metric), compare_values.get(metric)
                 if left is not None and right is not None:
                     distributions[method][metric].append(float(left - right))
+        if _ == 0 or (_ + 1) % 50 == 0 or (_ + 1) == args.n_bootstrap:
+            observed_vs_ssim = None
+            if "ssim_change" in distributions and distributions["ssim_change"]["AUPRC"]:
+                observed_vs_ssim = float(np.mean(distributions["ssim_change"]["AUPRC"]))
+            if observed_vs_ssim is not None:
+                bootstrap_iter.set_postfix(mean_delta_vs_ssim="{:+.4f}".format(observed_vs_ssim))
 
     summary_rows: List[Dict[str, object]] = []
     replicate_rows: List[Dict[str, object]] = []
