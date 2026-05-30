@@ -2,13 +2,9 @@
 """Create leakage-safe facade splits shared by segmentation and RGB compression.
 
 Input is the linked full manifest produced by ``build_facade_master_manifest.py``.
-It contains all RGB/mask samples for segmentation and an ``is_temporal`` flag
-marking observations participating in temporal RGB data. Every facade_id is
-assigned to exactly one split.
-
-Outputs include full segmentation manifests and temporal RGB manifests. Crops
-and augmentations are intentionally not generated here: prepare them from the
-segmentation train split only. RGB compression must use real aligned pairs.
+For compression-aware balancing, pass the unsplit aligned pair manifest produced
+by ``build_aligned_compression_pairs_manifest.py``. Every facade_id is assigned
+to exactly one split; crops and augmentation are never created here.
 """
 from __future__ import annotations
 
@@ -30,21 +26,20 @@ class FacadeStats:
     facade_id: str
     n_all_images: int
     n_temporal_images: int
+    n_aligned_pairs: int
     temporal_years: Tuple[int, ...]
 
     @property
-    def n_pairs(self) -> int:
-        return max(0, self.n_temporal_images - 1)
-
-    @property
     def has_pair(self) -> bool:
-        return self.n_pairs > 0
+        return self.n_aligned_pairs > 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Split linked facade data by facade_id without leakage.")
     parser.add_argument("--master-manifest", type=Path, required=True,
-                        help="segmentation_manifest_all.csv produced by build_facade_master_manifest.py")
+                        help="segmentation_manifest_all.csv from build_facade_master_manifest.py")
+    parser.add_argument("--compression-pairs-manifest", type=Path, default=None,
+                        help="Optional unsplit aligned pairs_all.csv; strongly recommended.")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--train-ratio", type=float, default=0.70)
     parser.add_argument("--val-ratio", type=float, default=0.15)
@@ -52,19 +47,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--search-trials", type=int, default=30000)
     parser.add_argument("--force-train-top-k", type=int, default=1,
-                        help="Keep this many largest temporal histories as train anchors.")
+                        help="Keep this many facades with most real aligned pairs as train anchors.")
     parser.add_argument("--min-eval-pairs", type=int, default=5,
-                        help="Preferred minimum temporal RGB pairs in each of val and test.")
+                        help="Preferred minimum real aligned pairs in each of val and test.")
     parser.add_argument("--materialize-segmentation", choices=("none", "symlink", "copy"), default="none")
     parser.add_argument("--overwrite-materialized", action="store_true")
     return parser.parse_args()
 
 
-def read_manifest(path: Path) -> Tuple[List[Dict[str, str]], List[str]]:
+def read_csv(path: Path) -> Tuple[List[Dict[str, str]], List[str]]:
     with path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         fields = list(reader.fieldnames or [])
         rows = [{str(k): (v or "") for k, v in row.items()} for row in reader]
+    return rows, fields
+
+
+def read_master_manifest(path: Path) -> Tuple[List[Dict[str, str]], List[str]]:
+    rows, fields = read_csv(path)
     required = {"facade_id", "image_path", "mask_path", "is_temporal"}
     missing = required - set(fields)
     if missing:
@@ -88,13 +88,34 @@ def temporal_flag(row: Dict[str, str]) -> bool:
     return row.get("is_temporal", "").strip().lower() in {"1", "true", "yes"}
 
 
-def build_stats(rows: Sequence[Dict[str, str]]) -> Dict[str, FacadeStats]:
+def load_real_pair_counts(path: Optional[Path]) -> Tuple[Dict[str, int], int]:
+    if path is None:
+        return {}, 0
+    rows, fields = read_csv(path)
+    if "facade_id" not in fields or "pair_id" not in fields:
+        raise ValueError("Compression pair manifest must contain facade_id and pair_id.")
+    pair_ids = [row["pair_id"] for row in rows]
+    if len(pair_ids) != len(set(pair_ids)):
+        raise ValueError("Compression pair manifest contains duplicate pair_id values.")
+    counts: Dict[str, int] = defaultdict(int)
+    for row in rows:
+        facade_id = row["facade_id"].strip()
+        if not facade_id:
+            raise ValueError("Empty facade_id in compression pair row: {}".format(row))
+        counts[facade_id] += 1
+    return dict(counts), len(rows)
+
+
+def build_stats(rows: Sequence[Dict[str, str]], pair_counts: Dict[str, int]) -> Dict[str, FacadeStats]:
     grouped: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     for row in rows:
         facade_id = row["facade_id"].strip()
         if not facade_id:
             raise ValueError("Empty facade_id in row: {}".format(row))
         grouped[facade_id].append(row)
+    unknown_pair_facades = sorted(set(pair_counts) - set(grouped))
+    if unknown_pair_facades:
+        raise ValueError("Aligned pairs refer to facades absent from master manifest: {}".format(unknown_pair_facades))
     stats: Dict[str, FacadeStats] = {}
     for facade_id, items in grouped.items():
         temporal_items = [row for row in items if temporal_flag(row)]
@@ -104,7 +125,9 @@ def build_stats(rows: Sequence[Dict[str, str]]) -> Dict[str, FacadeStats]:
         ))
         if len(years) != len(temporal_items):
             raise ValueError("Temporal RGB row without valid year for facade: {}".format(facade_id))
-        stats[facade_id] = FacadeStats(facade_id, len(items), len(temporal_items), years)
+        approximate_pairs = max(0, len(temporal_items) - 1)
+        real_pairs = pair_counts.get(facade_id, approximate_pairs)
+        stats[facade_id] = FacadeStats(facade_id, len(items), len(temporal_items), real_pairs, years)
     return stats
 
 
@@ -114,14 +137,14 @@ def validate_ratios(ratios: Dict[str, float]) -> None:
 
 
 def totals(assignment: Dict[str, str], stats: Dict[str, FacadeStats]) -> Dict[str, Dict[str, int]]:
-    counts = {split: {"facades": 0, "all_images": 0, "temporal_images": 0, "temporal_pairs": 0}
+    counts = {split: {"facades": 0, "all_images": 0, "temporal_images": 0, "aligned_pairs": 0}
               for split in SPLITS}
     for facade_id, split in assignment.items():
         item = stats[facade_id]
         counts[split]["facades"] += 1
         counts[split]["all_images"] += item.n_all_images
         counts[split]["temporal_images"] += item.n_temporal_images
-        counts[split]["temporal_pairs"] += item.n_pairs
+        counts[split]["aligned_pairs"] += item.n_aligned_pairs
     return counts
 
 
@@ -129,15 +152,15 @@ def score_assignment(assignment: Dict[str, str], stats: Dict[str, FacadeStats],
                      ratios: Dict[str, float], min_eval_pairs: int) -> float:
     counts = totals(assignment, stats)
     total_images = sum(item.n_all_images for item in stats.values())
-    total_pairs = sum(item.n_pairs for item in stats.values())
+    total_pairs = sum(item.n_aligned_pairs for item in stats.values())
     score = 0.0
     for split in SPLITS:
         target_images = max(1.0, ratios[split] * total_images)
         target_pairs = max(1.0, ratios[split] * total_pairs)
         score += 0.35 * ((counts[split]["all_images"] - target_images) / target_images) ** 2
-        score += 0.65 * ((counts[split]["temporal_pairs"] - target_pairs) / target_pairs) ** 2
+        score += 0.65 * ((counts[split]["aligned_pairs"] - target_pairs) / target_pairs) ** 2
     for split in ("val", "test"):
-        score += 50.0 * max(0, min_eval_pairs - counts[split]["temporal_pairs"])
+        score += 50.0 * max(0, min_eval_pairs - counts[split]["aligned_pairs"])
         if counts[split]["facades"] == 0:
             score += 1000.0
     return score
@@ -147,13 +170,11 @@ def assign_facades(stats: Dict[str, FacadeStats], ratios: Dict[str, float],
                    args: argparse.Namespace) -> Tuple[Dict[str, str], Dict[str, str]]:
     fixed: Dict[str, str] = {}
     reasons: Dict[str, str] = {}
-    temporal = sorted(
-        (item for item in stats.values() if item.has_pair),
-        key=lambda item: (item.n_pairs, item.n_temporal_images, item.facade_id), reverse=True,
-    )
+    temporal = sorted((item for item in stats.values() if item.has_pair),
+                      key=lambda item: (item.n_aligned_pairs, item.n_temporal_images, item.facade_id), reverse=True)
     for item in temporal[:max(0, args.force_train_top_k)]:
         fixed[item.facade_id] = "train"
-        reasons[item.facade_id] = "long_temporal_history_train_anchor"
+        reasons[item.facade_id] = "largest_aligned_pair_history_train_anchor"
     free = [facade_id for facade_id in stats if facade_id not in fixed]
     if len(free) < 2:
         raise ValueError("Too few free facade groups for validation/test.")
@@ -167,8 +188,7 @@ def assign_facades(stats: Dict[str, FacadeStats], ratios: Dict[str, float],
             candidate[facade_id] = rng.choices(SPLITS, weights=weights, k=1)[0]
         value = score_assignment(candidate, stats, ratios, args.min_eval_pairs)
         if value < best_score:
-            best = candidate
-            best_score = value
+            best, best_score = candidate, value
     if best is None:
         raise RuntimeError("Could not construct facade assignment.")
     for facade_id in free:
@@ -190,8 +210,7 @@ def materialize_segmentation(rows: Sequence[Dict[str, str]], assignment: Dict[st
     if mode == "none":
         return counts
     for row in rows:
-        image = Path(row["image_path"])
-        mask = Path(row["mask_path"])
+        image, mask = Path(row["image_path"]), Path(row["mask_path"])
         if not image.exists() or not mask.exists():
             raise FileNotFoundError("Cannot materialize RGB/mask pair: {}, {}".format(image, mask))
         split = assignment[row["facade_id"]]
@@ -203,10 +222,7 @@ def materialize_segmentation(rows: Sequence[Dict[str, str]], assignment: Dict[st
                 if not overwrite:
                     raise FileExistsError("Destination exists: {}".format(dst))
                 dst.unlink()
-            if mode == "copy":
-                shutil.copy2(src, dst)
-            else:
-                dst.symlink_to(src.resolve())
+            shutil.copy2(src, dst) if mode == "copy" else dst.symlink_to(src.resolve())
         counts[split] += 1
     return counts
 
@@ -215,8 +231,9 @@ def main() -> None:
     args = parse_args()
     ratios = {"train": args.train_ratio, "val": args.val_ratio, "test": args.test_ratio}
     validate_ratios(ratios)
-    rows, fields = read_manifest(args.master_manifest)
-    stats = build_stats(rows)
+    rows, fields = read_master_manifest(args.master_manifest)
+    pair_counts, n_pair_rows = load_real_pair_counts(args.compression_pairs_manifest)
+    stats = build_stats(rows, pair_counts)
     assignment, reasons = assign_facades(stats, ratios, args)
     out = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
@@ -224,15 +241,13 @@ def main() -> None:
     assignment_rows: List[Dict[str, object]] = []
     for facade_id in sorted(stats):
         item = stats[facade_id]
-        assignment_rows.append({
-            "facade_id": facade_id, "split": assignment[facade_id], "reason": reasons[facade_id],
-            "n_all_images": item.n_all_images, "n_temporal_images": item.n_temporal_images,
-            "temporal_years": ";".join(str(year) for year in sorted(set(item.temporal_years))),
-            "n_pairs_consecutive": item.n_pairs, "has_temporal_pair": int(item.has_pair),
-        })
+        assignment_rows.append({"facade_id": facade_id, "split": assignment[facade_id], "reason": reasons[facade_id],
+                                "n_all_images": item.n_all_images, "n_temporal_images": item.n_temporal_images,
+                                "temporal_years": ";".join(str(y) for y in sorted(set(item.temporal_years))),
+                                "n_aligned_pairs": item.n_aligned_pairs, "has_aligned_pair": int(item.has_pair)})
     write_csv(out / "facade_assignments.csv",
-              ["facade_id", "split", "reason", "n_all_images", "n_temporal_images",
-               "temporal_years", "n_pairs_consecutive", "has_temporal_pair"], assignment_rows)
+              ["facade_id", "split", "reason", "n_all_images", "n_temporal_images", "temporal_years",
+               "n_aligned_pairs", "has_aligned_pair"], assignment_rows)
 
     out_fields = list(fields) if "split" in fields else list(fields) + ["split"]
     full_rows: List[Dict[str, str]] = []
@@ -256,26 +271,25 @@ def main() -> None:
     counts = totals(assignment, stats)
     materialized = materialize_segmentation(full_rows, assignment, out,
                                             args.materialize_segmentation, args.overwrite_materialized)
-    report = {
-        "input_master_manifest": str(args.master_manifest), "seed": args.seed,
-        "ratios_requested": ratios,
-        "policy": {"group_key": "facade_id", "segmentation_source": "all RGB images and target masks",
-                   "compression_source": "real aligned temporal RGB pairs only",
-                   "long_temporal_train_anchors": args.force_train_top_k,
-                   "singletons_allowed_in_eval": True},
-        "counts": counts, "materialized_segmentation_pairs": materialized,
-        "checks": {"facade_overlap_absent": True,
-                   "val_temporal_pairs_ge_min": counts["val"]["temporal_pairs"] >= args.min_eval_pairs,
-                   "test_temporal_pairs_ge_min": counts["test"]["temporal_pairs"] >= args.min_eval_pairs},
-    }
+    report = {"input_master_manifest": str(args.master_manifest),
+              "compression_pairs_manifest": str(args.compression_pairs_manifest) if args.compression_pairs_manifest else "",
+              "real_pair_manifest_used": args.compression_pairs_manifest is not None,
+              "n_real_pair_rows": n_pair_rows, "seed": args.seed, "ratios_requested": ratios,
+              "policy": {"group_key": "facade_id", "segmentation_source": "all RGB images and target masks",
+                         "compression_source": "real aligned temporal RGB pairs", "singletons_allowed_in_eval": True,
+                         "long_temporal_train_anchors": args.force_train_top_k},
+              "counts": counts, "materialized_segmentation_pairs": materialized,
+              "checks": {"facade_overlap_absent": True,
+                         "val_aligned_pairs_ge_min": counts["val"]["aligned_pairs"] >= args.min_eval_pairs,
+                         "test_aligned_pairs_ge_min": counts["test"]["aligned_pairs"] >= args.min_eval_pairs}}
     (out / "split_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print("Prepared linked group split: {}".format(out))
     for split in SPLITS:
-        print("{}: facades={} all_images={} temporal_images={} temporal_pairs={}".format(
+        print("{}: facades={} all_images={} temporal_images={} aligned_pairs={}".format(
             split, counts[split]["facades"], counts[split]["all_images"],
-            counts[split]["temporal_images"], counts[split]["temporal_pairs"]))
+            counts[split]["temporal_images"], counts[split]["aligned_pairs"]))
     print("Segmentation manifests: {}".format(out / "segmentation"))
-    print("Temporal RGB manifests: {}".format(out / "temporal_rgb"))
+    print("Rebuild aligned pair manifest with --facade-assignments {} to attach splits.".format(out / "facade_assignments.csv"))
 
 
 if __name__ == "__main__":
