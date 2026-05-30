@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .io import load_rgb_image, read_csv_rows, write_csv_rows
+from .residuals import load_valid_mask
 
 DEEP_METHODS = {"dinov2_patch_cosine", "lpips_change"}
 
@@ -21,6 +22,16 @@ def _image_to_np(path: Path):
     np = _np()
     w, h, payload = load_rgb_image(path)
     return np.frombuffer(payload, dtype=np.uint8).reshape((h, w, 3)).astype(np.float32)
+
+
+def _valid_to_np(row: Dict[str, str], height: int, width: int):
+    np = _np()
+    path_value = row.get("valid_mask_path", "")
+    if not path_value:
+        return np.ones((height, width), dtype=bool)
+    threshold = int(float(row.get("valid_threshold", "0") or 0))
+    payload = load_valid_mask(Path(path_value), (width, height), threshold=threshold)
+    return np.frombuffer(payload, dtype=np.uint8).reshape((height, width)).astype(bool)
 
 
 def _tile_grid(h: int, w: int, tile_size: int) -> Iterable[Tuple[int, int, slice, slice]]:
@@ -119,12 +130,21 @@ def compute_baseline_tile_scores(
     temporal_features_csv: Optional[Path] = None,
     artifact_index_csv: Optional[Path] = None,
     skip_deep_baselines: bool = False,
+    min_valid_ratio: float = 0.50,
 ) -> List[Dict[str, object]]:
+    """Compute tile scores on valid aligned pixels only.
+
+    Invalid pixels are neutralised by setting ``curr=prev`` before feature
+    extraction. Per-pixel baselines are then averaged over valid pixels only.
+    Tiles below ``min_valid_ratio`` are excluded rather than assigned a score.
+    """
     np = _np()
     _ = (temporal_features_csv, artifact_index_csv)
     methods = [m.strip() for m in methods if m.strip()]
     if not methods:
         raise ValueError("No methods provided")
+    if not 0.0 <= min_valid_ratio <= 1.0:
+        raise ValueError("min_valid_ratio must be in [0, 1]")
 
     torch = dino_model = lpips_model = None
     if "dinov2_patch_cosine" in methods and not skip_deep_baselines:
@@ -152,21 +172,24 @@ def compute_baseline_tile_scores(
         h, w = prev.shape[:2]
         if curr.shape[:2] != (h, w):
             raise ValueError(f"Image shape mismatch for pair {pair_id}: prev={prev.shape}, curr={curr.shape}")
+        valid = _valid_to_np(row, h, w)
+        curr_neutral = curr.copy()
+        curr_neutral[~valid] = prev[~valid]
 
-        abs_diff = np.abs(curr - prev)
+        abs_diff = np.abs(curr_neutral - prev)
         gray_prev = 0.299 * prev[:, :, 0] + 0.587 * prev[:, :, 1] + 0.114 * prev[:, :, 2]
-        gray_curr = 0.299 * curr[:, :, 0] + 0.587 * curr[:, :, 1] + 0.114 * curr[:, :, 2]
+        gray_curr = 0.299 * curr_neutral[:, :, 0] + 0.587 * curr_neutral[:, :, 1] + 0.114 * curr_neutral[:, :, 2]
         gray_diff = np.abs(gray_curr - gray_prev)
-        ssim_change_map = _ssim_map(prev, curr) if "ssim_change" in methods else None
+        ssim_change_map = _ssim_map(prev, curr_neutral) if "ssim_change" in methods else None
 
         dino_dist = dino_h = dino_w = None
         if "dinov2_patch_cosine" in methods and not skip_deep_baselines:
             key_prev = hashlib.sha1(f"{pair_id}|prev".encode()).hexdigest()
-            key_curr = hashlib.sha1(f"{pair_id}|curr".encode()).hexdigest()
+            key_curr = hashlib.sha1(f"{pair_id}|curr_valid_neutral".encode()).hexdigest()
             prev_cache = feature_cache_dir / f"{key_prev}.npy" if feature_cache_dir else None
             curr_cache = feature_cache_dir / f"{key_curr}.npy" if feature_cache_dir else None
             pfeat, ph, pw = _dino_features(torch, dino_model, prev, device, prev_cache)
-            cfeat, ch, cw = _dino_features(torch, dino_model, curr, device, curr_cache)
+            cfeat, ch, cw = _dino_features(torch, dino_model, curr_neutral, device, curr_cache)
             hmin, wmin = min(ph, ch), min(pw, cw)
             p = pfeat[:hmin, :wmin, :]
             c = cfeat[:hmin, :wmin, :]
@@ -176,20 +199,31 @@ def compute_baseline_tile_scores(
             dino_h, dino_w = hmin, wmin
 
         for tx, ty, ys, xs in _tile_grid(h, w, tile_size):
+            valid_patch = valid[ys, xs]
+            valid_count = int(valid_patch.sum())
+            tile_pixels = int(valid_patch.size)
+            valid_ratio = valid_count / max(tile_pixels, 1)
+            if valid_ratio < min_valid_ratio or valid_count == 0:
+                continue
             for method in methods:
                 if skip_deep_baselines and method in DEEP_METHODS:
                     continue
                 if method == "absdiff_l1":
-                    score = float(abs_diff[ys, xs, :].mean())
+                    score = float(abs_diff[ys, xs, :][valid_patch].mean())
                 elif method == "absdiff_l2":
-                    score = float(np.sqrt(np.mean((curr[ys, xs, :] - prev[ys, xs, :]) ** 2)))
+                    squared = (curr_neutral[ys, xs, :] - prev[ys, xs, :]) ** 2
+                    score = float(np.sqrt(np.mean(squared[valid_patch])))
                 elif method == "grayscale_absdiff":
-                    score = float(gray_diff[ys, xs].mean())
+                    score = float(gray_diff[ys, xs][valid_patch].mean())
                 elif method == "ssim_change":
-                    score = float(ssim_change_map[ys, xs, :].mean() if ssim_change_map.ndim == 3 else ssim_change_map[ys, xs].mean())
+                    patch = ssim_change_map[ys, xs]
+                    if patch.ndim == 3:
+                        score = float(patch[valid_patch].mean())
+                    else:
+                        score = float(patch[valid_patch].mean())
                 elif method == "lpips_change":
-                    patch_prev = prev[ys, xs, :]
-                    patch_curr = curr[ys, xs, :]
+                    patch_prev = prev[ys, xs, :].copy()
+                    patch_curr = curr_neutral[ys, xs, :].copy()
                     tprev = torch.from_numpy(patch_prev.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
                     tcurr = torch.from_numpy(patch_curr.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
                     tprev = (tprev / 127.5) - 1.0
@@ -217,8 +251,10 @@ def compute_baseline_tile_scores(
                     "tile_y": ty,
                     "tile_score": score,
                     "tile_size": tile_size,
+                    "valid_pixel_count": valid_count,
+                    "valid_ratio": valid_ratio,
                 })
 
-    fields = ["pair_id", "facade_id", "split", "method", "score_type", "tile_x", "tile_y", "tile_score", "tile_size"]
+    fields = ["pair_id", "facade_id", "split", "method", "score_type", "tile_x", "tile_y", "tile_score", "tile_size", "valid_pixel_count", "valid_ratio"]
     write_csv_rows(out_scores_csv, fields, out_rows)
     return out_rows
