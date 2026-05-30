@@ -67,13 +67,19 @@ def _load_dinov2(device: str, model_name: str, cache_dir: Optional[Path], weight
         cache_dir.mkdir(parents=True, exist_ok=True)
         torch.hub.set_dir(str(cache_dir))
 
+    if weights_path is not None and not Path(weights_path).is_file():
+        raise FileNotFoundError("DINOv2 weights file does not exist: {}".format(weights_path))
+    if repo_dir is not None and not Path(repo_dir).is_dir():
+        raise FileNotFoundError("DINOv2 repository directory does not exist: {}".format(repo_dir))
+
     source = "local" if repo_dir else "github"
     repo_or_dir = str(repo_dir) if repo_dir else "facebookresearch/dinov2"
+    load_kwargs = {"pretrained": False} if weights_path else {}
     try:
-        model = torch.hub.load(repo_or_dir, model_name, source=source)
+        model = torch.hub.load(repo_or_dir, model_name, source=source, **load_kwargs)
     except Exception as exc:
         raise RuntimeError(
-            f"Failed to load DINOv2 '{model_name}'. For offline mode pass --dinov2-repo-dir pointing to local dinov2 clone (and optional --dinov2-weights-path). Original error: {exc}"
+            f"Failed to load DINOv2 '{model_name}'. For offline/local mode pass --dinov2-repo-dir pointing to a local dinov2 clone or torch.hub checkout and --dinov2-weights-path pointing to the pretrained checkpoint. Original error: {exc}"
         ) from exc
 
     if weights_path:
