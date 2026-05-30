@@ -22,15 +22,6 @@ The learned RGB residual compression model is trained in the companion repositor
 
 All splitting is performed by `facade_id`, so images from one facade cannot appear in both training and evaluation splits. Single non-temporal facade images are used only for segmentation training. Aligned temporal RGB pairs are assigned using the same facade split as the segmentation data.
 
-For the current dataset snapshot, the aligned RGB pair manifest contains:
-
-| Split | Aligned RGB pairs |
-|---|---:|
-| Train | 104 |
-| Validation | 22 |
-| Test | 21 |
-| Total | 147 |
-
 The validation split is used for model/checkpoint selection and heatmap score threshold selection. The test split is reserved for final reporting.
 
 ### Temporal representation
