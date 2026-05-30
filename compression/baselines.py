@@ -8,6 +8,7 @@ from .io import load_rgb_image, read_csv_rows, write_csv_rows
 from .residuals import load_valid_mask
 
 DEEP_METHODS = {"dinov2_patch_cosine", "lpips_change"}
+DINO_PATCH_SIZE = 14
 
 
 def _np():
@@ -91,13 +92,24 @@ def _load_dinov2(device: str, model_name: str, cache_dir: Optional[Path], weight
     return torch, model
 
 
+def _pad_image_to_patch_multiple(img, patch_size: int = DINO_PATCH_SIZE):
+    np = _np()
+    height, width = img.shape[:2]
+    pad_h = (-height) % patch_size
+    pad_w = (-width) % patch_size
+    if pad_h == 0 and pad_w == 0:
+        return img
+    return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+
+
 def _dino_features(torch, model, img, device: str, cache_path: Optional[Path]):
     np = _np()
     if cache_path and cache_path.exists():
         dat = np.load(cache_path, allow_pickle=True).item()
         return dat["features"], int(dat["grid_h"]), int(dat["grid_w"])
 
-    x = torch.from_numpy(img.transpose(2, 0, 1)).float().unsqueeze(0).to(device) / 255.0
+    model_img = _pad_image_to_patch_multiple(img, DINO_PATCH_SIZE)
+    x = torch.from_numpy(model_img.transpose(2, 0, 1)).float().unsqueeze(0).to(device) / 255.0
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
     x = (x - mean) / std
@@ -106,18 +118,33 @@ def _dino_features(torch, model, img, device: str, cache_path: Optional[Path]):
     patch = feats.get("x_norm_patchtokens")
     if patch is None:
         raise RuntimeError("DINOv2 forward_features output missing 'x_norm_patchtokens'.")
+    h_p = model_img.shape[0] // DINO_PATCH_SIZE
+    w_p = model_img.shape[1] // DINO_PATCH_SIZE
     n = int(patch.shape[1])
-    h_p = img.shape[0] // 14
-    w_p = img.shape[1] // 14
     if h_p * w_p != n:
-        h_p = 1
-        while h_p <= n and n % h_p != 0:
-            h_p += 1
-        w_p = max(1, n // h_p)
+        raise RuntimeError(
+            "Unexpected DINOv2 patch-token grid: padded image={}x{}, expected tokens={}, observed tokens={}".format(
+                model_img.shape[0], model_img.shape[1], h_p * w_p, n
+            )
+        )
     arr = patch[0].detach().cpu().numpy().reshape(h_p, w_p, -1)
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(cache_path, {"features": arr, "grid_h": h_p, "grid_w": w_p}, allow_pickle=True)
+        np.save(
+            cache_path,
+            {
+                "features": arr,
+                "grid_h": h_p,
+                "grid_w": w_p,
+                "patch_size": DINO_PATCH_SIZE,
+                "original_h": int(img.shape[0]),
+                "original_w": int(img.shape[1]),
+                "padded_h": int(model_img.shape[0]),
+                "padded_w": int(model_img.shape[1]),
+                "padding_policy": "edge_pad_to_patch_multiple",
+            },
+            allow_pickle=True,
+        )
     return arr, h_p, w_p
 
 
@@ -171,7 +198,7 @@ def compute_baseline_tile_scores(
     extraction. Per-pixel baselines are averaged over valid pixels only. Tiles
     below ``min_valid_ratio`` are excluded. LPIPS is evaluated in tile batches;
     DINOv2 is evaluated as whole-image patch features and pooled to the common
-    tile grid.
+    tile grid after edge-padding images to the ViT patch-size multiple.
     """
     np = _np()
     _ = (temporal_features_csv, artifact_index_csv)
@@ -229,8 +256,8 @@ def compute_baseline_tile_scores(
 
         dino_dist = dino_h = dino_w = None
         if "dinov2_patch_cosine" in methods and not skip_deep_baselines:
-            key_prev = hashlib.sha1(f"{pair_id}|prev".encode()).hexdigest()
-            key_curr = hashlib.sha1(f"{pair_id}|curr_valid_neutral".encode()).hexdigest()
+            key_prev = hashlib.sha1(f"{pair_id}|prev|edgepad14".encode()).hexdigest()
+            key_curr = hashlib.sha1(f"{pair_id}|curr_valid_neutral|edgepad14".encode()).hexdigest()
             prev_cache = feature_cache_dir / f"{key_prev}.npy" if feature_cache_dir else None
             curr_cache = feature_cache_dir / f"{key_curr}.npy" if feature_cache_dir else None
             pfeat, ph, pw = _dino_features(torch, dino_model, prev, device, prev_cache)
@@ -279,10 +306,10 @@ def compute_baseline_tile_scores(
                 elif method == "dinov2_patch_cosine":
                     if dino_dist is None:
                         continue
-                    py0 = int(ys.start / h * dino_h)
-                    py1 = max(py0 + 1, int(ys.stop / h * dino_h))
-                    px0 = int(xs.start / w * dino_w)
-                    px1 = max(px0 + 1, int(xs.stop / w * dino_w))
+                    py0 = max(0, ys.start // DINO_PATCH_SIZE)
+                    py1 = min(dino_h, max(py0 + 1, (ys.stop + DINO_PATCH_SIZE - 1) // DINO_PATCH_SIZE))
+                    px0 = max(0, xs.start // DINO_PATCH_SIZE)
+                    px1 = min(dino_w, max(px0 + 1, (xs.stop + DINO_PATCH_SIZE - 1) // DINO_PATCH_SIZE))
                     score = float(dino_dist[py0:py1, px0:px1].mean())
                 elif method == "lpips_change":
                     continue
