@@ -4,6 +4,11 @@ Training reads pre-generated augmented train tiles. Validation reads clean tiles
 from a deterministic tiling manifest, runs the model tile-wise, averages logits
 in overlapping regions, then computes loss and semantic segmentation metrics on
 the reconstructed full-resolution validation images.
+
+Optionally, online train metrics are accumulated from the same forward passes
+used for optimization. They add no second train inference pass and are intended
+for diagnostics only: train predictions are produced on augmented samples in
+training mode before the current optimizer update.
 """
 from __future__ import annotations
 
@@ -11,29 +16,28 @@ import argparse
 import csv
 import datetime
 import json
-import math
-import os
-import random
 import sys
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import cv2
-import mmcv  # type: ignore
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from hydra import compose, initialize_config_dir
-from mmseg.datasets import build_dataloader, build_dataset
-from tqdm import tqdm
-
+# Make repository-local packages (in particular ./mmseg) importable before
+# importing them. This removes the need to export PYTHONPATH manually.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_ROOT = Path(__file__).resolve().parent
 for path in (PROJECT_ROOT, TOOLS_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
+
+import cv2  # noqa: E402
+import mmcv  # type: ignore  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+from hydra import compose, initialize_config_dir  # noqa: E402
+from mmseg.datasets import build_dataloader, build_dataset  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
 import finetune as common  # noqa: E402
 from helpers.logger import get_logger  # noqa: E402
@@ -64,7 +68,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="outputs")
     parser.add_argument("--val-save-visualizations", type=int, default=10,
                         help="Maximum number of stitched validation visualizations saved per epoch.")
-    parser.add_argument("--select-best-by", choices=["val_loss", "mIoU", "mF1"], default="val_loss")
+    parser.add_argument("--select-best-by", choices=["val_loss", "mIoU", "mF1", "mIoU_no_background", "mF1_no_background"], default="val_loss")
+    parser.add_argument(
+        "--log-online-train-metrics",
+        action="store_true",
+        help=(
+            "Accumulate per-class train metrics from optimization forward passes. "
+            "No additional inference pass is run; metrics are diagnostic only."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -131,6 +143,49 @@ def source_target(mask_path: Path) -> torch.Tensor:
     if mask.ndim == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
     return torch.from_numpy(mask.astype(np.int64))
+
+
+def add_no_background_metrics(metrics: dict, class_names: Sequence[str]) -> dict:
+    foreground_names = [name for name in class_names if name != "BACKGROUND"]
+    if not foreground_names:
+        return metrics
+    class_metrics = metrics.get("class_metrics", {})
+    metrics["mIoU_no_background"] = float(np.mean([class_metrics[name]["iou"] for name in foreground_names]))
+    metrics["mF1_no_background"] = float(np.mean([class_metrics[name]["f1"] for name in foreground_names]))
+    metrics["mAcc_no_background"] = float(np.mean([class_metrics[name]["accuracy"] for name in foreground_names]))
+    return metrics
+
+
+def log_metric_breakdown(logger, title: str, metrics: dict, class_names: Sequence[str]) -> None:
+    logger.info(
+        "%s summary — mIoU=%.4f | mF1=%.4f | mAcc=%.4f | mIoU_no_background=%.4f | mF1_no_background=%.4f",
+        title,
+        metrics.get("mIoU", 0.0),
+        metrics.get("mF1", 0.0),
+        metrics.get("mAcc", 0.0),
+        metrics.get("mIoU_no_background", 0.0),
+        metrics.get("mF1_no_background", 0.0),
+    )
+    logger.info("%s per-class metrics:", title)
+    class_metrics = metrics.get("class_metrics", {})
+    for name in class_names:
+        values = class_metrics.get(name, {})
+        logger.info(
+            "  %-18s IoU=%.4f | F1=%.4f | Acc=%.4f",
+            name,
+            values.get("iou", 0.0),
+            values.get("f1", 0.0),
+            values.get("accuracy", 0.0),
+        )
+    logger.info("%s grouped metrics:", title)
+    for group_name, values in metrics.get("group_metrics", {}).items():
+        logger.info(
+            "  %-18s IoU=%.4f | F1=%.4f | Acc=%.4f",
+            group_name,
+            values.get("iou", 0.0),
+            values.get("f1", 0.0),
+            values.get("accuracy", 0.0),
+        )
 
 
 def save_stitched_visualization(
@@ -238,6 +293,7 @@ def evaluate_stitched_tiles(
             )
 
     metrics = common._compute_metrics_from_confusion(confusion, class_names)
+    metrics = add_no_background_metrics(metrics, class_names)
     val_loss = sum(loss_values) / max(len(loss_values), 1)
     if first_prediction_dist is not None:
         print("[VAL DEBUG] First stitched source class dist:", first_prediction_dist)
@@ -267,6 +323,7 @@ def main() -> None:
     logger = get_logger(cfg)
     logger.info("Starting fine-tuning with stitched tiled validation")
     logger.info("Validation tiles manifest: %s", args.val_tiles_manifest)
+    logger.info("Online train metrics enabled: %s", args.log_online_train_metrics)
 
     train_loader, val_dataset = build_loaders_and_val_dataset(
         args.train_dataset_config, args.val_dataset_config, args.batch_size, args.num_workers
@@ -318,13 +375,24 @@ def main() -> None:
         wrapper.train()
         total_loss = 0.0
         loss_window = deque(maxlen=100)
+        train_confusion = (
+            torch.zeros((num_classes, num_classes), dtype=torch.float64, device="cuda")
+            if args.log_online_train_metrics else None
+        )
         progress = tqdm(train_loader, desc="Epoch {}".format(epoch))
         for data in progress:
             images = data["img"].data[0].cuda()
             targets = data["gt_semantic_seg"].data[0].long().squeeze(1).cuda()
             optimizer.zero_grad(set_to_none=True)
             logits, _ = wrapper(images)
+            if logits.shape[-2:] != targets.shape[-2:]:
+                logits = F.interpolate(logits, size=targets.shape[-2:], mode="bilinear", align_corners=False)
             loss = common.compute_loss(logits, targets, loss_cfg, class_weights, ignore_index=ignore_index)
+            if train_confusion is not None:
+                predictions = logits.detach().argmax(dim=1)
+                train_confusion = common._accumulate_confusion(
+                    train_confusion, predictions, targets, num_classes=num_classes, ignore_index=ignore_index
+                )
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -338,6 +406,12 @@ def main() -> None:
             )
 
         train_loss = total_loss / len(train_loader.dataset)
+        online_train_metrics = None
+        if train_confusion is not None:
+            online_train_metrics = common._compute_metrics_from_confusion(train_confusion, class_names)
+            online_train_metrics = add_no_background_metrics(online_train_metrics, class_names)
+            log_metric_breakdown(logger, "Epoch {} online train".format(epoch), online_train_metrics, class_names)
+
         viz_dir = run_dir / "val_viz" / "epoch_{:03d}".format(epoch)
         metrics, val_loss = evaluate_stitched_tiles(
             wrapper, val_dataset, args.val_tiles_manifest, class_names, loss_cfg,
@@ -345,10 +419,11 @@ def main() -> None:
             max_visualizations=args.val_save_visualizations,
         )
         logger.info(
-            "Epoch %d — train_loss: %.4f | stitched val mIoU: %.4f | mF1: %.4f | mAcc: %.4f | val_loss: %.4f",
-            epoch, train_loss, metrics.get("mIoU", 0.0), metrics.get("mF1", 0.0),
-            metrics.get("mAcc", 0.0), val_loss,
+            "Epoch %d — train_loss: %.4f | stitched val mIoU: %.4f | mIoU_no_background: %.4f | mF1: %.4f | val_loss: %.4f",
+            epoch, train_loss, metrics.get("mIoU", 0.0), metrics.get("mIoU_no_background", 0.0),
+            metrics.get("mF1", 0.0), val_loss,
         )
+        log_metric_breakdown(logger, "Epoch {} stitched val".format(epoch), metrics, class_names)
         score_name, score_value = selection_score(metrics, val_loss, args.select_best_by)
         best_checkpoints = common.save_checkpoint(
             model=wrapper, optimizer=optimizer, out_dir=run_dir, epoch=epoch, metrics=metrics,
@@ -356,8 +431,8 @@ def main() -> None:
             score_value=score_value, best_pool=best_checkpoints,
         )
         record = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
-                  "metrics": metrics, "selection_score_name": score_name,
-                  "selection_score_value": score_value}
+                  "metrics": metrics, "online_train_metrics": online_train_metrics,
+                  "selection_score_name": score_name, "selection_score_value": score_value}
         with metrics_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
