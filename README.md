@@ -1,191 +1,249 @@
-# LPOSS: Label Propagation Over Patches and Pixels for Open-vocabulary Semantic Segmentation
+# AI-Assisted Monitoring of Historical Facade Changes with Temporal Heatmaps
 
-This repository contains the code for the paper Vladan Stojnić, Yannis Kalantidis, Jiří Matas, Giorgos Tolias, ["LPOSS: Label Propagation Over Patches and Pixels for Open-vocabulary Semantic Segmentation"](http://arxiv.org/abs/2503.19777), In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2025.
+This repository contains the facade-monitoring experimental pipeline built on top of the original [LPOSS](https://arxiv.org/abs/2503.19777) open-vocabulary semantic segmentation codebase. The current study analyses temporally separated street-level RGB images of historical facades after geometric alignment. The primary signal is a compression-derived heatmap computed on aligned RGB residuals; semantic segmentation is used as an auxiliary interpretation branch and for reference-based quantitative evaluation.
 
-<div align="center">
-    
-[![arXiv](https://img.shields.io/badge/arXiv-2503.19777-b31b1b.svg)](http://arxiv.org/abs/2503.19777) [![Open in Spaces](https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-md-dark.svg)](https://huggingface.co/spaces/stojnvla/LPOSS)
+The current experimental objective is **inspection-relevant facade state change localization**, not automatic diagnosis of physical degradation alone. Target changes may include deterioration, repairs, added or removed textual/pictorial content, and other visible interventions relevant to inspection.
 
-</div>
+## Repository roles
 
-## Demo
+This repository provides:
 
-The demo of our method is available at [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.png" height=20px> huggingface spaces](https://huggingface.co/spaces/stojnvla/LPOSS).
+- dataset preparation, facade-disjoint splitting, segmentation tiling and fine-tuning;
+- aligned RGB pair manifests and valid-mask-aware RGB residual construction;
+- aligned manual-reference maps for quantitative temporal heatmap evaluation;
+- classical and perceptual temporal-change baselines;
+- evaluation of heatmaps against inspection-relevant and damage/repair-oriented references.
 
-## Setup
+The learned RGB residual compression model is trained in the companion repository [`InsightofSPb/MasksComp`](https://github.com/InsightofSPb/MasksComp), using the aligned pair manifests produced here.
 
-Setup the conda environment:
-```
-# Create conda environment
-conda create -n lposs python=3.9
-conda activate lposs
-conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.3 -c pytorch
-```
-Install MMCV and MMSegmentation:
-```
-pip install -U openmim
-mim install mmengine    
-mim install "mmcv-full==1.6.0"
-mim install "mmsegmentation==0.27.0"
-```
-Install additional requirements:
-```
-conda install -c pytorch -c nvidia faiss-gpu=1.8.0
-pip install kornia==0.7.4 cupy-cuda11x ftfy omegaconf open_clip_torch==2.26.1 hydra-core wandb
-```
+## Current experimental protocol
 
-## Offline dataset augmentation
+### Data split
 
-To pre-generate an augmented facade dataset (images, masks, and overlays), use the helper script:
+All splitting is performed by `facade_id`, so images from one facade cannot appear in both training and evaluation splits. Single non-temporal facade images are used only for segmentation training. Aligned temporal RGB pairs are assigned using the same facade split as the segmentation data.
 
-```
-python tools/augment_dataset.py -c configs/augmentation.yaml
-```
+For the current dataset snapshot, the aligned RGB pair manifest contains:
 
-Key points:
+| Split | Aligned RGB pairs |
+|---|---:|
+| Train | 104 |
+| Validation | 22 |
+| Test | 21 |
+| Total | 147 |
 
-* The default config (`configs/augmentation.yaml`) expects raw images under `data/facades/images` and masks under `data/facades/masks`, and will write augmented images, masks, and visual overlays into `data/facades_aug/`.
-* Images are first split into 448×448 tiles (configurable via `tiling`) so that augmentations are applied on the same patch size the network expects; this avoids random crops that would otherwise change the spatial support post-augmentation.
-* When training on the pre-generated tiles, keep the dataloader pipeline free of extra augmentations so you do not stack online transforms on top of the offline ones.
-* If mask filenames differ from the image filenames, point `paths.pairs` in the config to a YAML/JSON dict mapping `image_name.png: mask_name.png` so the script can locate the right mask.
-* Augmentations include geometric/photometric transforms, weather effects from Albumentations, CutOut, MixUp, CutMix, and a soft zoom-in crop (`augmentations.zoom`) that crops a smaller area and resizes back to 448×448. Counts/probabilities, output formats, and overlay transparency can all be tuned in the YAML file.
-* A tqdm progress bar is shown while augmentations are generated so you can estimate runtime even with multiple augmentations per image.
+The validation split is used for model/checkpoint selection and heatmap score threshold selection. The test split is reserved for final reporting.
 
-To split the augmented tiles (e.g., `data/facades_aug/images` and `data/facades_aug/masks`) into train/val/test subsets, use:
+### Temporal representation
 
-```
-python tools/split_dataset.py --data-root data/facades_aug --train-ratio 0.8 --val-ratio 0.1 --test-ratio 0.1
+For each temporal pair, the earlier RGB image is geometrically warped to the coordinate system of the later image. The RGB residual is then defined on valid aligned pixels as:
+
+```text
+residual = (current_RGB - warped_previous_RGB) mod 256
 ```
 
-By default the script writes the splits to `<data-root>/data_prepared/{train,val,test}/{images,masks}`. Adjust the ratios or the `--output-dir` as needed. Masks must share filenames with their corresponding images.
+Pixels outside the valid alignment region are excluded from training and scoring. Full residual images may contain zero-filled invalid pixels only as storage/context placeholders; these pixels are not treated as valid change evidence.
 
-For facade-specific fine-tuning recipes (full MaskCLIP unfreeze, LR groups, weighted CE/Focal+Dice), see `docs/train_facades.md`.
+### Reference maps
 
-## Datasets
+Manual semantic masks are aligned using the same homography as the RGB images, with nearest-neighbour interpolation. Reference maps encode:
 
-We use 8 benchmark datasets: PASCAL VOC20, PASCAL Context59, COCO-Object, PASCAL VOC, PASCAL Context, COCO-Stuff, Cityscapes, and ADE20k.
-
-To run the evaluation, download and set up PASCAL VOC, PASCAL Context, COCO-Stuff164k, Cityscapes, and ADE20k datasets following ["MMSegmentation"](https://mmsegmentation.readthedocs.io/en/latest/user_guides/2_dataset_prepare.html) data preparation document.
-
-COCO-Object dataset uses only object classes from COCO-Stuff164k dataset by collecting instance segmentation annotations. Run the following command to convert instance segmentation annotations to semantic segmentation annotations:
-
-```
-python tools/convert_coco.py data/coco_stuff164k/ -o data/coco_stuff164k/
+```text
+0   no target change
+1   target change
+255 invalid / ignored pixel
 ```
 
-## Running
+The principal reference is `inspection_relevant_change`, which retains changes involving:
 
-The provided code can be run using follwing commands:
+- damage labels: `CRACK`, `SPALLING`, `DELAMINATION`, `MISSING_ELEMENT`, `WATER_STAIN`, `EFFLORESCENCE`, `CORROSION`;
+- `REPAIRS`;
+- `TEXT_OR_IMAGES`.
 
-LPOSS:
+Secondary references include `damage_or_repair_change`, `damage_type_change`, `intervention_or_content_change`, `damage_presence_change`, and `any_semantic_change`.
+
+The annotation ontology currently groups signage, graffiti and other visual textual/pictorial content into `TEXT_OR_IMAGES`. Consequently, appearance or disappearance of that category is represented, while within-category changes such as signage-to-graffiti cannot be distinguished.
+
+### Heatmap evaluation
+
+The current common evaluation grid is:
+
+| Setting | Value |
+|---|---:|
+| Tile size | 32 × 32 |
+| Tile stride | 32 |
+| Minimum valid tile ratio for val/test scoring | 0.50 |
+| Primary positive-tile criterion | changed valid pixel ratio ≥ 0.05 |
+
+Primary ranking metrics are `AUPRC`, `AUROC`, `Precision@Top-K%`, and correlation with the continuous changed-pixel fraction. Thresholded `F1` and `IoU` are supplementary: their score threshold is selected on validation only and must be interpreted relative to the all-positive baseline.
+
+## End-to-end workflow
+
+The examples below use local variables rather than hard-coded machine paths:
+
+```bash
+DATA_ROOT=/path/to/data_26_05_all
+SPLIT_ROOT=$DATA_ROOT/evaluation/group_split_v1
+PAIRS_ROOT=$DATA_ROOT/compression/aligned_pairs_split_v1
+REF_ROOT=$DATA_ROOT/evaluation/pair_change_references_v1
+RES_ROOT=$DATA_ROOT/compression/rgb_residuals_valid_v1
+BASELINE_ROOT=$DATA_ROOT/evaluation/baselines_valid_v1
 ```
-torchrun main_eval.py lposs.yaml --dataset {voc, coco_object, context, context59, coco_stuff, voc20, ade20k, cityscapes} [--measure_boundary]
+
+### 1. Build aligned manual-reference maps
+
+```bash
+python tools/build_pair_change_reference_maps.py \
+  --pairs-manifest $PAIRS_ROOT/pairs_all.csv \
+  --masks-dir $DATA_ROOT/masks \
+  --ref-spx-out $DATA_ROOT/facades_images_with_years/ref_spx_batch_out \
+  --out-dir $REF_ROOT
 ```
 
-LPOSS+:
-```
-torchrun main_eval.py lposs_plus.yaml --dataset {voc, coco_object, context, context59, coco_stuff, voc20, ade20k, cityscapes} [--measure_boundary]
-```
+The builder verifies that the recovered homography reproduces the saved RGB warp and writes reference manifests for train, validation and test pairs.
 
-### Using DINOv3 backbones
+### 2. Build valid-mask-aware RGB residuals
 
-To swap the DINO encoder for a DINOv3 checkpoint with a similar parameter scale (e.g., `dinov3_vitb16` instead of `dino_vitb16`):
-
-1. Clone the [DINOv3 repository](https://github.com/facebookresearch/dinov3) locally.
-2. Download the desired checkpoint (e.g., `dinov3_vitb16_pretrain.pth` from the release page).
-3. In your config (`lposs.yaml`, `lposs_plus.yaml`, or `facades_raw.yaml`), override the model block:
-
-```yaml
-model:
-  dino_repo: /path/to/local/dinov3       # path to the local clone or hub repo string
-  dino_model: dinov3_vitb16              # stay in the same weight range as dino_vitb16
-  dino_weights: /path/to/dinov3_vitb16_pretrain.pth
-  dino_source: local                     # "github" if you want torch.hub to fetch from the repo URL
+```bash
+python tools/build_rgb_residual_dataset.py \
+  --pairs-manifest $PAIRS_ROOT/pairs_all.csv \
+  --out-dir $RES_ROOT
 ```
 
-If you only set `dino_model: dinov3_*` and leave `dino_repo` unset, LPOSS will automatically point torch.hub to the official
-`facebookresearch/dinov3:main` entry and print the chosen repo/model when the backbone is loaded, so you can verify in the
-log that DINOv3 is being used.
+### 3. Run classical aligned RGB baselines
 
-If you leave these fields as `null`, the original DINO v1 checkpoints are used automatically.
-
-## Citation
-
+```bash
+python tools/run_temporal_change_baselines.py \
+  --residual-manifest $RES_ROOT/residual_manifest.csv \
+  --out-csv $BASELINE_ROOT/basic_tile_scores.csv \
+  --methods absdiff_l1,absdiff_l2,grayscale_absdiff,ssim_change \
+  --tile-size 32 \
+  --min-valid-ratio 0.50 \
+  --device cpu
 ```
+
+The same CLI also supports `lpips_change` and `dinov2_patch_cosine` when their model dependencies are available.
+
+### 4. Evaluate temporal tile scores
+
+Primary inspection-relevant evaluation:
+
+```bash
+python tools/evaluate_temporal_tile_scores.py \
+  --scores-csv $BASELINE_ROOT/basic_tile_scores.csv \
+  --references-csv $REF_ROOT/pair_change_references.csv \
+  --reference inspection_relevant_change \
+  --target-min-change-ratio 0.05 \
+  --top-k-percent 5,10,20 \
+  --out-dir $BASELINE_ROOT/inspection_relevant_change_r005
+```
+
+Damage/repair-oriented supplementary evaluation:
+
+```bash
+python tools/evaluate_temporal_tile_scores.py \
+  --scores-csv $BASELINE_ROOT/basic_tile_scores.csv \
+  --references-csv $REF_ROOT/pair_change_references.csv \
+  --reference damage_or_repair_change \
+  --target-min-change-ratio 0.05 \
+  --top-k-percent 5,10,20 \
+  --out-dir $BASELINE_ROOT/damage_or_repair_change_r005
+```
+
+## Semantic segmentation branch
+
+### Important architecture note
+
+The current supervised fine-tuning implementation evaluates and adapts the **MaskCLIP-based segmentation branch initialised within the LPOSS codebase**. The training wrapper calls the MaskCLIP backbone and decode head directly; full LPOSS DINO-refinement is not invoked in this fine-tuning path. Accordingly, results should not be described as supervised fine-tuning of the complete LPOSS+DINO pipeline.
+
+### Prepared tiled dataset
+
+Training uses pre-generated image/mask tiles; augmentations are applied only to training tiles. `CutOut` writes ignored mask pixels with label `255`, and the segmentation loss/evaluation pipeline uses `ignore_index=255`. Validation and test images are tiled without augmentations and their overlapping logits are stitched before computing metrics.
+
+### Fine-tuning with stitched validation
+
+```bash
+export FACADES_SEG_TRAIN_ROOT=$SPLIT_ROOT/segmentation_train_tiles
+export FACADES_SEG_TRAIN_SPLIT=$SPLIT_ROOT/train_subsets/train_allclean_plus1aug.txt
+export FACADES_SEG_VAL_TILES_ROOT=$SPLIT_ROOT/segmentation_eval_tiles
+
+python tools/finetune_tiled.py lposs \
+  --train-dataset-config mmseg/datasets/facades_group_split_train.py \
+  --val-dataset-config mmseg/datasets/facades_group_split_val_tiles.py \
+  --val-tiles-manifest $SPLIT_ROOT/segmentation_eval_tiles/val/tiles_manifest.csv \
+  --train-probe-split $SPLIT_ROOT/train_subsets/clean_probe_512.txt \
+  --train-probe-batch-size 32 \
+  --train-probe-fixed-count 20 \
+  --train-probe-top-k 20 \
+  --train-probe-min-damage-ratio 0.01 \
+  --epochs 10 \
+  --batch-size 64 \
+  --num-workers 2 \
+  --learning-rate 2e-5 \
+  --backbone-lr-mult 0.1 \
+  --warmup-steps 300 \
+  --unfreeze-depth 1 \
+  --loss-mode focal_dice \
+  --focal-gamma 2.0 \
+  --dice-weight 1.0 \
+  --class-weights auto \
+  --class-weight-mode median_freq \
+  --select-best-by DAMAGE_MACRO_MIOU \
+  --log-online-train-metrics \
+  --val-save-visualizations -1 \
+  --output-root outputs/facade_segmentation_group_split_v1_depth1_damage
+```
+
+The principal checkpoint-selection metric is `DAMAGE_MACRO_MIOU`, the mean IoU across the seven annotated damage labels. Grouped metrics such as `STRUCTURAL_DAMAGE` remain useful for practical interpretation, especially under severe class imbalance.
+
+### Stock versus fine-tuned evaluation
+
+To quantify the effect of supervised adaptation, the stock pretrained branch and the validation-selected fine-tuned checkpoint must be evaluated with the same stitched tiled protocol.
+
+Stock validation example:
+
+```bash
+python tools/evaluate_segmentation_tiled.py lposs \
+  --eval-dataset-config mmseg/datasets/facades_group_split_val_tiles.py \
+  --tiles-manifest $SPLIT_ROOT/segmentation_eval_tiles/val/tiles_manifest.csv \
+  --split val \
+  --model-label stock \
+  --save-visualizations -1 \
+  --output-root $DATA_ROOT/evaluation/segmentation_stock_vs_finetuned_v1
+```
+
+For a fine-tuned run, add:
+
+```bash
+--checkpoint /path/to/validation_selected_checkpoint.pth --model-label finetuned
+```
+
+Checkpoint selection is performed on validation only; test is evaluated once after selection.
+
+## Learned RGB compression branch
+
+The learned byte-level RGB residual model is implemented in the companion `MasksComp` repository. Use:
+
+```text
+tools/build_aligned_rgb_residual_tiles_valid.py
+tools/train_aligned_rgb_temporal_lm_valid.py
+tools/eval_aligned_rgb_temporal_lm_valid.py
+```
+
+The resulting tile-score CSVs are compatible with `tools/evaluate_temporal_tile_scores.py` in this repository.
+
+## Upstream LPOSS attribution
+
+This repository is based on:
+
+> Vladan Stojnić, Yannis Kalantidis, Jiří Matas, Giorgos Tolias, **LPOSS: Label Propagation Over Patches and Pixels for Open-vocabulary Semantic Segmentation**, CVPR 2025.
+
+```bibtex
 @InProceedings{stojnic2025_lposs,
-    author    = {Stojni\'c, Vladan and Kalantidis, Yannis and Matas, Ji\v{r}\'i  and Tolias, Giorgos},
+    author    = {Stojni\'c, Vladan and Kalantidis, Yannis and Matas, Ji\v{r}i and Tolias, Giorgos},
     title     = {LPOSS: Label Propagation Over Patches and Pixels for Open-vocabulary Semantic Segmentation},
     booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
     year      = {2025}
 }
 ```
 
-## Acknowledgments
-
-This repository is based on ["CLIP-DINOiser: Teaching CLIP a few DINO tricks for Open-Vocabulary Semantic Segmentation"](https://github.com/wysoczanska/clip_dinoiser). Thanks to the authors!
-
-## Facade compression/change pipeline
-
-The repository includes a facade-focused compression/change branch under `compression/` with CLI entrypoints under `cli/`.
-
-Highlights:
-- stronger learned entropy baseline (`--model-mode bigram`) plus `unigram` ablation
-- explicit `score_type` (`achieved_bits` vs `model_bits`) and `bit_length` fields in outputs
-- codec methods: `zstd`, `lzma`, `webp`, `fnlic` (FNLIC-lite approximation documented)
-
-Quick start:
-
-```bash
-python cli/make_facade_pairs.py --manifest-csv data/facades/manifest_images.csv --out-dir data/facades/compression/pairs
-python cli/build_facade_residual_dataset.py --pairs-csv data/facades/compression/pairs/pairs_all.csv --out-root data/facades/compression/residuals
-python cli/bench_facade_residual_codecs.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-csv outputs/compression/codec_bench.csv --methods zstd,lzma,webp,fnlic
-python cli/train_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-out outputs/compression/entropy_bigram.json --model-mode bigram
-python cli/eval_residual_entropy.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --model-path outputs/compression/entropy_bigram.json --split val --out-csv outputs/compression/entropy_val.csv --tile-size 32 --tile-out-csv outputs/compression/entropy_val_tiles.csv
-python cli/eval_facade_change_tiles.py --residual-manifest data/facades/compression/residuals/residual_manifest.csv --out-scores-csv outputs/compression/change_tiles.csv --heatmap-dir outputs/compression/heatmaps
-python cli/eval_facade_change_metrics.py --tile-scores-csv outputs/compression/change_tiles.csv --labels-csv data/facades/compression/tile_labels.csv --out-csv outputs/compression/change_metrics.csv
-```
-
-See `docs/compression_port.md` and `docs/compression_baselines.md` for baseline semantics and the mini real-facade sanity workflow.
-
-## Temporal semantics (S2)
-
-The repository now includes an S2 temporal semantic layer under `temporal_semantics/` with CLI entrypoints in `cli/`:
-
-- `export_temporal_semantic_artifacts.py`
-- `build_temporal_semantic_features.py`
-- `eval_temporal_semantic_features.py`
-- `render_temporal_semantic_previews.py`
-
-Backends:
-- fully working: `lposs`, `dinov2`, `clip`, `siglip2`
-- optional scaffold: `florence2` (experimental)
-
-Quick S2 run:
-
-```bash
-python cli/export_temporal_semantic_artifacts.py --list-backends
-python cli/export_temporal_semantic_artifacts.py --manifest-csv data/facades/sanity/manifest_mini.csv --out-dir outputs/temporal_semantics --backends lposs,dinov2,clip,siglip2 --tile-size 32
-python cli/build_temporal_semantic_features.py --pairs-csv data/facades/compression/pairs/pairs_all.csv --artifact-index-csv outputs/temporal_semantics/artifact_index.csv --out-csv outputs/temporal_semantics/pair_tile_features.csv --backends lposs,dinov2,clip,siglip2 --tile-size 32
-python cli/eval_temporal_semantic_features.py --features-csv outputs/temporal_semantics/pair_tile_features.csv --out-summary-csv outputs/temporal_semantics/summary.csv --out-topk-csv outputs/temporal_semantics/topk_tiles.csv
-python cli/render_temporal_semantic_previews.py --features-csv outputs/temporal_semantics/pair_tile_features.csv --pairs-csv data/facades/compression/pairs/pairs_all.csv --out-dir outputs/temporal_semantics/previews --tile-size 32
-```
-
-See `docs/temporal_semantics.md` for details.
-
-
-## Semantic-conditioned residual codec (C1)
-
-A first C1 implementation now exists under `compression/conditioned/` with CLIs:
-- `cli/train_semantic_conditioned_codec.py`
-- `cli/eval_semantic_conditioned_codec.py`
-- `cli/render_semantic_conditioned_codec_previews.py`
-
-C1 reuses S2 artifacts/feature tables as context (`lposs`, `dinov2`, `clip`, `siglip2`, temporal semantic features, fused semantic score), supports context modes (`none`, `lposs_only`, `features_only`, `temporal_semantic_only`, `full`, `custom`) and two conditioning mechanisms (`concat_context`, `film_context`).
-
-Outputs are explicitly model-estimated (`model_bits`, `nll_bits`, `bits_per_byte`) and not arithmetic-coded achieved bits.
-
-See `docs/semantic_conditioned_codec.md` for usage, ablation setup, and examples.
-
-## Facade quantitative evaluation
-
-For quantitative facade heatmap evaluation (proposed + RGB/gray diff + SSIM + DINOv2 + LPIPS), see `docs/facade_evaluation.md`.
+The original LPOSS setup and benchmark evaluation conventions remain applicable to the upstream open-vocabulary segmentation code; the facade temporal-monitoring pipeline documented above is project-specific.
