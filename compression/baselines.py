@@ -115,6 +115,30 @@ def _dino_features(torch, model, img, device: str, cache_path: Optional[Path]):
     return arr, h_p, w_p
 
 
+def _pad_image_tile(tile, tile_size: int):
+    np = _np()
+    height, width = tile.shape[:2]
+    if height == tile_size and width == tile_size:
+        return tile
+    pad_h = tile_size - height
+    pad_w = tile_size - width
+    return np.pad(tile, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+
+
+def _score_lpips_tiles(torch, model, prev_tiles, curr_tiles, device: str, batch_size: int):
+    np = _np()
+    scores: List[float] = []
+    for start in range(0, len(prev_tiles), batch_size):
+        p = np.stack(prev_tiles[start:start + batch_size]).transpose(0, 3, 1, 2)
+        c = np.stack(curr_tiles[start:start + batch_size]).transpose(0, 3, 1, 2)
+        tprev = torch.from_numpy(p).float().to(device) / 127.5 - 1.0
+        tcurr = torch.from_numpy(c).float().to(device) / 127.5 - 1.0
+        with torch.no_grad():
+            values = model(tprev, tcurr).reshape(-1).detach().cpu().numpy()
+        scores.extend(float(value) for value in values.tolist())
+    return scores
+
+
 def compute_baseline_tile_scores(
     residual_manifest_csv: Path,
     out_scores_csv: Path,
@@ -131,12 +155,17 @@ def compute_baseline_tile_scores(
     artifact_index_csv: Optional[Path] = None,
     skip_deep_baselines: bool = False,
     min_valid_ratio: float = 0.50,
+    include_splits: Optional[Sequence[str]] = None,
+    deep_batch_size: int = 128,
+    show_progress: bool = False,
 ) -> List[Dict[str, object]]:
     """Compute tile scores on valid aligned pixels only.
 
     Invalid pixels are neutralised by setting ``curr=prev`` before feature
-    extraction. Per-pixel baselines are then averaged over valid pixels only.
-    Tiles below ``min_valid_ratio`` are excluded rather than assigned a score.
+    extraction. Per-pixel baselines are averaged over valid pixels only. Tiles
+    below ``min_valid_ratio`` are excluded. LPIPS is evaluated in tile batches;
+    DINOv2 is evaluated as whole-image patch features and pooled to the common
+    tile grid.
     """
     np = _np()
     _ = (temporal_features_csv, artifact_index_csv)
@@ -145,6 +174,8 @@ def compute_baseline_tile_scores(
         raise ValueError("No methods provided")
     if not 0.0 <= min_valid_ratio <= 1.0:
         raise ValueError("min_valid_ratio must be in [0, 1]")
+    if deep_batch_size <= 0:
+        raise ValueError("deep_batch_size must be positive")
 
     torch = dino_model = lpips_model = None
     if "dinov2_patch_cosine" in methods and not skip_deep_baselines:
@@ -161,9 +192,17 @@ def compute_baseline_tile_scores(
             torch = torch_lp
 
     rows = read_csv_rows(residual_manifest_csv)
+    if include_splits:
+        permitted = set(include_splits)
+        rows = [row for row in rows if row.get("split", "") in permitted]
     out_rows: List[Dict[str, object]] = []
+    try:
+        from tqdm.auto import tqdm
+        iterator = tqdm(rows, desc="Scoring temporal pairs", unit="pair", disable=not show_progress)
+    except Exception:
+        iterator = rows
 
-    for row in rows:
+    for row in iterator:
         pair_id = row["pair_id"]
         facade_id = row.get("facade_id", "")
         split = row.get("split", "")
@@ -198,6 +237,9 @@ def compute_baseline_tile_scores(
             dino_dist = 1.0 - np.sum(p * c, axis=2)
             dino_h, dino_w = hmin, wmin
 
+        eligible_tiles = []
+        lpips_prev_tiles = []
+        lpips_curr_tiles = []
         for tx, ty, ys, xs in _tile_grid(h, w, tile_size):
             valid_patch = valid[ys, xs]
             valid_count = int(valid_patch.sum())
@@ -205,6 +247,17 @@ def compute_baseline_tile_scores(
             valid_ratio = valid_count / max(tile_pixels, 1)
             if valid_ratio < min_valid_ratio or valid_count == 0:
                 continue
+            common = {
+                "pair_id": pair_id,
+                "facade_id": facade_id,
+                "split": split,
+                "tile_x": tx,
+                "tile_y": ty,
+                "tile_size": tile_size,
+                "valid_pixel_count": valid_count,
+                "valid_ratio": valid_ratio,
+            }
+            eligible_tiles.append((common, ys, xs))
             for method in methods:
                 if skip_deep_baselines and method in DEEP_METHODS:
                     continue
@@ -216,20 +269,7 @@ def compute_baseline_tile_scores(
                 elif method == "grayscale_absdiff":
                     score = float(gray_diff[ys, xs][valid_patch].mean())
                 elif method == "ssim_change":
-                    patch = ssim_change_map[ys, xs]
-                    if patch.ndim == 3:
-                        score = float(patch[valid_patch].mean())
-                    else:
-                        score = float(patch[valid_patch].mean())
-                elif method == "lpips_change":
-                    patch_prev = prev[ys, xs, :].copy()
-                    patch_curr = curr_neutral[ys, xs, :].copy()
-                    tprev = torch.from_numpy(patch_prev.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
-                    tcurr = torch.from_numpy(patch_curr.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
-                    tprev = (tprev / 127.5) - 1.0
-                    tcurr = (tcurr / 127.5) - 1.0
-                    with torch.no_grad():
-                        score = float(lpips_model(tprev, tcurr).item())
+                    score = float(ssim_change_map[ys, xs][valid_patch].mean())
                 elif method == "dinov2_patch_cosine":
                     if dino_dist is None:
                         continue
@@ -238,22 +278,21 @@ def compute_baseline_tile_scores(
                     px0 = int(xs.start / w * dino_w)
                     px1 = max(px0 + 1, int(xs.stop / w * dino_w))
                     score = float(dino_dist[py0:py1, px0:px1].mean())
+                elif method == "lpips_change":
+                    continue
                 else:
                     continue
+                out_rows.append({**common, "method": method, "score_type": _score_type(method), "tile_score": score})
+            if "lpips_change" in methods and not skip_deep_baselines:
+                lpips_prev_tiles.append(_pad_image_tile(prev[ys, xs, :], tile_size))
+                lpips_curr_tiles.append(_pad_image_tile(curr_neutral[ys, xs, :], tile_size))
 
-                out_rows.append({
-                    "pair_id": pair_id,
-                    "facade_id": facade_id,
-                    "split": split,
-                    "method": method,
-                    "score_type": _score_type(method),
-                    "tile_x": tx,
-                    "tile_y": ty,
-                    "tile_score": score,
-                    "tile_size": tile_size,
-                    "valid_pixel_count": valid_count,
-                    "valid_ratio": valid_ratio,
-                })
+        if lpips_prev_tiles:
+            lpips_scores = _score_lpips_tiles(torch, lpips_model, lpips_prev_tiles, lpips_curr_tiles, device, deep_batch_size)
+            for (common, _, _), score in zip(eligible_tiles, lpips_scores):
+                out_rows.append({**common, "method": "lpips_change", "score_type": _score_type("lpips_change"), "tile_score": score})
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(split=split, scores=len(out_rows))
 
     fields = ["pair_id", "facade_id", "split", "method", "score_type", "tile_x", "tile_y", "tile_score", "tile_size", "valid_pixel_count", "valid_ratio"]
     write_csv_rows(out_scores_csv, fields, out_rows)
