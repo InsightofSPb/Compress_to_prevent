@@ -8,10 +8,14 @@ the current image coordinates with nearest-neighbour interpolation, and writes
 binary reference maps restricted to the saved valid alignment mask.
 
 Generated references:
-  * any_semantic_change: previous aligned semantic label != current label.
-  * damage_presence_change: damage/non-damage status changed.
-  * damage_type_change: damage status or damage category changed; all non-damage
-    classes are collapsed to zero before comparison.
+  * inspection_relevant_change: primary reference retaining damage classes,
+    repairs and annotated visual content/signage changes. All other labels are
+    collapsed to neutral before comparison.
+  * damage_or_repair_change: change involving a damage class or repairs.
+  * intervention_or_content_change: change involving repairs or visual content.
+  * damage_type_change: strict damage-only category/status change.
+  * damage_presence_change: binary damage/non-damage status change.
+  * any_semantic_change: broad supplementary exact-label change map.
 
 Reference PNG encoding is 0=no change, 1=change, 255=invalid/ignored pixel.
 """
@@ -21,12 +25,14 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 DEFAULT_DAMAGE_LABELS = (1, 2, 3, 4, 5, 6, 7)
+DEFAULT_REPAIR_LABELS = (9,)
+DEFAULT_CONTENT_LABELS = (10,)
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp")
 
 
@@ -41,6 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--damage-labels", type=str, default=",".join(str(v) for v in DEFAULT_DAMAGE_LABELS),
                         help="Comma-separated semantic label ids treated as damage.")
+    parser.add_argument("--repair-labels", type=str, default=",".join(str(v) for v in DEFAULT_REPAIR_LABELS),
+                        help="Comma-separated semantic label ids treated as repairs/interventions.")
+    parser.add_argument("--content-labels", type=str, default=",".join(str(v) for v in DEFAULT_CONTENT_LABELS),
+                        help="Comma-separated semantic label ids treated as visual content/signage changes.")
     parser.add_argument("--valid-threshold", type=int, default=0)
     parser.add_argument("--invalid-label", type=int, default=255)
     parser.add_argument("--max-rgb-warp-mae", type=float, default=None,
@@ -61,10 +71,10 @@ def write_csv(path: Path, fields: Sequence[str], rows: Iterable[Dict[str, object
         writer.writerows(rows)
 
 
-def parse_damage_labels(value: str) -> Tuple[int, ...]:
+def parse_labels(value: str, name: str, allow_empty: bool = False) -> Tuple[int, ...]:
     labels = tuple(sorted({int(item.strip()) for item in value.split(",") if item.strip()}))
-    if not labels:
-        raise ValueError("damage-labels cannot be empty")
+    if not labels and not allow_empty:
+        raise ValueError("{} cannot be empty".format(name))
     return labels
 
 
@@ -128,6 +138,13 @@ def write_reference(path: Path, values: np.ndarray, valid: np.ndarray, invalid_l
         raise OSError("Failed to save reference map: {}".format(path))
 
 
+def retained_type_change(previous: np.ndarray, current: np.ndarray, labels: Sequence[int]) -> np.ndarray:
+    """Compare target states after collapsing labels outside ``labels`` to neutral zero."""
+    previous_target = np.where(np.isin(previous, labels), previous, 0)
+    current_target = np.where(np.isin(current, labels), current, 0)
+    return previous_target != current_target
+
+
 def compute_rgb_warp_mae(prev_image: Path, saved_warp: Path, H: np.ndarray,
                          out_size: Tuple[int, int], valid: np.ndarray) -> float:
     prev = read_rgb(prev_image)
@@ -143,7 +160,12 @@ def compute_rgb_warp_mae(prev_image: Path, saved_warp: Path, H: np.ndarray,
 
 def main() -> None:
     args = parse_args()
-    damage_labels = parse_damage_labels(args.damage_labels)
+    damage_labels = parse_labels(args.damage_labels, "damage-labels")
+    repair_labels = parse_labels(args.repair_labels, "repair-labels", allow_empty=True)
+    content_labels = parse_labels(args.content_labels, "content-labels", allow_empty=True)
+    inspection_labels = tuple(sorted(set(damage_labels + repair_labels + content_labels)))
+    damage_or_repair_labels = tuple(sorted(set(damage_labels + repair_labels)))
+    intervention_or_content_labels = tuple(sorted(set(repair_labels + content_labels)))
     if not 0 <= args.invalid_label <= 255 or not 0 <= args.valid_threshold <= 255:
         raise ValueError("invalid-label and valid-threshold must be in [0, 255]")
     pairs = read_csv(args.pairs_manifest)
@@ -188,20 +210,27 @@ def main() -> None:
         prev_damage = np.isin(prev_aligned, damage_labels)
         curr_damage = np.isin(curr_mask, damage_labels)
         damage_presence_change = prev_damage != curr_damage
-        prev_damage_type = np.where(prev_damage, prev_aligned, 0)
-        curr_damage_type = np.where(curr_damage, curr_mask, 0)
-        damage_type_change = prev_damage_type != curr_damage_type
+        damage_type_change = retained_type_change(prev_aligned, curr_mask, damage_labels)
+        damage_or_repair_change = retained_type_change(prev_aligned, curr_mask, damage_or_repair_labels)
+        intervention_or_content_change = retained_type_change(prev_aligned, curr_mask, intervention_or_content_labels)
+        inspection_relevant_change = retained_type_change(prev_aligned, curr_mask, inspection_labels)
 
         pair_dir = args.out_dir / str(row.get("split", "unsplit") or "unsplit") / facade_id / pair_id
         prev_aligned_path = pair_dir / "prev_manual_mask_aligned.png"
         semantic_path = pair_dir / "any_semantic_change.png"
         presence_path = pair_dir / "damage_presence_change.png"
         damage_type_path = pair_dir / "damage_type_change.png"
+        damage_or_repair_path = pair_dir / "damage_or_repair_change.png"
+        intervention_content_path = pair_dir / "intervention_or_content_change.png"
+        inspection_path = pair_dir / "inspection_relevant_change.png"
         pair_dir.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(prev_aligned_path), prev_aligned)
         write_reference(semantic_path, any_semantic_change, valid, args.invalid_label)
         write_reference(presence_path, damage_presence_change, valid, args.invalid_label)
         write_reference(damage_type_path, damage_type_change, valid, args.invalid_label)
+        write_reference(damage_or_repair_path, damage_or_repair_change, valid, args.invalid_label)
+        write_reference(intervention_content_path, intervention_or_content_change, valid, args.invalid_label)
+        write_reference(inspection_path, inspection_relevant_change, valid, args.invalid_label)
 
         rgb_warp_mae = compute_rgb_warp_mae(prev_image, saved_warp, H, (width, height), valid)
         mae_values.append(rgb_warp_mae)
@@ -223,11 +252,17 @@ def main() -> None:
             "any_semantic_change_path": str(semantic_path),
             "damage_presence_change_path": str(presence_path),
             "damage_type_change_path": str(damage_type_path),
+            "damage_or_repair_change_path": str(damage_or_repair_path),
+            "intervention_or_content_change_path": str(intervention_content_path),
+            "inspection_relevant_change_path": str(inspection_path),
             "valid_pixel_count": n_valid,
             "valid_ratio": "{:.8f}".format(n_valid / max(height * width, 1)),
             "any_semantic_change_ratio": "{:.8f}".format(float(any_semantic_change[valid].mean())),
             "damage_presence_change_ratio": "{:.8f}".format(float(damage_presence_change[valid].mean())),
             "damage_type_change_ratio": "{:.8f}".format(float(damage_type_change[valid].mean())),
+            "damage_or_repair_change_ratio": "{:.8f}".format(float(damage_or_repair_change[valid].mean())),
+            "intervention_or_content_change_ratio": "{:.8f}".format(float(intervention_or_content_change[valid].mean())),
+            "inspection_relevant_change_ratio": "{:.8f}".format(float(inspection_relevant_change[valid].mean())),
             "homography_json_path": str(h_json_path),
             "alignment_quality": quality,
             "rgb_warp_recreation_mae": "{:.8f}".format(rgb_warp_mae),
@@ -237,9 +272,13 @@ def main() -> None:
         "pair_id", "facade_id", "year_prev", "year_curr", "split",
         "prev_manual_mask_path", "curr_manual_mask_path", "prev_manual_mask_aligned_path",
         "valid_mask_path", "any_semantic_change_path", "damage_presence_change_path",
-        "damage_type_change_path", "valid_pixel_count", "valid_ratio",
-        "any_semantic_change_ratio", "damage_presence_change_ratio", "damage_type_change_ratio",
-        "homography_json_path", "alignment_quality", "rgb_warp_recreation_mae",
+        "damage_type_change_path", "damage_or_repair_change_path",
+        "intervention_or_content_change_path", "inspection_relevant_change_path",
+        "valid_pixel_count", "valid_ratio", "any_semantic_change_ratio",
+        "damage_presence_change_ratio", "damage_type_change_ratio",
+        "damage_or_repair_change_ratio", "intervention_or_content_change_ratio",
+        "inspection_relevant_change_ratio", "homography_json_path", "alignment_quality",
+        "rgb_warp_recreation_mae",
     ]
     write_csv(args.out_dir / "pair_change_references.csv", fields, rows)
     by_split = {}
@@ -251,7 +290,15 @@ def main() -> None:
         "pairs_manifest": str(args.pairs_manifest),
         "ref_spx_out": str(args.ref_spx_out),
         "masks_dir": str(args.masks_dir),
-        "damage_labels": list(damage_labels),
+        "label_groups": {
+            "damage": list(damage_labels),
+            "repairs": list(repair_labels),
+            "visual_content_or_signage": list(content_labels),
+            "inspection_relevant": list(inspection_labels),
+            "damage_or_repair": list(damage_or_repair_labels),
+            "intervention_or_content": list(intervention_or_content_labels),
+            "excluded_as_primary_target": [8],
+        },
         "n_input_pairs": len(pairs),
         "n_reference_pairs": len(rows),
         "missing_direct_homography_pairs": missing_H,
@@ -259,7 +306,15 @@ def main() -> None:
         "mean_rgb_warp_recreation_mae": float(np.nanmean(mae_values)) if mae_values else None,
         "max_rgb_warp_recreation_mae": float(np.nanmax(mae_values)) if mae_values else None,
         "reference_encoding": {"no_change": 0, "change": 1, "invalid_or_ignored": args.invalid_label},
-        "primary_reference_candidate": "damage_type_change",
+        "primary_reference_candidate": "inspection_relevant_change",
+        "secondary_reference_candidates": [
+            "damage_or_repair_change", "damage_type_change", "intervention_or_content_change",
+            "any_semantic_change",
+        ],
+        "ontology_limitation": (
+            "TEXT_OR_IMAGES is a combined annotation class; changes within this class, such as signage-to-graffiti, "
+            "cannot be distinguished by the current reference masks."
+        ),
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "pair_change_reference_report.json").write_text(
@@ -272,6 +327,7 @@ def main() -> None:
         print("RGB warp recreation MAE mean/max: {:.6f}/{:.6f}".format(
             float(np.nanmean(mae_values)), float(np.nanmax(mae_values))
         ))
+    print("Primary reference: inspection_relevant_change")
     print("Manifest: {}".format(args.out_dir / "pair_change_references.csv"))
 
 
