@@ -6,6 +6,11 @@ changed valid pixels in the corresponding GT reference tile is at least a
 configurable threshold. Continuous ranking metrics (AUROC and AUPRC) are
 reported for validation and test splits. A binary score threshold is selected
 on validation by maximum F1 and then applied unchanged to test.
+
+The report includes prevalence/random-ranking baselines, all-positive binary
+baselines, lift over these baselines, and correlations between the raw score
+and the continuous changed-pixel fraction. This prevents misleading
+interpretation when maximum-F1 thresholds mark almost every tile as changed.
 """
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -64,7 +69,7 @@ def read_reference(path: Path) -> np.ndarray:
     return image
 
 
-def safe_ranking_metrics(y_true: np.ndarray, y_score: np.ndarray) -> Dict[str, float | None]:
+def safe_ranking_metrics(y_true: np.ndarray, y_score: np.ndarray) -> Dict[str, Optional[float]]:
     try:
         from sklearn.metrics import average_precision_score, roc_auc_score
     except Exception as exc:
@@ -77,6 +82,35 @@ def safe_ranking_metrics(y_true: np.ndarray, y_score: np.ndarray) -> Dict[str, f
     }
 
 
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+    """Average ranks with tie handling, implemented without scipy."""
+    order = np.argsort(values, kind="mergesort")
+    sorted_values = values[order]
+    ranks = np.empty(len(values), dtype=np.float64)
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[order[start:end]] = (start + end - 1) / 2.0
+        start = end
+    return ranks
+
+
+def _safe_corr(left: np.ndarray, right: np.ndarray) -> Optional[float]:
+    if len(left) < 2 or float(np.std(left)) == 0.0 or float(np.std(right)) == 0.0:
+        return None
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def continuous_agreement(target_ratio: np.ndarray, score: np.ndarray) -> Dict[str, Optional[float]]:
+    return {
+        "Pearson_target_ratio": _safe_corr(target_ratio, score),
+        "Spearman_target_ratio": _safe_corr(_average_ranks(target_ratio), _average_ranks(score)),
+        "mean_target_change_ratio": float(target_ratio.mean()) if len(target_ratio) else None,
+    }
+
+
 def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float | int]:
     tp = int(np.logical_and(y_true == 1, y_pred == 1).sum())
     fp = int(np.logical_and(y_true == 0, y_pred == 1).sum())
@@ -86,10 +120,12 @@ def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float | 
     recall = tp / max(tp + fn, 1)
     f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
     iou = tp / max(tp + fp + fn, 1)
+    predicted_positive_ratio = float(y_pred.mean()) if len(y_pred) else 0.0
     return {
         "TP": tp, "FP": fp, "FN": fn, "TN": tn,
         "precision": float(precision), "recall": float(recall),
         "F1": float(f1), "IoU": float(iou),
+        "predicted_positive_ratio": predicted_positive_ratio,
     }
 
 
@@ -109,10 +145,34 @@ def select_f1_threshold(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[float,
 def precision_at_top_k(y_true: np.ndarray, y_score: np.ndarray, fractions: Sequence[float]) -> Dict[str, float]:
     order = np.argsort(-y_score)
     output: Dict[str, float] = {}
+    prevalence = float(y_true.mean()) if len(y_true) else 0.0
     for fraction in fractions:
+        label = int(round(fraction * 100))
         n = max(1, int(np.ceil(len(order) * fraction)))
-        output["Precision@Top{}%".format(int(round(fraction * 100)))] = float(y_true[order[:n]].mean())
+        precision = float(y_true[order[:n]].mean())
+        output["Precision@Top{}%".format(label)] = precision
+        output["Precision@Top{}%_lift".format(label)] = precision / prevalence if prevalence > 0 else 0.0
     return output
+
+
+def baseline_and_lift_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    binary: Dict[str, float | int],
+    ranking: Dict[str, Optional[float]],
+) -> Dict[str, Optional[float]]:
+    prevalence = float(y_true.mean()) if len(y_true) else 0.0
+    all_positive = binary_metrics(y_true, np.ones_like(y_true, dtype=np.uint8))
+    auprc = ranking.get("AUPRC")
+    return {
+        "random_AUPRC_baseline": prevalence,
+        "AUPRC_delta_over_random": (float(auprc) - prevalence) if auprc is not None else None,
+        "AUPRC_lift_over_random": (float(auprc) / prevalence) if auprc is not None and prevalence > 0 else None,
+        "all_positive_F1_baseline": float(all_positive["F1"]),
+        "all_positive_IoU_baseline": float(all_positive["IoU"]),
+        "F1_delta_over_all_positive": float(binary["F1"]) - float(all_positive["F1"]),
+        "IoU_delta_over_all_positive": float(binary["IoU"]) - float(all_positive["IoU"]),
+    }
 
 
 def main() -> None:
@@ -181,6 +241,10 @@ def main() -> None:
         "target_min_change_ratio": args.target_min_change_ratio,
         "selection_split": args.selection_split,
         "report_split": args.report_split,
+        "interpretation": {
+            "primary_ranking_metrics": ["AUPRC", "AUROC", "Precision@TopK", "Spearman_target_ratio"],
+            "threshold_metrics": "F1/IoU use a threshold selected on validation only; compare against all-positive baselines.",
+        },
         "methods": {},
     }
     flat_rows: List[Dict[str, object]] = []
@@ -193,21 +257,31 @@ def main() -> None:
             raise ValueError("Method {} lacks rows for val/test threshold evaluation".format(method))
         y_val = np.asarray([row["target_positive"] for row in selection], dtype=np.uint8)
         s_val = np.asarray([row["tile_score"] for row in selection], dtype=np.float64)
+        r_val = np.asarray([row["target_change_ratio"] for row in selection], dtype=np.float64)
         y_test = np.asarray([row["target_positive"] for row in report], dtype=np.uint8)
         s_test = np.asarray([row["tile_score"] for row in report], dtype=np.float64)
+        r_test = np.asarray([row["target_change_ratio"] for row in report], dtype=np.float64)
         threshold, val_binary = select_f1_threshold(y_val, s_val)
         test_binary = binary_metrics(y_test, (s_test >= threshold).astype(np.uint8))
         val_rank = safe_ranking_metrics(y_val, s_val)
         test_rank = safe_ranking_metrics(y_test, s_test)
-        val_top = precision_at_top_k(y_val, s_val, fractions)
-        test_top = precision_at_top_k(y_test, s_test, fractions)
+        val_values = {
+            "n_tiles": len(selection), "positive_tiles": int(y_val.sum()), "positive_ratio": float(y_val.mean()),
+            **val_rank, **val_binary, **precision_at_top_k(y_val, s_val, fractions),
+            **continuous_agreement(r_val, s_val), **baseline_and_lift_metrics(y_val, s_val, val_binary, val_rank),
+        }
+        test_values = {
+            "n_tiles": len(report), "positive_tiles": int(y_test.sum()), "positive_ratio": float(y_test.mean()),
+            **test_rank, **test_binary, **precision_at_top_k(y_test, s_test, fractions),
+            **continuous_agreement(r_test, s_test), **baseline_and_lift_metrics(y_test, s_test, test_binary, test_rank),
+        }
         method_summary = {
             "threshold_selected_on_val": threshold,
-            "val": {"n_tiles": len(selection), "positive_tiles": int(y_val.sum()), "positive_ratio": float(y_val.mean()), **val_rank, **val_binary, **val_top},
-            "test": {"n_tiles": len(report), "positive_tiles": int(y_test.sum()), "positive_ratio": float(y_test.mean()), **test_rank, **test_binary, **test_top},
+            "val": val_values,
+            "test": test_values,
         }
         summary["methods"][method] = method_summary
-        for split_name, values in ((args.selection_split, method_summary["val"]), (args.report_split, method_summary["test"])):
+        for split_name, values in ((args.selection_split, val_values), (args.report_split, test_values)):
             flat_rows.append({
                 "method": method, "reference": args.reference, "split": split_name,
                 "target_min_change_ratio": args.target_min_change_ratio,
@@ -218,16 +292,25 @@ def main() -> None:
     (args.out_dir / "evaluation_report.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     fields = [
         "method", "reference", "split", "target_min_change_ratio", "threshold_selected_on_val",
-        "n_tiles", "positive_tiles", "positive_ratio", "AUROC", "AUPRC", "TP", "FP", "FN", "TN",
-        "precision", "recall", "F1", "IoU",
-    ] + ["Precision@Top{}%".format(int(round(value * 100))) for value in fractions]
+        "n_tiles", "positive_tiles", "positive_ratio", "mean_target_change_ratio",
+        "AUROC", "AUPRC", "random_AUPRC_baseline", "AUPRC_delta_over_random", "AUPRC_lift_over_random",
+        "Pearson_target_ratio", "Spearman_target_ratio", "TP", "FP", "FN", "TN",
+        "predicted_positive_ratio", "precision", "recall", "F1", "IoU",
+        "all_positive_F1_baseline", "all_positive_IoU_baseline",
+        "F1_delta_over_all_positive", "IoU_delta_over_all_positive",
+    ]
+    for value in fractions:
+        label = int(round(value * 100))
+        fields.extend(["Precision@Top{}%".format(label), "Precision@Top{}%_lift".format(label)])
     write_csv(args.out_dir / "evaluation_summary.csv", fields, flat_rows)
     print("Reference: {}".format(args.reference))
     print("Tile target positive threshold: {:.4f}".format(args.target_min_change_ratio))
     for row in flat_rows:
         print(
             "{method:22s} {split:5s} tiles={n_tiles:6d} pos={positive_ratio:.4f} "
-            "AUPRC={AUPRC} AUROC={AUROC} F1={F1:.4f} IoU={IoU:.4f}".format(**row)
+            "AUPRC={AUPRC} lift={AUPRC_lift_over_random} AUROC={AUROC} "
+            "F1={F1:.4f} (all+={all_positive_F1_baseline:.4f}) "
+            "Spearman={Spearman_target_ratio}".format(**row)
         )
     print("Report: {}".format(args.out_dir / "evaluation_report.json"))
     print("Summary: {}".format(args.out_dir / "evaluation_summary.csv"))
