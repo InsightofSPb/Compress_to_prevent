@@ -9,8 +9,8 @@ Expected local layout under --pairs-root::
 
 The warped source is the previous RGB observation geometrically mapped into
 coordinates of the current observation. The valid mask marks pixels where the
-residual is meaningful after warping. Split assignments are read from the
-facade-level split produced by ``prepare_facade_group_splits.py``.
+residual is meaningful after warping. The manifest may be built before facade
+splitting; when --facade-assignments is passed, split columns are populated.
 """
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pairs-root", type=Path, required=True,
                         help="Path ending in ref_spx_batch_out/pairs.")
     parser.add_argument("--raw-images-dir", type=Path, required=True)
-    parser.add_argument("--facade-assignments", type=Path, required=True,
-                        help="CSV with facade_id and split columns.")
+    parser.add_argument("--facade-assignments", type=Path, default=None,
+                        help="Optional CSV with facade_id and split columns.")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--valid-threshold", type=int, default=0,
                         help="Mask pixels strictly larger than this value are counted as valid.")
@@ -53,7 +53,9 @@ def write_csv(path: Path, fields: Sequence[str], rows: Iterable[Dict[str, object
         writer.writerows(rows)
 
 
-def load_assignments(path: Path) -> Dict[str, str]:
+def load_assignments(path: Optional[Path]) -> Dict[str, str]:
+    if path is None:
+        return {}
     rows = read_csv(path)
     assignments: Dict[str, str] = {}
     for row in rows:
@@ -128,21 +130,17 @@ def main() -> None:
         if match is None:
             ignored_warps.append(str(warp_path))
             continue
-        year_prev = match.group("prev")
-        year_curr = match.group("curr")
-        # The standard layout stores the pair identifier at the first pair-root level.
+        year_prev, year_curr = match.group("prev"), match.group("curr")
         relative = warp_path.relative_to(args.pairs_root)
         if len(relative.parts) < 2:
             raise ValueError("Unexpected warp path layout: {}".format(warp_path))
-        facade_id = relative.parts[0]
-        pair_folder = relative.parts[1]
+        facade_id, pair_folder = relative.parts[0], relative.parts[1]
         pair_match = PAIR_DIR_RE.match(pair_folder)
         if pair_match is None or pair_match.group("prev") != year_prev or pair_match.group("curr") != year_curr:
             raise ValueError("Pair folder/warp name disagree: {}".format(warp_path))
-        nested_facades = [part for part in relative.parts if part == facade_id]
-        if len(nested_facades) < 2:
-            raise ValueError("Warp path does not repeat the expected facade id: {}".format(warp_path))
-        if facade_id not in assignments:
+        if sum(1 for part in relative.parts if part == facade_id) < 2:
+            raise ValueError("Warp path does not repeat expected facade id: {}".format(warp_path))
+        if assignments and facade_id not in assignments:
             raise ValueError("Pair facade has no train/val/test assignment: {}".format(facade_id))
 
         valid_path = warp_path.parent / "valid_mask_{}_to_{}.png".format(year_prev, year_curr)
@@ -153,9 +151,8 @@ def main() -> None:
         width, height, n_valid, valid_ratio = image_info_and_coverage(
             warp_path, curr_path, valid_path, args.valid_threshold
         )
-        pair_id = "{}_{}_{}".format(facade_id, year_prev, year_curr)
         rows.append({
-            "pair_id": pair_id,
+            "pair_id": "{}_{}_{}".format(facade_id, year_prev, year_curr),
             "facade_id": facade_id,
             "year_prev": year_prev,
             "year_curr": year_curr,
@@ -168,34 +165,32 @@ def main() -> None:
             "valid_ratio": "{:.8f}".format(valid_ratio),
             "height": height,
             "width": width,
-            "split": assignments[facade_id],
+            "split": assignments.get(facade_id, ""),
             "alignment_source": "ref_spx_batch_out",
         })
 
     if not rows:
         raise ValueError("No src_warp_*.png pair outputs found under: {}".format(args.pairs_root))
     pair_ids = [str(row["pair_id"]) for row in rows]
-    if len(pair_ids) != len(set(pair_ids)):
-        duplicates = [pair_id for pair_id in sorted(set(pair_ids)) if pair_ids.count(pair_id) > 1]
+    duplicates = [pair_id for pair_id in sorted(set(pair_ids)) if pair_ids.count(pair_id) > 1]
+    if duplicates:
         raise ValueError("Duplicate aligned pair IDs: {}".format(duplicates))
 
-    fields = [
-        "pair_id", "facade_id", "year_prev", "year_curr", "prev_image_path", "curr_image_path",
-        "prev_aligned_path", "valid_mask_path", "valid_threshold", "valid_pixel_count", "valid_ratio",
-        "height", "width", "split", "alignment_source",
-    ]
+    fields = ["pair_id", "facade_id", "year_prev", "year_curr", "prev_image_path", "curr_image_path",
+              "prev_aligned_path", "valid_mask_path", "valid_threshold", "valid_pixel_count", "valid_ratio",
+              "height", "width", "split", "alignment_source"]
     write_csv(args.out_dir / "pairs_all.csv", fields, rows)
-    for split in SPLITS:
-        write_csv(args.out_dir / "pairs_{}.csv".format(split), fields,
-                  [row for row in rows if row["split"] == split])
+    if assignments:
+        for split in SPLITS:
+            write_csv(args.out_dir / "pairs_{}.csv".format(split), fields,
+                      [row for row in rows if row["split"] == split])
 
     counts = {split: sum(1 for row in rows if row["split"] == split) for split in SPLITS}
     report = {
-        "pairs_root": str(args.pairs_root),
-        "raw_images_dir": str(args.raw_images_dir),
-        "facade_assignments": str(args.facade_assignments),
-        "n_pairs": len(rows),
-        "pairs_by_split": counts,
+        "pairs_root": str(args.pairs_root), "raw_images_dir": str(args.raw_images_dir),
+        "facade_assignments": str(args.facade_assignments) if args.facade_assignments else "",
+        "n_pairs": len(rows), "split_assigned": bool(assignments),
+        "pairs_by_split": counts if assignments else {},
         "mean_valid_ratio": sum(float(row["valid_ratio"]) for row in rows) / len(rows),
         "min_valid_ratio": min(float(row["valid_ratio"]) for row in rows),
         "max_valid_ratio": max(float(row["valid_ratio"]) for row in rows),
@@ -205,7 +200,10 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "pairs_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print("Aligned RGB pairs: {}".format(len(rows)))
-    print("Pairs by split: {}".format(counts))
+    if assignments:
+        print("Pairs by split: {}".format(counts))
+    else:
+        print("Splits not assigned; pass this pairs_all.csv into prepare_facade_group_splits.py.")
     print("Manifest: {}".format(args.out_dir / "pairs_all.csv"))
     print("Mean valid alignment ratio: {:.4f}".format(report["mean_valid_ratio"]))
 
