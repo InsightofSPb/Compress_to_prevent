@@ -33,6 +33,10 @@ train_root = os.environ.get(
     "data/facades_group_split/segmentation_train_tiles",
 )
 
+# Optional absolute path to a text file containing tile stems without `.png`.
+# When unset, all generated train tiles are loaded.
+train_split = os.environ.get("FACADES_SEG_TRAIN_SPLIT") or None
+
 data = dict(
     samples_per_gpu=2,
     workers_per_gpu=2,
@@ -43,6 +47,7 @@ data = dict(
         ann_dir="masks",
         img_suffix=".png",
         seg_map_suffix=".png",
+        split=train_split,
         ignore_index=255,
         reduce_zero_label=False,
         classes=classes,
