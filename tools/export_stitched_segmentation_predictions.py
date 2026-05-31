@@ -3,10 +3,13 @@
 
 The evaluator used for the facade-disjoint segmentation comparison saves visual
 triptychs, but temporal qualitative figures require raw predicted label maps for
-both observations of a facade pair. This script reuses exactly the same tiled
-stitching and model construction protocol as ``evaluate_segmentation_tiled.py``
+both observations of a facade pair. This script reuses exactly the same clean
+tiled-stitching and model-construction protocol as ``evaluate_segmentation_tiled.py``
 and writes one indexed uint8 PNG prediction per source RGB image together with a
 CSV manifest.
+
+The ``train`` option is intended only for clean qualitative inference: it uses
+clean deterministic tiles, not the augmented tiles used during model fitting.
 """
 from __future__ import annotations
 
@@ -46,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("config", help="Hydra model config, for example lposs")
     parser.add_argument("--eval-dataset-config", required=True)
     parser.add_argument("--tiles-manifest", type=Path, required=True)
-    parser.add_argument("--split", choices=("val", "test"), required=True)
+    parser.add_argument("--split", choices=("train", "val", "test"), required=True)
     parser.add_argument("--checkpoint", type=Path, default=None,
                         help="Fine-tuned checkpoint; omit to export stock predictions.")
     parser.add_argument("--model-label", default=None)
@@ -165,7 +168,9 @@ def main() -> None:
         "palette": palette,
         "prediction_manifest": str(manifest_path),
         "prediction_dir": str(prediction_dir),
-        "note": "Predictions are stitched full-resolution indexed class masks exported with the same inference protocol as segmentation evaluation.",
+        "note": "Predictions are stitched full-resolution indexed class masks exported with the same clean inference protocol as segmentation evaluation.",
+        "train_note": ("Clean deterministic train inference for qualitative figures only; augmented fitting samples are not used here."
+                       if args.split == "train" else ""),
     }
     report_path = args.out_dir / "prediction_export_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
