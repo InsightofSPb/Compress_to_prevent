@@ -2,30 +2,22 @@
 """Render paper-style temporal qualitative grids and visual baseline ablations.
 
 The compact paper-style layout follows the qualitative organisation used in the
-facade monitoring manuscript, but makes the temporal signal interpretable on
-the facade itself:
+facade monitoring manuscript, while making the temporal score interpretable on
+the facade itself::
 
-    previous RGB | current RGB
-    previous semantic mask | current semantic mask
-    semantic change map | temporal heatmap overlay on current RGB
-    embedded semantic-class legend and primary score colour bar
+    previous RGB       | current RGB       | semantic-class legend
+    previous semantics | current semantics | temporal-score colour bar
+    semantic change    | heatmap overlay   | notes
 
-The script supports two semantic contexts with identical RGB-derived score
-maps: manual/GT masks and model-predicted masks. In the RGB-residual
-formulation, semantic masks are an interpretation/reference branch; the
-compression-derived and image-baseline heatmaps do not depend on whether GT or
-predicted semantic masks are displayed.
+The split is deliberately represented only by the output-directory hierarchy;
+it is not printed inside any figure. The script supports two semantic contexts
+with identical RGB-derived score maps: manual/GT masks and model-predicted
+masks. In this RGB-residual formulation, semantic masks are an interpretation
+branch, whereas RGB/MSDZip and the visual baselines remain image-derived.
 
 A second, wider ablation layout renders all supplied temporal score methods for
-the same pair:
-
-    previous RGB | current RGB | semantic change | method-1 heatmap | ...
-    previous mask| current mask| change overlay  | method-1 overlay | ...
-
-Scores are converted to heatmaps on the current-image coordinate system by
-averaging scores covering each pixel. Robust normalisation defaults to one
-shared low/high range per method over the selected pairs; it is saved in JSON
-so generated figures are reproducible.
+the same pair. Its first row contains independent heatmaps and its second row
+contains heatmaps overlaid on current RGB for direct spatial interpretation.
 """
 from __future__ import annotations
 
@@ -33,7 +25,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -62,27 +54,20 @@ REFERENCE_LABELS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render temporal facade qualitative figures and method ablations.")
-    parser.add_argument("--pairs-manifest", type=Path, required=True,
-                        help="Aligned RGB temporal pair manifest containing image and valid-mask paths.")
-    parser.add_argument("--semantic-manifest", type=Path, required=True,
-                        help="Manual or predicted change-map manifest with semantic mask/change paths.")
+    parser.add_argument("--pairs-manifest", type=Path, required=True)
+    parser.add_argument("--semantic-manifest", type=Path, required=True)
     parser.add_argument("--semantic-source", choices=("gt", "predicted"), required=True)
-    parser.add_argument("--semantic-label", default=None,
-                        help="Figure title label; default is derived from semantic-source.")
-    parser.add_argument("--reference", default="inspection_relevant_change",
-                        choices=tuple(REFERENCE_LABELS))
+    parser.add_argument("--semantic-label", default=None)
+    parser.add_argument("--reference", default="inspection_relevant_change", choices=tuple(REFERENCE_LABELS))
     parser.add_argument(
         "--score-source", action="append", required=True,
-        help=("Temporal score source as LABEL=CSV or LABEL=CSV#RAW_METHOD. The second form selects one method "
-              "from a multi-method CSV, e.g. SSIM=/path/basic_tile_scores.csv#ssim_change."),
+        help=("Score source as LABEL=CSV or LABEL=CSV#RAW_METHOD. The latter selects a method "
+              "from a multi-method CSV, for example SSIM=/path/scores.csv#ssim_change."),
     )
-    parser.add_argument("--primary-method", default="RGB/MSDZip",
-                        help="Method label used in paper-style two-column figure.")
-    parser.add_argument("--split", default="test", help="Pair split to render; default: test.")
-    parser.add_argument("--pair-id", action="append", default=None,
-                        help="Specific pair_id to render; repeat. Without this, all selected split pairs are rendered.")
-    parser.add_argument("--max-pairs", type=int, default=None,
-                        help="Optional limit after pair selection; useful for quick inspection.")
+    parser.add_argument("--primary-method", default="RGB/MSDZip")
+    parser.add_argument("--split", default="test")
+    parser.add_argument("--pair-id", action="append", default=None)
+    parser.add_argument("--max-pairs", type=int, default=None)
     parser.add_argument("--sort-by", choices=("manifest", "primary_score", "semantic_change_ratio"), default="manifest")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--normalization", choices=("global", "per_pair"), default="global")
@@ -90,13 +75,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-percentile", type=float, default=95.0)
     parser.add_argument("--invalid-label", type=int, default=255)
     parser.add_argument("--valid-threshold", type=int, default=0)
-    parser.add_argument("--cell-width", type=int, default=460)
+    parser.add_argument("--cell-width", type=int, default=500)
+    parser.add_argument("--legend-width", type=int, default=310)
     parser.add_argument("--title-height", type=int, default=42)
     parser.add_argument("--overlay-alpha", type=float, default=0.46)
-    parser.add_argument("--paper-primary-panel", choices=("overlay", "heatmap"), default="overlay",
-                        help="Render the primary temporal score as an interpretable RGB overlay by default.")
+    parser.add_argument("--paper-primary-panel", choices=("overlay", "heatmap"), default="overlay")
+    parser.add_argument("--legend-position", choices=("right", "bottom", "none"), default="right",
+                        help="Legend arrangement in paper-style figures; right is compact for manuscript insertion.")
     parser.add_argument("--no-embedded-legend", action="store_true",
-                        help="Do not append the semantic legend and primary heatmap colour bar to paper figures.")
+                        help="Backward-compatible alias for --legend-position none.")
     parser.add_argument("--no-paper-style", action="store_true")
     parser.add_argument("--no-ablation-style", action="store_true")
     return parser.parse_args()
@@ -159,28 +146,28 @@ def resolve_semantic_paths(row: Dict[str, str], source: str, reference: str) -> 
 
 
 def semantic_colour(mask: np.ndarray, invalid_label: int) -> np.ndarray:
-    out = np.zeros((*mask.shape[:2], 3), dtype=np.uint8)
+    output = np.zeros((*mask.shape[:2], 3), dtype=np.uint8)
     for idx, rgb in enumerate(DEFAULT_PALETTE_RGB):
-        out[mask == idx] = np.asarray(rgb[::-1], dtype=np.uint8)
-    out[mask == invalid_label] = (40, 40, 40)
-    return out
+        output[mask == idx] = np.asarray(rgb[::-1], dtype=np.uint8)
+    output[mask == invalid_label] = (40, 40, 40)
+    return output
 
 
 def change_colour(change: np.ndarray, invalid_label: int) -> np.ndarray:
-    out = np.zeros((*change.shape[:2], 3), dtype=np.uint8)
-    out[change == 1] = (0, 0, 238)
-    out[change == invalid_label] = (55, 55, 55)
-    return out
+    output = np.zeros((*change.shape[:2], 3), dtype=np.uint8)
+    output[change == 1] = (0, 0, 238)
+    output[change == invalid_label] = (55, 55, 55)
+    return output
 
 
 def change_overlay(current: np.ndarray, change: np.ndarray, invalid_label: int, alpha: float) -> np.ndarray:
     colour = change_colour(change, invalid_label)
-    out = current.copy()
-    valid_change = change == 1
+    output = current.copy()
+    changed = change == 1
     blended = cv2.addWeighted(current, 1.0 - alpha, colour, alpha, 0.0)
-    out[valid_change] = blended[valid_change]
-    out[change == invalid_label] = (45, 45, 45)
-    return out
+    output[changed] = blended[changed]
+    output[change == invalid_label] = (45, 45, 45)
+    return output
 
 
 def score_map(rows: Sequence[Dict[str, str]], shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
@@ -197,28 +184,23 @@ def score_map(rows: Sequence[Dict[str, str]], shape: Tuple[int, int]) -> Tuple[n
         total[y0:y1, x0:x1] += float(row["tile_score"])
         count[y0:y1, x0:x1] += 1.0
     output = np.zeros((height, width), dtype=np.float32)
-    valid = count > 0
-    output[valid] = total[valid] / count[valid]
-    return output, valid
+    covered = count > 0
+    output[covered] = total[covered] / count[covered]
+    return output, covered
 
 
 def method_range(method_rows: Dict[str, List[Dict[str, str]]], selected_pairs: Sequence[str], low: float, high: float) -> Tuple[float, float]:
-    values: List[float] = []
-    for pair_id in selected_pairs:
-        for row in method_rows.get(pair_id, []):
-            values.append(float(row["tile_score"]))
+    values = [float(row["tile_score"]) for pair_id in selected_pairs for row in method_rows.get(pair_id, [])]
     if not values:
         return 0.0, 1.0
     lo, hi = np.percentile(np.asarray(values, dtype=np.float32), [low, high]).tolist()
-    if float(hi) <= float(lo):
-        hi = float(lo) + 1e-8
-    return float(lo), float(hi)
+    return (float(lo), float(hi) if float(hi) > float(lo) else float(lo) + 1e-8)
 
 
 def heatmap_visual(score: np.ndarray, score_valid: np.ndarray, valid: np.ndarray, limits: Tuple[float, float]) -> np.ndarray:
     lo, hi = limits
-    norm = np.zeros_like(score, dtype=np.float32)
     combined = score_valid & valid
+    norm = np.zeros_like(score, dtype=np.float32)
     norm[combined] = np.clip((score[combined] - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
     colour = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
     colour[~combined] = (32, 32, 32)
@@ -226,9 +208,9 @@ def heatmap_visual(score: np.ndarray, score_valid: np.ndarray, valid: np.ndarray
 
 
 def heatmap_overlay(current: np.ndarray, heatmap: np.ndarray, valid: np.ndarray, alpha: float) -> np.ndarray:
-    out = cv2.addWeighted(current, 1.0 - alpha, heatmap, alpha, 0.0)
-    out[~valid] = (45, 45, 45)
-    return out
+    output = cv2.addWeighted(current, 1.0 - alpha, heatmap, alpha, 0.0)
+    output[~valid] = (45, 45, 45)
+    return output
 
 
 def fit_panel(image: np.ndarray, width: int) -> np.ndarray:
@@ -238,18 +220,18 @@ def fit_panel(image: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(image, (width, max(1, int(round(image.shape[0] * scale)))), interpolation=cv2.INTER_AREA)
 
 
-def fitted_scale(text: str, max_width: int, preferred: float, thickness: int, minimum: float = 0.32) -> float:
+def fitted_scale(text: str, max_width: int, preferred: float, thickness: int, minimum: float = 0.26) -> float:
     scale = preferred
     while scale > minimum:
-        width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
-        if width <= max_width:
+        if cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0] <= max_width:
             return scale
         scale -= 0.03
     return minimum
 
 
 def put_fitted_text(canvas: np.ndarray, text: str, position: Tuple[int, int], max_width: int,
-                    preferred: float = 0.62, thickness: int = 1, colour: Tuple[int, int, int] = (25, 25, 25)) -> None:
+                    preferred: float = 0.62, thickness: int = 1,
+                    colour: Tuple[int, int, int] = (25, 25, 25)) -> None:
     scale = fitted_scale(text, max_width, preferred, thickness)
     cv2.putText(canvas, text, position, cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thickness, cv2.LINE_AA)
 
@@ -257,19 +239,18 @@ def put_fitted_text(canvas: np.ndarray, text: str, position: Tuple[int, int], ma
 def labelled_panel(image: np.ndarray, title: str, width: int, title_height: int) -> np.ndarray:
     image = fit_panel(image, width)
     band = np.full((title_height, width, 3), 248, dtype=np.uint8)
-    put_fitted_text(band, title, (12, int(title_height * 0.68)), width - 24, preferred=0.62, thickness=1)
+    put_fitted_text(band, title, (12, int(title_height * 0.68)), width - 24, preferred=0.62)
     return np.concatenate([band, image], axis=0)
 
 
 def equalise_cells(cells: Sequence[np.ndarray]) -> List[np.ndarray]:
     target_h = max(cell.shape[0] for cell in cells)
-    results: List[np.ndarray] = []
+    result: List[np.ndarray] = []
     for cell in cells:
         if cell.shape[0] < target_h:
-            padding = np.full((target_h - cell.shape[0], cell.shape[1], 3), 255, dtype=np.uint8)
-            cell = np.concatenate([cell, padding], axis=0)
-        results.append(cell)
-    return results
+            cell = np.concatenate([cell, np.full((target_h - cell.shape[0], cell.shape[1], 3), 255, dtype=np.uint8)], axis=0)
+        result.append(cell)
+    return result
 
 
 def row_canvas(cells: Sequence[np.ndarray]) -> np.ndarray:
@@ -278,86 +259,107 @@ def row_canvas(cells: Sequence[np.ndarray]) -> np.ndarray:
 
 def add_header(canvas: np.ndarray, facade_id: str, year_prev: str, year_curr: str,
                semantic_label: str, reference: str) -> np.ndarray:
-    """Use a two-line compact header so long facade IDs cannot be clipped."""
     band = np.full((84, canvas.shape[1], 3), 255, dtype=np.uint8)
-    title = "{} | {} -> {}".format(facade_id, year_prev, year_curr)
-    subtitle = "{} | target: {}".format(semantic_label, REFERENCE_LABELS.get(reference, reference))
-    put_fitted_text(band, title, (16, 33), canvas.shape[1] - 32, preferred=0.82, thickness=2, colour=(15, 15, 15))
-    put_fitted_text(band, subtitle, (16, 67), canvas.shape[1] - 32, preferred=0.56, thickness=1, colour=(55, 55, 55))
+    put_fitted_text(band, "{} | {} -> {}".format(facade_id, year_prev, year_curr), (16, 33),
+                    canvas.shape[1] - 32, preferred=0.82, thickness=2, colour=(15, 15, 15))
+    put_fitted_text(band, "{} | target: {}".format(semantic_label, REFERENCE_LABELS.get(reference, reference)),
+                    (16, 67), canvas.shape[1] - 32, preferred=0.56, colour=(55, 55, 55))
     return np.concatenate([band, canvas], axis=0)
 
 
-def semantic_legend(width: int, primary_method: Optional[str] = None,
-                    primary_limits: Optional[Tuple[float, float]] = None) -> np.ndarray:
-    """Create an embedded semantic-class legend; optionally add a heatmap colour bar."""
+def legend_entries() -> List[Tuple[str, Tuple[int, int, int]]]:
+    entries = [("{}  {}".format(idx, name), tuple(int(v) for v in rgb[::-1]))
+               for idx, (name, rgb) in enumerate(zip(DEFAULT_CLASS_NAMES, DEFAULT_PALETTE_RGB))]
+    entries.extend([("semantic change", (0, 0, 238)), ("invalid / excluded", (55, 55, 55))])
+    return entries
+
+
+def semantic_legend_bottom(width: int, method: str, limits: Tuple[float, float]) -> np.ndarray:
     columns = 3 if width < 1300 else 4
     cell_width = width // columns
-    entries: List[Tuple[str, Tuple[int, int, int]]] = [
-        ("{} {}".format(idx, name), tuple(int(value) for value in rgb[::-1]))
-        for idx, (name, rgb) in enumerate(zip(DEFAULT_CLASS_NAMES, DEFAULT_PALETTE_RGB))
-    ]
-    entries.extend([
-        ("semantic change", (0, 0, 238)),
-        ("invalid / excluded", (55, 55, 55)),
-    ])
-    n_rows = int(np.ceil(len(entries) / columns))
-    heat_height = 66 if primary_method is not None and primary_limits is not None else 0
-    canvas = np.full((42 + n_rows * 33 + heat_height, width, 3), 255, dtype=np.uint8)
-    put_fitted_text(canvas, "Semantic class legend", (14, 27), width - 28, preferred=0.60, thickness=1)
-    for index, (name, bgr) in enumerate(entries):
-        row, col = divmod(index, columns)
-        x0 = col * cell_width + 14
-        y0 = 42 + row * 33
-        canvas[y0 + 5:y0 + 27, x0:x0 + 30] = bgr
-        put_fitted_text(canvas, name, (x0 + 40, y0 + 22), cell_width - 54, preferred=0.42, thickness=1)
-    if heat_height:
-        lo, hi = primary_limits or (0.0, 1.0)
-        y0 = 42 + n_rows * 33 + 10
-        label = "{} overlay score (global P5-P95: {:.3f} -> {:.3f})".format(primary_method, lo, hi)
-        put_fitted_text(canvas, label, (14, y0 + 18), width - 28, preferred=0.45, thickness=1)
-        bar_width = min(430, width - 160)
-        bar_x, bar_y = 14, y0 + 29
-        gradient = np.tile(np.linspace(0, 255, bar_width, dtype=np.uint8), (18, 1))
-        bar = cv2.applyColorMap(gradient, cv2.COLORMAP_TURBO)
-        canvas[bar_y:bar_y + 18, bar_x:bar_x + bar_width] = bar
-        cv2.putText(canvas, "low", (bar_x + bar_width + 12, bar_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (25, 25, 25), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "high", (bar_x + bar_width + 54, bar_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (25, 25, 25), 1, cv2.LINE_AA)
+    entries = legend_entries()
+    rows = int(np.ceil(len(entries) / columns))
+    canvas = np.full((42 + rows * 33 + 68, width, 3), 255, dtype=np.uint8)
+    put_fitted_text(canvas, "Semantic class legend", (14, 27), width - 28, preferred=0.60)
+    for idx, (name, colour) in enumerate(entries):
+        row, col = divmod(idx, columns)
+        x0, y0 = col * cell_width + 14, 42 + row * 33
+        canvas[y0 + 5:y0 + 27, x0:x0 + 30] = colour
+        put_fitted_text(canvas, name, (x0 + 40, y0 + 22), cell_width - 54, preferred=0.42)
+    y0 = 42 + rows * 33 + 10
+    lo, hi = limits
+    put_fitted_text(canvas, "{} overlay score (global P5-P95: {:.3f} -> {:.3f})".format(method, lo, hi),
+                    (14, y0 + 18), width - 28, preferred=0.45)
+    bar_width = min(430, width - 150)
+    gradient = np.tile(np.linspace(0, 255, bar_width, dtype=np.uint8), (18, 1))
+    canvas[y0 + 29:y0 + 47, 14:14 + bar_width] = cv2.applyColorMap(gradient, cv2.COLORMAP_TURBO)
+    cv2.putText(canvas, "low     high", (24 + bar_width, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (25, 25, 25), 1, cv2.LINE_AA)
     return canvas
 
 
-def write_legend(out_path: Path, width: int, primary_method: Optional[str] = None,
-                 primary_limits: Optional[Tuple[float, float]] = None) -> None:
+def semantic_legend_sidebar(height: int, width: int, method: str, limits: Tuple[float, float]) -> np.ndarray:
+    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+    canvas[:, :2] = (214, 214, 214)
+    put_fitted_text(canvas, "Semantic classes", (18, 34), width - 32, preferred=0.60, thickness=1)
+    y = 55
+    for name, colour in legend_entries():
+        canvas[y:y + 22, 18:48] = colour
+        put_fitted_text(canvas, name, (60, y + 17), width - 72, preferred=0.40, thickness=1)
+        y += 31
+    y += 15
+    put_fitted_text(canvas, "Temporal score", (18, y + 18), width - 32, preferred=0.56, thickness=1)
+    y += 37
+    put_fitted_text(canvas, method, (18, y + 15), width - 32, preferred=0.45, thickness=1)
+    y += 30
+    lo, hi = limits
+    put_fitted_text(canvas, "global P5-P95", (18, y + 14), width - 32, preferred=0.41)
+    y += 28
+    bar_width = width - 44
+    gradient = np.tile(np.linspace(0, 255, bar_width, dtype=np.uint8), (22, 1))
+    canvas[y:y + 22, 18:18 + bar_width] = cv2.applyColorMap(gradient, cv2.COLORMAP_TURBO)
+    y += 42
+    put_fitted_text(canvas, "low  {:.3f}".format(lo), (18, y), width - 32, preferred=0.40)
+    y += 28
+    put_fitted_text(canvas, "high {:.3f}".format(hi), (18, y), width - 32, preferred=0.40)
+    y += 48
+    put_fitted_text(canvas, "Score map is overlaid", (18, y), width - 32, preferred=0.39)
+    put_fitted_text(canvas, "on current RGB image", (18, y + 26), width - 32, preferred=0.39)
+    return canvas
+
+
+def write_legend(out_path: Path, width: int, method: str, limits: Tuple[float, float]) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), semantic_legend(width, primary_method, primary_limits))
+    cv2.imwrite(str(out_path), semantic_legend_bottom(width, method, limits))
 
 
 def main() -> None:
     args = parse_args()
-    if args.low_percentile < 0 or args.high_percentile > 100 or args.low_percentile >= args.high_percentile:
+    if not 0 <= args.low_percentile < args.high_percentile <= 100:
         raise ValueError("Percentiles must satisfy 0 <= low < high <= 100")
     if not 0.0 <= args.overlay_alpha <= 1.0:
         raise ValueError("overlay-alpha must be in [0, 1]")
+    legend_position = "none" if args.no_embedded_legend else args.legend_position
     pairs = [row for row in read_csv(args.pairs_manifest) if row.get("split", "") == args.split]
     semantic_rows = {row["pair_id"]: row for row in read_csv(args.semantic_manifest) if row.get("split", "") == args.split}
     scores, score_paths = score_sources(args.score_source, args.split)
     if args.primary_method not in scores:
-        raise KeyError("Primary method {} is not one of score sources: {}".format(args.primary_method, sorted(scores)))
+        raise KeyError("Primary method {} absent from score sources: {}".format(args.primary_method, sorted(scores)))
     requested = set(args.pair_id or [])
     if requested:
         pairs = [row for row in pairs if row["pair_id"] in requested]
-        missing_requested = requested - {row["pair_id"] for row in pairs}
-        if missing_requested:
-            raise KeyError("Requested pair_ids absent from split {}: {}".format(args.split, sorted(missing_requested)))
-    for row in pairs:
-        if row["pair_id"] not in semantic_rows:
-            raise KeyError("Semantic manifest lacks selected pair {}".format(row["pair_id"]))
-        missing_scores = [method for method, grouped in scores.items() if row["pair_id"] not in grouped]
-        if missing_scores:
-            raise KeyError("Score sources lack pair {} for methods {}".format(row["pair_id"], missing_scores))
-
-    semantic_ratio_key = args.reference + "_ratio"
+        missing = requested - {row["pair_id"] for row in pairs}
+        if missing:
+            raise KeyError("Requested pair_ids absent from split {}: {}".format(args.split, sorted(missing)))
+    for pair in pairs:
+        pair_id = pair["pair_id"]
+        if pair_id not in semantic_rows:
+            raise KeyError("Semantic manifest lacks selected pair {}".format(pair_id))
+        missing_methods = [method for method, grouped in scores.items() if pair_id not in grouped]
+        if missing_methods:
+            raise KeyError("Score sources lack pair {} for methods {}".format(pair_id, missing_methods))
+    ratio_key = args.reference + "_ratio"
     if args.sort_by == "semantic_change_ratio":
-        pairs.sort(key=lambda row: float(semantic_rows[row["pair_id"]].get(semantic_ratio_key, 0.0)), reverse=True)
+        pairs.sort(key=lambda row: float(semantic_rows[row["pair_id"]].get(ratio_key, 0.0)), reverse=True)
     elif args.sort_by == "primary_score":
         pairs.sort(key=lambda row: float(np.mean([float(item["tile_score"]) for item in scores[args.primary_method][row["pair_id"]]])), reverse=True)
     if args.max_pairs is not None:
@@ -365,10 +367,8 @@ def main() -> None:
     if not pairs:
         raise ValueError("No pairs selected for figure rendering")
     selected_ids = [row["pair_id"] for row in pairs]
-    ranges = {
-        method: method_range(grouped, selected_ids, args.low_percentile, args.high_percentile)
-        for method, grouped in scores.items()
-    }
+    ranges = {method: method_range(grouped, selected_ids, args.low_percentile, args.high_percentile)
+              for method, grouped in scores.items()}
     semantic_label = args.semantic_label or ("GT semantic masks" if args.semantic_source == "gt" else "Predicted semantic masks")
     paper_dir = args.out_dir / args.semantic_source / "paper_style"
     ablation_dir = args.out_dir / args.semantic_source / "method_ablation"
@@ -377,7 +377,6 @@ def main() -> None:
     write_legend(args.out_dir / args.semantic_source / "semantic_legend.png", args.cell_width * 2,
                  args.primary_method, ranges[args.primary_method])
     output_rows: List[Dict[str, object]] = []
-
     for pair in tqdm(pairs, desc="Rendering temporal grids", unit="pair"):
         pair_id = pair["pair_id"]
         current = read_image(Path(pair["curr_image_path"]), cv2.IMREAD_COLOR)
@@ -388,12 +387,9 @@ def main() -> None:
         prev_mask = read_image(prev_mask_path, cv2.IMREAD_UNCHANGED)
         curr_mask = read_image(curr_mask_path, cv2.IMREAD_UNCHANGED)
         change = read_image(change_path, cv2.IMREAD_UNCHANGED)
-        if prev_mask.ndim == 3:
-            prev_mask = prev_mask[..., 0]
-        if curr_mask.ndim == 3:
-            curr_mask = curr_mask[..., 0]
-        if change.ndim == 3:
-            change = change[..., 0]
+        prev_mask = prev_mask[..., 0] if prev_mask.ndim == 3 else prev_mask
+        curr_mask = curr_mask[..., 0] if curr_mask.ndim == 3 else curr_mask
+        change = change[..., 0] if change.ndim == 3 else change
         prev_semantic = semantic_colour(prev_mask, args.invalid_label)
         curr_semantic = semantic_colour(curr_mask, args.invalid_label)
         semantic_change = change_colour(change, args.invalid_label)
@@ -401,88 +397,70 @@ def main() -> None:
         maps: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         for method, grouped in scores.items():
             raw, covered = score_map(grouped[pair_id], current.shape[:2])
-            limits = (ranges[method] if args.normalization == "global" else
-                      method_range({pair_id: grouped[pair_id]}, [pair_id], args.low_percentile, args.high_percentile))
+            limits = ranges[method] if args.normalization == "global" else method_range({pair_id: grouped[pair_id]}, [pair_id], args.low_percentile, args.high_percentile)
             heat = heatmap_visual(raw, covered, valid, limits)
-            overlay = heatmap_overlay(current, heat, covered & valid, args.overlay_alpha)
-            maps[method] = (raw, heat, overlay)
-
+            maps[method] = (raw, heat, heatmap_overlay(current, heat, covered & valid, args.overlay_alpha))
         if not args.no_paper_style:
             primary_panel = maps[args.primary_method][2] if args.paper_primary_panel == "overlay" else maps[args.primary_method][1]
             primary_title = "{} heatmap overlay".format(args.primary_method) if args.paper_primary_panel == "overlay" else "{} temporal heatmap".format(args.primary_method)
-            cells = [
-                [labelled_panel(previous, "Previous aligned RGB ({})".format(pair.get("year_prev", "")), args.cell_width, args.title_height),
-                 labelled_panel(current, "Current RGB ({})".format(pair.get("year_curr", "")), args.cell_width, args.title_height)],
-                [labelled_panel(prev_semantic, "Previous semantic mask", args.cell_width, args.title_height),
-                 labelled_panel(curr_semantic, "Current semantic mask", args.cell_width, args.title_height)],
-                [labelled_panel(semantic_change, "Semantic change: {}".format(REFERENCE_LABELS.get(args.reference, args.reference)), args.cell_width, args.title_height),
-                 labelled_panel(primary_panel, primary_title, args.cell_width, args.title_height)],
-            ]
-            canvas = np.concatenate([row_canvas(row) for row in cells], axis=0)
-            if not args.no_embedded_legend:
-                canvas = np.concatenate([canvas, semantic_legend(canvas.shape[1], args.primary_method, ranges[args.primary_method])], axis=0)
-            canvas = add_header(canvas, pair.get("facade_id", pair_id), pair.get("year_prev", ""),
-                                pair.get("year_curr", ""), semantic_label, args.reference)
+            main = np.concatenate([
+                row_canvas([labelled_panel(previous, "Previous aligned RGB ({})".format(pair.get("year_prev", "")), args.cell_width, args.title_height),
+                            labelled_panel(current, "Current RGB ({})".format(pair.get("year_curr", "")), args.cell_width, args.title_height)]),
+                row_canvas([labelled_panel(prev_semantic, "Previous semantic mask", args.cell_width, args.title_height),
+                            labelled_panel(curr_semantic, "Current semantic mask", args.cell_width, args.title_height)]),
+                row_canvas([labelled_panel(semantic_change, "Semantic change: {}".format(REFERENCE_LABELS.get(args.reference, args.reference)), args.cell_width, args.title_height),
+                            labelled_panel(primary_panel, primary_title, args.cell_width, args.title_height)]),
+            ], axis=0)
+            if legend_position == "right":
+                canvas = np.concatenate([main, semantic_legend_sidebar(main.shape[0], args.legend_width, args.primary_method, ranges[args.primary_method])], axis=1)
+            elif legend_position == "bottom":
+                canvas = np.concatenate([main, semantic_legend_bottom(main.shape[1], args.primary_method, ranges[args.primary_method])], axis=0)
+            else:
+                canvas = main
+            canvas = add_header(canvas, pair.get("facade_id", pair_id), pair.get("year_prev", ""), pair.get("year_curr", ""), semantic_label, args.reference)
             out_path = paper_dir / (pair_id + "_paper_grid.png")
             cv2.imwrite(str(out_path), canvas)
         else:
             out_path = Path("")
-
         if not args.no_ablation_style:
             method_labels = list(scores.keys())
-            top_cells = [
-                labelled_panel(previous, "Previous aligned RGB", args.cell_width, args.title_height),
-                labelled_panel(current, "Current RGB", args.cell_width, args.title_height),
-                labelled_panel(semantic_change, "Semantic change", args.cell_width, args.title_height),
-            ] + [labelled_panel(maps[method][1], method + " heatmap", args.cell_width, args.title_height) for method in method_labels]
-            bottom_cells = [
-                labelled_panel(prev_semantic, "Previous semantic mask", args.cell_width, args.title_height),
-                labelled_panel(curr_semantic, "Current semantic mask", args.cell_width, args.title_height),
-                labelled_panel(semantic_on_rgb, "Semantic change overlay", args.cell_width, args.title_height),
-            ] + [labelled_panel(maps[method][2], method + " overlay", args.cell_width, args.title_height) for method in method_labels]
-            comparison = np.concatenate([row_canvas(top_cells), row_canvas(bottom_cells)], axis=0)
-            comparison = add_header(comparison, pair.get("facade_id", pair_id), pair.get("year_prev", ""),
-                                    pair.get("year_curr", ""), semantic_label + " | visual method ablation", args.reference)
+            top = [labelled_panel(previous, "Previous aligned RGB", args.cell_width, args.title_height),
+                   labelled_panel(current, "Current RGB", args.cell_width, args.title_height),
+                   labelled_panel(semantic_change, "Semantic change", args.cell_width, args.title_height)]
+            top.extend(labelled_panel(maps[method][1], method + " heatmap", args.cell_width, args.title_height) for method in method_labels)
+            bottom = [labelled_panel(prev_semantic, "Previous semantic mask", args.cell_width, args.title_height),
+                      labelled_panel(curr_semantic, "Current semantic mask", args.cell_width, args.title_height),
+                      labelled_panel(semantic_on_rgb, "Semantic change overlay", args.cell_width, args.title_height)]
+            bottom.extend(labelled_panel(maps[method][2], method + " overlay", args.cell_width, args.title_height) for method in method_labels)
+            comparison = add_header(np.concatenate([row_canvas(top), row_canvas(bottom)], axis=0),
+                                    pair.get("facade_id", pair_id), pair.get("year_prev", ""), pair.get("year_curr", ""),
+                                    semantic_label + " | visual method ablation", args.reference)
             comparison_path = ablation_dir / (pair_id + "_methods_grid.png")
             cv2.imwrite(str(comparison_path), comparison)
         else:
             comparison_path = Path("")
         output_rows.append({
-            "pair_id": pair_id,
-            "facade_id": pair.get("facade_id", ""),
-            "year_prev": pair.get("year_prev", ""),
-            "year_curr": pair.get("year_curr", ""),
-            "split": args.split,
-            "semantic_source": args.semantic_source,
-            "reference": args.reference,
-            "semantic_change_ratio": semantic.get(semantic_ratio_key, ""),
-            "paper_grid_path": str(out_path),
-            "method_ablation_grid_path": str(comparison_path),
+            "pair_id": pair_id, "facade_id": pair.get("facade_id", ""), "year_prev": pair.get("year_prev", ""),
+            "year_curr": pair.get("year_curr", ""), "split": args.split, "semantic_source": args.semantic_source,
+            "reference": args.reference, "semantic_change_ratio": semantic.get(ratio_key, ""),
+            "paper_grid_path": str(out_path), "method_ablation_grid_path": str(comparison_path),
         })
-
     manifest_path = args.out_dir / args.semantic_source / "rendered_figures_manifest.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(output_rows[0].keys()))
         writer.writeheader()
         writer.writerows(output_rows)
     report = {
-        "pairs_manifest": str(args.pairs_manifest),
-        "semantic_manifest": str(args.semantic_manifest),
-        "semantic_source": args.semantic_source,
-        "semantic_label": semantic_label,
-        "reference": args.reference,
-        "split": args.split,
-        "n_pairs": len(output_rows),
-        "methods": list(scores.keys()),
-        "score_sources": score_paths,
-        "primary_method": args.primary_method,
-        "paper_primary_panel": args.paper_primary_panel,
-        "embedded_legend": not args.no_embedded_legend,
-        "normalization": args.normalization,
+        "pairs_manifest": str(args.pairs_manifest), "semantic_manifest": str(args.semantic_manifest),
+        "semantic_source": args.semantic_source, "semantic_label": semantic_label, "reference": args.reference,
+        "split": args.split, "n_pairs": len(output_rows), "methods": list(scores.keys()), "score_sources": score_paths,
+        "primary_method": args.primary_method, "paper_primary_panel": args.paper_primary_panel,
+        "legend_position": legend_position, "normalization": args.normalization,
         "normalization_percentiles": [args.low_percentile, args.high_percentile],
-        "global_score_ranges": {method: [float(value) for value in limits] for method, limits in ranges.items()},
-        "layout_note": "Paper-style grids contain RGB observations, semantic maps, semantic change, an RGB heatmap overlay, and an embedded semantic legend.",
-        "semantic_branch_note": "In the RGB-residual experiment, semantic source changes contextual/change-map panels only; all temporal score heatmaps are image-derived and held fixed between GT and predicted semantic visualisations.",
+        "global_score_ranges": {method: [float(v) for v in limits] for method, limits in ranges.items()},
+        "layout_note": "Paper-style grids contain RGB observations, semantic maps, semantic change, an RGB heatmap overlay, and a compact right-hand legend by default.",
+        "split_display_note": "The subset is encoded only in the output directory selected by the caller; no train/val/test label is printed on figures.",
+        "semantic_branch_note": "Semantic source changes only contextual/change-map panels; all RGB-derived temporal score heatmaps are held fixed between GT and predicted semantic visualisations.",
         "quantitative_warning": "Predicted-semantic grids are qualitative whole-pipeline views and must not replace GT-based quantitative evaluation.",
         "output_manifest": str(manifest_path),
     }
@@ -493,7 +471,7 @@ def main() -> None:
     print("Method-ablation figures:", ablation_dir)
     print("Manifest:", manifest_path)
     print("Report:", report_path)
-    print("NOTE: RGB-derived heatmaps are identical between GT and predicted semantic contexts; only semantic panels differ.")
+    print("NOTE: the subset is represented by output folders only and is not printed within any image.")
 
 
 if __name__ == "__main__":
