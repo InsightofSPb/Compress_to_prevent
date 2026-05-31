@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--invalid-label", type=int, default=255)
     parser.add_argument("--valid-threshold", type=int, default=0)
     parser.add_argument("--cell-width", type=int, default=500)
-    parser.add_argument("--legend-width", type=int, default=310)
+    parser.add_argument("--legend-width", type=int, default=380)
     parser.add_argument("--title-height", type=int, default=42)
     parser.add_argument("--overlay-alpha", type=float, default=0.46)
     parser.add_argument("--paper-primary-panel", choices=("overlay", "heatmap"), default="overlay")
@@ -220,7 +220,7 @@ def fit_panel(image: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(image, (width, max(1, int(round(image.shape[0] * scale)))), interpolation=cv2.INTER_AREA)
 
 
-def fitted_scale(text: str, max_width: int, preferred: float, thickness: int, minimum: float = 0.26) -> float:
+def fitted_scale(text: str, max_width: int, preferred: float, thickness: int, minimum: float = 0.22) -> float:
     scale = preferred
     while scale > minimum:
         if cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0] <= max_width:
@@ -298,32 +298,41 @@ def semantic_legend_bottom(width: int, method: str, limits: Tuple[float, float])
 
 
 def semantic_legend_sidebar(height: int, width: int, method: str, limits: Tuple[float, float]) -> np.ndarray:
+    """Render a compact two-column legend that fits short facade figures."""
     canvas = np.full((height, width, 3), 255, dtype=np.uint8)
     canvas[:, :2] = (214, 214, 214)
-    put_fitted_text(canvas, "Semantic classes", (18, 34), width - 32, preferred=0.60, thickness=1)
-    y = 55
-    for name, colour in legend_entries():
-        canvas[y:y + 22, 18:48] = colour
-        put_fitted_text(canvas, name, (60, y + 17), width - 72, preferred=0.40, thickness=1)
-        y += 31
-    y += 15
-    put_fitted_text(canvas, "Temporal score", (18, y + 18), width - 32, preferred=0.56, thickness=1)
-    y += 37
-    put_fitted_text(canvas, method, (18, y + 15), width - 32, preferred=0.45, thickness=1)
-    y += 30
+    margin = 14
+    put_fitted_text(canvas, "Semantic classes", (margin, 27), width - 2 * margin, preferred=0.55, thickness=1)
+    entries = legend_entries()
+    columns = 2
+    cell_width = (width - 2 * margin) // columns
+    row_height = 27
+    start_y = 42
+    for index, (name, colour) in enumerate(entries):
+        row, col = divmod(index, columns)
+        x0 = margin + col * cell_width
+        y0 = start_y + row * row_height
+        canvas[y0 + 4:y0 + 22, x0:x0 + 22] = colour
+        put_fitted_text(canvas, name, (x0 + 29, y0 + 18), cell_width - 34, preferred=0.34, thickness=1)
+    semantic_rows = int(np.ceil(len(entries) / columns))
+    y = start_y + semantic_rows * row_height + 16
+    put_fitted_text(canvas, "Temporal score", (margin, y), width - 2 * margin, preferred=0.52, thickness=1)
+    y += 27
+    put_fitted_text(canvas, method + " overlay", (margin, y), width - 2 * margin, preferred=0.41, thickness=1)
+    y += 21
+    put_fitted_text(canvas, "global P5-P95", (margin, y), width - 2 * margin, preferred=0.38, thickness=1)
+    y += 12
+    bar_width = width - 2 * margin
+    gradient = np.tile(np.linspace(0, 255, bar_width, dtype=np.uint8), (18, 1))
+    canvas[y:y + 18, margin:margin + bar_width] = cv2.applyColorMap(gradient, cv2.COLORMAP_TURBO)
+    y += 36
     lo, hi = limits
-    put_fitted_text(canvas, "global P5-P95", (18, y + 14), width - 32, preferred=0.41)
-    y += 28
-    bar_width = width - 44
-    gradient = np.tile(np.linspace(0, 255, bar_width, dtype=np.uint8), (22, 1))
-    canvas[y:y + 22, 18:18 + bar_width] = cv2.applyColorMap(gradient, cv2.COLORMAP_TURBO)
-    y += 42
-    put_fitted_text(canvas, "low  {:.3f}".format(lo), (18, y), width - 32, preferred=0.40)
-    y += 28
-    put_fitted_text(canvas, "high {:.3f}".format(hi), (18, y), width - 32, preferred=0.40)
-    y += 48
-    put_fitted_text(canvas, "Score map is overlaid", (18, y), width - 32, preferred=0.39)
-    put_fitted_text(canvas, "on current RGB image", (18, y + 26), width - 32, preferred=0.39)
+    put_fitted_text(canvas, "low {:.3f}     high {:.3f}".format(lo, hi), (margin, y), width - 2 * margin,
+                    preferred=0.39, thickness=1)
+    y += 35
+    if y + 25 < height:
+        put_fitted_text(canvas, "Overlay on current RGB", (margin, y), width - 2 * margin,
+                        preferred=0.39, thickness=1, colour=(70, 70, 70))
     return canvas
 
 
@@ -412,6 +421,9 @@ def main() -> None:
                             labelled_panel(primary_panel, primary_title, args.cell_width, args.title_height)]),
             ], axis=0)
             if legend_position == "right":
+                minimum_height = 410
+                if main.shape[0] < minimum_height:
+                    main = np.concatenate([main, np.full((minimum_height - main.shape[0], main.shape[1], 3), 255, dtype=np.uint8)], axis=0)
                 canvas = np.concatenate([main, semantic_legend_sidebar(main.shape[0], args.legend_width, args.primary_method, ranges[args.primary_method])], axis=1)
             elif legend_position == "bottom":
                 canvas = np.concatenate([main, semantic_legend_bottom(main.shape[1], args.primary_method, ranges[args.primary_method])], axis=0)
