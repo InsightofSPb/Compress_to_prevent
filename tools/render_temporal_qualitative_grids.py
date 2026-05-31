@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Render paper-style temporal qualitative grids and visual baseline ablations.
 
-The paper-style layout follows the qualitative figure organization used in the
-facade monitoring manuscript:
+The compact paper-style layout follows the qualitative organisation used in the
+facade monitoring manuscript, but makes the temporal signal interpretable on
+the facade itself:
 
     previous RGB | current RGB
     previous semantic mask | current semantic mask
-    semantic change map | temporal score heatmap
+    semantic change map | temporal heatmap overlay on current RGB
+    embedded semantic-class legend and primary score colour bar
 
-The script supports two semantic contexts with identical RGB score maps:
-manual/GT masks and model-predicted masks. In the RGB-residual formulation of
-this paper, semantic masks are an interpretation/reference branch; the
-compression-derived and image-baseline heatmaps themselves do not depend on
-whether GT or predicted semantic masks are displayed.
+The script supports two semantic contexts with identical RGB-derived score
+maps: manual/GT masks and model-predicted masks. In the RGB-residual
+formulation, semantic masks are an interpretation/reference branch; the
+compression-derived and image-baseline heatmaps do not depend on whether GT or
+predicted semantic masks are displayed.
 
 A second, wider ablation layout renders all supplied temporal score methods for
 the same pair:
@@ -21,7 +23,7 @@ the same pair:
     previous mask| current mask| change overlay  | method-1 overlay | ...
 
 Scores are converted to heatmaps on the current-image coordinate system by
-averaging scores covering each pixel. Robust normalization defaults to one
+averaging scores covering each pixel. Robust normalisation defaults to one
 shared low/high range per method over the selected pairs; it is saved in JSON
 so generated figures are reproducible.
 """
@@ -48,6 +50,14 @@ DEFAULT_CLASS_NAMES = [
     "WATER_STAIN", "EFFLORESCENCE", "CORROSION", "ORNAMENT_INTACT",
     "REPAIRS", "TEXT_OR_IMAGES",
 ]
+REFERENCE_LABELS = {
+    "inspection_relevant_change": "inspection-relevant change",
+    "damage_or_repair_change": "damage / repair change",
+    "damage_type_change": "damage-type change",
+    "damage_presence_change": "damage-presence change",
+    "intervention_or_content_change": "intervention / content change",
+    "any_semantic_change": "any semantic change",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,8 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-label", default=None,
                         help="Figure title label; default is derived from semantic-source.")
     parser.add_argument("--reference", default="inspection_relevant_change",
-                        choices=("inspection_relevant_change", "damage_or_repair_change", "damage_type_change",
-                                 "damage_presence_change", "intervention_or_content_change", "any_semantic_change"))
+                        choices=tuple(REFERENCE_LABELS))
     parser.add_argument(
         "--score-source", action="append", required=True,
         help=("Temporal score source as LABEL=CSV or LABEL=CSV#RAW_METHOD. The second form selects one method "
@@ -84,6 +93,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cell-width", type=int, default=460)
     parser.add_argument("--title-height", type=int, default=42)
     parser.add_argument("--overlay-alpha", type=float, default=0.46)
+    parser.add_argument("--paper-primary-panel", choices=("overlay", "heatmap"), default="overlay",
+                        help="Render the primary temporal score as an interpretable RGB overlay by default.")
+    parser.add_argument("--no-embedded-legend", action="store_true",
+                        help="Do not append the semantic legend and primary heatmap colour bar to paper figures.")
     parser.add_argument("--no-paper-style", action="store_true")
     parser.add_argument("--no-ablation-style", action="store_true")
     return parser.parse_args()
@@ -225,10 +238,26 @@ def fit_panel(image: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(image, (width, max(1, int(round(image.shape[0] * scale)))), interpolation=cv2.INTER_AREA)
 
 
+def fitted_scale(text: str, max_width: int, preferred: float, thickness: int, minimum: float = 0.32) -> float:
+    scale = preferred
+    while scale > minimum:
+        width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
+        if width <= max_width:
+            return scale
+        scale -= 0.03
+    return minimum
+
+
+def put_fitted_text(canvas: np.ndarray, text: str, position: Tuple[int, int], max_width: int,
+                    preferred: float = 0.62, thickness: int = 1, colour: Tuple[int, int, int] = (25, 25, 25)) -> None:
+    scale = fitted_scale(text, max_width, preferred, thickness)
+    cv2.putText(canvas, text, position, cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thickness, cv2.LINE_AA)
+
+
 def labelled_panel(image: np.ndarray, title: str, width: int, title_height: int) -> np.ndarray:
     image = fit_panel(image, width)
     band = np.full((title_height, width, 3), 248, dtype=np.uint8)
-    cv2.putText(band, title, (12, int(title_height * 0.68)), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (25, 25, 25), 1, cv2.LINE_AA)
+    put_fitted_text(band, title, (12, int(title_height * 0.68)), width - 24, preferred=0.62, thickness=1)
     return np.concatenate([band, image], axis=0)
 
 
@@ -247,32 +276,59 @@ def row_canvas(cells: Sequence[np.ndarray]) -> np.ndarray:
     return np.concatenate(equalise_cells(cells), axis=1)
 
 
-def add_header(canvas: np.ndarray, title: str) -> np.ndarray:
-    band = np.full((58, canvas.shape[1], 3), 255, dtype=np.uint8)
-    cv2.putText(band, title, (16, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (15, 15, 15), 2, cv2.LINE_AA)
+def add_header(canvas: np.ndarray, facade_id: str, year_prev: str, year_curr: str,
+               semantic_label: str, reference: str) -> np.ndarray:
+    """Use a two-line compact header so long facade IDs cannot be clipped."""
+    band = np.full((84, canvas.shape[1], 3), 255, dtype=np.uint8)
+    title = "{} | {} -> {}".format(facade_id, year_prev, year_curr)
+    subtitle = "{} | target: {}".format(semantic_label, REFERENCE_LABELS.get(reference, reference))
+    put_fitted_text(band, title, (16, 33), canvas.shape[1] - 32, preferred=0.82, thickness=2, colour=(15, 15, 15))
+    put_fitted_text(band, subtitle, (16, 67), canvas.shape[1] - 32, preferred=0.56, thickness=1, colour=(55, 55, 55))
     return np.concatenate([band, canvas], axis=0)
 
 
-def write_legend(out_path: Path) -> None:
-    cells: List[np.ndarray] = []
-    for idx, (name, rgb) in enumerate(zip(DEFAULT_CLASS_NAMES, DEFAULT_PALETTE_RGB)):
-        cell = np.full((42, 238, 3), 255, dtype=np.uint8)
-        cell[8:34, 8:42] = np.asarray(rgb[::-1], dtype=np.uint8)
-        cv2.putText(cell, "{} {}".format(idx, name), (52, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (25, 25, 25), 1, cv2.LINE_AA)
-        cells.append(cell)
-    change_cell = np.full((42, 238, 3), 255, dtype=np.uint8)
-    change_cell[8:34, 8:42] = (0, 0, 238)
-    cv2.putText(change_cell, "semantic change", (52, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (25, 25, 25), 1, cv2.LINE_AA)
-    cells.append(change_cell)
-    ncols = 3
-    rows = []
-    for start in range(0, len(cells), ncols):
-        chunk = cells[start:start + ncols]
-        while len(chunk) < ncols:
-            chunk.append(np.full_like(cells[0], 255))
-        rows.append(np.concatenate(chunk, axis=1))
+def semantic_legend(width: int, primary_method: Optional[str] = None,
+                    primary_limits: Optional[Tuple[float, float]] = None) -> np.ndarray:
+    """Create an embedded semantic-class legend; optionally add a heatmap colour bar."""
+    columns = 3 if width < 1300 else 4
+    cell_width = width // columns
+    entries: List[Tuple[str, Tuple[int, int, int]]] = [
+        ("{} {}".format(idx, name), tuple(int(value) for value in rgb[::-1]))
+        for idx, (name, rgb) in enumerate(zip(DEFAULT_CLASS_NAMES, DEFAULT_PALETTE_RGB))
+    ]
+    entries.extend([
+        ("semantic change", (0, 0, 238)),
+        ("invalid / excluded", (55, 55, 55)),
+    ])
+    n_rows = int(np.ceil(len(entries) / columns))
+    heat_height = 66 if primary_method is not None and primary_limits is not None else 0
+    canvas = np.full((42 + n_rows * 33 + heat_height, width, 3), 255, dtype=np.uint8)
+    put_fitted_text(canvas, "Semantic class legend", (14, 27), width - 28, preferred=0.60, thickness=1)
+    for index, (name, bgr) in enumerate(entries):
+        row, col = divmod(index, columns)
+        x0 = col * cell_width + 14
+        y0 = 42 + row * 33
+        canvas[y0 + 5:y0 + 27, x0:x0 + 30] = bgr
+        put_fitted_text(canvas, name, (x0 + 40, y0 + 22), cell_width - 54, preferred=0.42, thickness=1)
+    if heat_height:
+        lo, hi = primary_limits or (0.0, 1.0)
+        y0 = 42 + n_rows * 33 + 10
+        label = "{} overlay score (global P5-P95: {:.3f} -> {:.3f})".format(primary_method, lo, hi)
+        put_fitted_text(canvas, label, (14, y0 + 18), width - 28, preferred=0.45, thickness=1)
+        bar_width = min(430, width - 160)
+        bar_x, bar_y = 14, y0 + 29
+        gradient = np.tile(np.linspace(0, 255, bar_width, dtype=np.uint8), (18, 1))
+        bar = cv2.applyColorMap(gradient, cv2.COLORMAP_TURBO)
+        canvas[bar_y:bar_y + 18, bar_x:bar_x + bar_width] = bar
+        cv2.putText(canvas, "low", (bar_x + bar_width + 12, bar_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (25, 25, 25), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "high", (bar_x + bar_width + 54, bar_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (25, 25, 25), 1, cv2.LINE_AA)
+    return canvas
+
+
+def write_legend(out_path: Path, width: int, primary_method: Optional[str] = None,
+                 primary_limits: Optional[Tuple[float, float]] = None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), np.concatenate(rows, axis=0))
+    cv2.imwrite(str(out_path), semantic_legend(width, primary_method, primary_limits))
 
 
 def main() -> None:
@@ -318,7 +374,8 @@ def main() -> None:
     ablation_dir = args.out_dir / args.semantic_source / "method_ablation"
     paper_dir.mkdir(parents=True, exist_ok=True)
     ablation_dir.mkdir(parents=True, exist_ok=True)
-    write_legend(args.out_dir / args.semantic_source / "semantic_legend.png")
+    write_legend(args.out_dir / args.semantic_source / "semantic_legend.png", args.cell_width * 2,
+                 args.primary_method, ranges[args.primary_method])
     output_rows: List[Dict[str, object]] = []
 
     for pair in tqdm(pairs, desc="Rendering temporal grids", unit="pair"):
@@ -344,23 +401,28 @@ def main() -> None:
         maps: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         for method, grouped in scores.items():
             raw, covered = score_map(grouped[pair_id], current.shape[:2])
-            limits = ranges[method] if args.normalization == "global" else method_range({pair_id: grouped[pair_id]}, [pair_id], args.low_percentile, args.high_percentile)
+            limits = (ranges[method] if args.normalization == "global" else
+                      method_range({pair_id: grouped[pair_id]}, [pair_id], args.low_percentile, args.high_percentile))
             heat = heatmap_visual(raw, covered, valid, limits)
             overlay = heatmap_overlay(current, heat, covered & valid, args.overlay_alpha)
             maps[method] = (raw, heat, overlay)
 
         if not args.no_paper_style:
-            primary_heat = maps[args.primary_method][1]
+            primary_panel = maps[args.primary_method][2] if args.paper_primary_panel == "overlay" else maps[args.primary_method][1]
+            primary_title = "{} heatmap overlay".format(args.primary_method) if args.paper_primary_panel == "overlay" else "{} temporal heatmap".format(args.primary_method)
             cells = [
                 [labelled_panel(previous, "Previous aligned RGB ({})".format(pair.get("year_prev", "")), args.cell_width, args.title_height),
                  labelled_panel(current, "Current RGB ({})".format(pair.get("year_curr", "")), args.cell_width, args.title_height)],
                 [labelled_panel(prev_semantic, "Previous semantic mask", args.cell_width, args.title_height),
                  labelled_panel(curr_semantic, "Current semantic mask", args.cell_width, args.title_height)],
-                [labelled_panel(semantic_change, "{} change: {}".format(semantic_label, args.reference), args.cell_width, args.title_height),
-                 labelled_panel(primary_heat, "{} temporal heatmap".format(args.primary_method), args.cell_width, args.title_height)],
+                [labelled_panel(semantic_change, "Semantic change: {}".format(REFERENCE_LABELS.get(args.reference, args.reference)), args.cell_width, args.title_height),
+                 labelled_panel(primary_panel, primary_title, args.cell_width, args.title_height)],
             ]
             canvas = np.concatenate([row_canvas(row) for row in cells], axis=0)
-            canvas = add_header(canvas, "{} | {} | {}".format(pair_id, semantic_label, args.reference))
+            if not args.no_embedded_legend:
+                canvas = np.concatenate([canvas, semantic_legend(canvas.shape[1], args.primary_method, ranges[args.primary_method])], axis=0)
+            canvas = add_header(canvas, pair.get("facade_id", pair_id), pair.get("year_prev", ""),
+                                pair.get("year_curr", ""), semantic_label, args.reference)
             out_path = paper_dir / (pair_id + "_paper_grid.png")
             cv2.imwrite(str(out_path), canvas)
         else:
@@ -379,7 +441,8 @@ def main() -> None:
                 labelled_panel(semantic_on_rgb, "Semantic change overlay", args.cell_width, args.title_height),
             ] + [labelled_panel(maps[method][2], method + " overlay", args.cell_width, args.title_height) for method in method_labels]
             comparison = np.concatenate([row_canvas(top_cells), row_canvas(bottom_cells)], axis=0)
-            comparison = add_header(comparison, "{} | {} | Visual method ablation".format(pair_id, semantic_label))
+            comparison = add_header(comparison, pair.get("facade_id", pair_id), pair.get("year_prev", ""),
+                                    pair.get("year_curr", ""), semantic_label + " | visual method ablation", args.reference)
             comparison_path = ablation_dir / (pair_id + "_methods_grid.png")
             cv2.imwrite(str(comparison_path), comparison)
         else:
@@ -413,10 +476,12 @@ def main() -> None:
         "methods": list(scores.keys()),
         "score_sources": score_paths,
         "primary_method": args.primary_method,
+        "paper_primary_panel": args.paper_primary_panel,
+        "embedded_legend": not args.no_embedded_legend,
         "normalization": args.normalization,
         "normalization_percentiles": [args.low_percentile, args.high_percentile],
         "global_score_ranges": {method: [float(value) for value in limits] for method, limits in ranges.items()},
-        "layout_note": "Paper-style grids reproduce the manuscript organization: RGB observations, semantic maps, semantic change, and temporal heatmap.",
+        "layout_note": "Paper-style grids contain RGB observations, semantic maps, semantic change, an RGB heatmap overlay, and an embedded semantic legend.",
         "semantic_branch_note": "In the RGB-residual experiment, semantic source changes contextual/change-map panels only; all temporal score heatmaps are image-derived and held fixed between GT and predicted semantic visualisations.",
         "quantitative_warning": "Predicted-semantic grids are qualitative whole-pipeline views and must not replace GT-based quantitative evaluation.",
         "output_manifest": str(manifest_path),
