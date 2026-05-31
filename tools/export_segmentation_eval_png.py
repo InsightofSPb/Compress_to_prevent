@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Export clean segmentation val/test samples as uniform PNG pairs.
+"""Export clean segmentation split samples as uniform PNG pairs.
 
 The facade dataset contains mixed RGB extensions (.png/.jpg). MMSeg CustomDataset
 configs in this repository use one fixed ``img_suffix``. This utility converts
 images from a split manifest to RGB PNG and copies label maps as PNG without any
-crop, resize, or augmentation. It is intended for validation and test only.
+crop, resize, or augmentation. It is intended for clean stitched inference and
+visualisation on train, validation, or test subsets.
 """
 from __future__ import annotations
 
@@ -20,9 +21,9 @@ from PIL import Image
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export clean val/test RGB-mask pairs as PNG files.")
+    parser = argparse.ArgumentParser(description="Export clean RGB-mask split samples as PNG files.")
     parser.add_argument("--manifest-csv", type=Path, required=True)
-    parser.add_argument("--split", choices=("val", "test"), required=True)
+    parser.add_argument("--split", choices=("train", "val", "test"), required=True)
     parser.add_argument("--out-root", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -51,7 +52,7 @@ def main() -> None:
 
     seen_names = set()
     label_values = set()
-    for index, row in enumerate(rows):
+    for row in rows:
         image_path = Path(row.get("image_path", ""))
         mask_path = Path(row.get("mask_path", ""))
         if not image_path.is_file() or not mask_path.is_file():
