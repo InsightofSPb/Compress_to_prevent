@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Prepare deterministic clean tiles for tiled segmentation validation/test.
+"""Prepare deterministic clean tiles for stitched segmentation inference.
 
-Unlike training crop generation, evaluation tiling never drops edge regions.
-The final tile position along each axis is aligned to the image boundary so
-that every original pixel is covered. Overlapping tile predictions must later
-be stitched back to full-resolution images before metric computation.
+Unlike augmented training crop generation, this utility never drops edge
+regions and never applies augmentation. The final tile position along each axis
+is aligned to the image boundary so every original pixel is covered. It is used
+for metric computation on validation/test and for clean full-resolution
+prediction export on train/validation/test qualitative subsets.
 
 Input layout::
 
@@ -33,10 +34,10 @@ from tqdm import tqdm
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create clean full-coverage tiles for val/test segmentation evaluation.")
+    parser = argparse.ArgumentParser(description="Create clean full-coverage tiles for stitched segmentation inference.")
     parser.add_argument("--eval-root", type=Path, required=True,
                         help="Root containing <split>/images and <split>/masks clean PNG pairs.")
-    parser.add_argument("--split", choices=("val", "test"), required=True)
+    parser.add_argument("--split", choices=("train", "val", "test"), required=True)
     parser.add_argument("--out-root", type=Path, required=True)
     parser.add_argument("--tile-size", type=int, default=448)
     parser.add_argument("--stride", type=int, default=224)
@@ -71,7 +72,7 @@ def pad_tile(image: np.ndarray, mask: np.ndarray, tile_size: int, ignore_label: 
 def find_mask(image_path: Path, masks_dir: Path) -> Path:
     mask_path = masks_dir / image_path.name
     if not mask_path.is_file():
-        raise FileNotFoundError("Mask not found for clean evaluation image: {}".format(image_path))
+        raise FileNotFoundError("Mask not found for clean inference image: {}".format(image_path))
     return mask_path
 
 
@@ -93,7 +94,7 @@ def main() -> None:
     input_images = input_root / "images"
     input_masks = input_root / "masks"
     if not input_images.is_dir() or not input_masks.is_dir():
-        raise FileNotFoundError("Expected clean evaluation folders: {} and {}".format(input_images, input_masks))
+        raise FileNotFoundError("Expected clean inference folders: {} and {}".format(input_images, input_masks))
 
     output_root = args.out_root / args.split
     if output_root.exists() and any(output_root.rglob("*")):
@@ -107,7 +108,7 @@ def main() -> None:
 
     image_paths = sorted(input_images.glob("*.png"))
     if not image_paths:
-        raise ValueError("No clean PNG evaluation images found in: {}".format(input_images))
+        raise ValueError("No clean PNG inference images found in: {}".format(input_images))
 
     rows: List[Dict[str, object]] = []
     tiles_per_image: Dict[str, int] = {}
@@ -138,9 +139,7 @@ def main() -> None:
                 content_width = min(args.tile_size, width - x)
                 image_tile = image[y:y + content_height, x:x + content_width]
                 mask_tile = mask[y:y + content_height, x:x + content_width]
-                image_tile, mask_tile = pad_tile(
-                    image_tile, mask_tile, args.tile_size, args.padding_ignore_label
-                )
+                image_tile, mask_tile = pad_tile(image_tile, mask_tile, args.tile_size, args.padding_ignore_label)
                 tile_stem = "{}_tile{:04d}_x{}_y{}".format(image_path.stem, image_tile_count, x, y)
                 image_out = output_images / (tile_stem + ".png")
                 mask_out = output_masks / (tile_stem + ".png")
@@ -168,7 +167,7 @@ def main() -> None:
         image_min_coverage = int(coverage.min())
         image_max_coverage = int(coverage.max())
         if image_min_coverage < 1:
-            raise RuntimeError("Evaluation tiling left uncovered pixels in: {}".format(image_path))
+            raise RuntimeError("Inference tiling left uncovered pixels in: {}".format(image_path))
         min_coverage = image_min_coverage if min_coverage is None else min(min_coverage, image_min_coverage)
         max_coverage = max(max_coverage, image_max_coverage)
         tiles_per_image[image_path.stem] = image_tile_count
@@ -196,15 +195,16 @@ def main() -> None:
         "pixel_coverage_max": max_coverage,
         "padding_ignore_label": args.padding_ignore_label,
         "notes": [
-            "No image augmentation is applied to validation or test tiles.",
-            "Metrics must be computed after stitching overlapping tile logits to each original image.",
+            "No image augmentation is applied to clean stitched-inference tiles.",
+            "Overlapping tile logits must be stitched to each original image before prediction export or metrics.",
+            "For the training subset these tiles are for qualitative clean inference only, not for model fitting.",
         ],
     }
     (output_root / "tiles_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print("Prepared clean {} tiles: {} from {} images".format(args.split, total_tiles, len(image_paths)))
     print("Tile manifest: {}".format(manifest_path))
     print("Coverage min/max: {}/{}".format(min_coverage, max_coverage))
-    print("No augmentations were applied; stitch logits before computing metrics.")
+    print("No augmentations were applied; stitch logits before using the outputs.")
 
 
 if __name__ == "__main__":
