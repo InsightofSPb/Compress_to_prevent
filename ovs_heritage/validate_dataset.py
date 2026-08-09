@@ -5,7 +5,10 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from .ontology import DEFAULT_ONTOLOGY, Ontology, load_ontology
+import yaml
+from yaml import YAMLError
+
+from .ontology import DEFAULT_ONTOLOGY, Ontology, extract_mask_ids, load_ontology
 
 MASK_COLUMNS = ("mask_path", "seg_map_path", "annotation", "mask", "label_path")
 
@@ -53,14 +56,18 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
         for path, facade_id in entries:
             if facade_id is not None: facades.add(facade_id)
             try:
-                mask = _read_mask(path); found = {int(x) for x in np.unique(mask)}
+                mask = _read_mask(path)
+                found = extract_mask_ids(mask, str(path))
                 unknown = found - ontology.valid_ids - {ontology.ignore_index}
                 if unknown:
                     unknown_files.append({"file": str(path), "ids": sorted(unknown)})
                     report["errors"].append(f"{path}: unknown mask IDs {sorted(unknown)}")
                 for value, count in zip(*np.unique(mask, return_counts=True)):
-                    counts[int(value)] += int(count); images_with[int(value)] += 1
-            except Exception as exc: report["errors"].append(f"{path}: {exc}")
+                    value = value.item()
+                    counts[value] += int(count); images_with[value] += 1
+            except Exception as exc:
+                message = str(exc)
+                report["errors"].append(message if message.startswith(str(path)) else f"{path}: {message}")
         total = sum(counts.values())
         valid_total = total - counts[ontology.ignore_index]
         missing = sorted(ontology.valid_ids - set(counts))
@@ -85,7 +92,10 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
     return report
 
 def _dataset_config(path: Path) -> dict[str, str]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except YAMLError as exc:
+        raise ValueError(f"{path}: malformed YAML dataset config: {exc}") from exc
     splits = data.get("splits", data)
     result = {}
     for name in ("train", "val", "validation", "test"):
@@ -97,7 +107,7 @@ def _dataset_config(path: Path) -> dict[str, str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ontology", default=str(DEFAULT_ONTOLOGY))
-    parser.add_argument("--dataset-config", type=Path, help="JSON/YAML-subset mapping split names to manifests or mask directories")
+    parser.add_argument("--dataset-config", type=Path, help="YAML mapping split names to manifests or mask directories")
     for split in ("train", "val", "test"): parser.add_argument(f"--{split}", help=f"{split} manifest or mask directory")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--strict", action="store_true", help="return nonzero for validation errors (errors are always reported)")

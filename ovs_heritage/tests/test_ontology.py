@@ -1,27 +1,139 @@
+import copy
 import json
+
 import numpy as np
 import pytest
-from ovs_heritage.ontology import load_ontology, ontology_from_mapping, OntologyError, validate_mask_ids
 
-def test_exact_ontology_and_groups():
-    o=load_ontology(); assert [c.id for c in o.classes]==list(range(12)); assert o.ignore_index==255 and 255 not in o.valid_ids
-    assert o.by_name('background').id==0; assert o.by_name('advertisements').id==11
-    assert 'advertisements' in o.groups['HUMAN_ACTIVITY']; assert 'advertisements' not in o.groups['DAMAGE_MACRO']
-    assert len(o.palette)==len(set(o.palette))==12
+from ovs_heritage.ontology import (
+    OntologyError,
+    load_ontology,
+    ontology_from_mapping,
+    validate_mask_ids,
+)
 
-def test_hash_independent_of_mapping_key_order():
-    p='ovs_heritage/configs/heritage_vocab.yaml'; data=json.load(open(p)); reversed_data={k:data[k] for k in reversed(data)}
-    assert load_ontology().hash==ontology_from_mapping(reversed_data).hash
+CONFIG = "ovs_heritage/configs/heritage_vocab.yaml"
 
-def test_invalid_duplicate_id_name_alias():
-    data=json.load(open('ovs_heritage/configs/heritage_vocab.yaml'))
-    for mutate in ('id','name','alias'):
-        x=json.loads(json.dumps(data))
-        if mutate=='id': x['classes'][1]['id']=0
-        elif mutate=='name': x['classes'][1]['name']='background'
-        else: x['classes'][1]['aliases']=['rust']
-        with pytest.raises(OntologyError): ontology_from_mapping(x)
 
-def test_unknown_ids_are_explicit_and_11_preserved():
-    o=load_ontology(); assert validate_mask_ids(np.array([11,255]),o)=={11,255}
-    with pytest.raises(OntologyError,match='17'): validate_mask_ids(np.array([17]),o,'mock.png')
+def config():
+    with open(CONFIG, encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def test_exact_v2_ontology_and_groups():
+    ontology = load_ontology()
+    assert [item.id for item in ontology.classes] == list(range(12))
+    assert ontology.ignore_index == 255 and 255 not in ontology.valid_ids
+    assert ontology.by_name("background").id == 0
+    assert ontology.by_name("text_or_images").id == 10
+    assert ontology.by_name("advertisements").id == 11
+    assert "advertisements" in ontology.groups["HUMAN_ACTIVITY"]
+    assert "advertisements" not in ontology.groups["DAMAGE_MACRO"]
+    assert tuple(ontology.groups["DAMAGE_MACRO"]) == ontology.class_names[1:8]
+    assert len(ontology.palette) == len(set(ontology.palette)) == 12
+
+
+def test_hash_independent_of_mapping_key_order_and_yaml_format(tmp_path):
+    data = config()
+    reordered = {key: data[key] for key in reversed(data)}
+    yaml_path = tmp_path / "ontology.yaml"
+    import yaml
+    yaml_path.write_text("# comment\n" + yaml.safe_dump(reordered, sort_keys=False), encoding="utf-8")
+    assert load_ontology().hash == load_ontology(yaml_path).hash
+
+
+@pytest.mark.parametrize("bad_id", [11.0, True, "11"])
+def test_ontology_ids_must_be_real_integers(bad_id):
+    data = config()
+    data["classes"][11]["id"] = bad_id
+    with pytest.raises(OntologyError, match="class ID must be an integer"):
+        ontology_from_mapping(data)
+
+
+def test_duplicate_ids_names_and_aliases_are_rejected():
+    mutations = (
+        lambda data: data["classes"][1].__setitem__("id", 0),
+        lambda data: data["classes"][1].__setitem__("name", "background"),
+        lambda data: data["classes"][1].__setitem__("aliases", ["rust"]),
+    )
+    for mutate in mutations:
+        data = config()
+        mutate(data)
+        with pytest.raises(OntologyError):
+            ontology_from_mapping(data)
+
+
+def test_strict_versions_and_canonical_order():
+    data = config()
+    data["ignore_index"] = 254
+    with pytest.raises(OntologyError, match="ignore_index=255"):
+        ontology_from_mapping(data)
+
+    data = config()
+    data["classes"][9]["name"], data["classes"][11]["name"] = (
+        data["classes"][11]["name"], data["classes"][9]["name"]
+    )
+    with pytest.raises(OntologyError, match="canonical class order"):
+        ontology_from_mapping(data)
+
+    data = config()
+    data["classes"][11]["id"] = 12
+    with pytest.raises(OntologyError, match="ordered IDs"):
+        ontology_from_mapping(data)
+
+
+def test_v1_is_exactly_zero_through_ten():
+    data = config()
+    data["version"] = "heritage_facades_v1_11classes"
+    data["classes"] = data["classes"][:11]
+    data["groups"]["HUMAN_ACTIVITY"].remove("advertisements")
+    v1 = ontology_from_mapping(data)
+    assert v1.class_names[-1] == "text_or_images"
+    assert v1.valid_ids == frozenset(range(11))
+
+
+def test_groups_are_bidirectionally_consistent():
+    data = config()
+    data["classes"][11]["evaluation_groups"] = []
+    with pytest.raises(OntologyError, match="top-level group HUMAN_ACTIVITY contains advertisements"):
+        ontology_from_mapping(data)
+
+    data = config()
+    data["groups"]["HUMAN_ACTIVITY"].remove("advertisements")
+    with pytest.raises(OntologyError, match="advertisements in HUMAN_ACTIVITY"):
+        ontology_from_mapping(data)
+
+
+def test_real_non_json_yaml_and_malformed_yaml(tmp_path):
+    yaml_path = tmp_path / "plain.yaml"
+    yaml_path.write_text("""
+version: heritage_facades_v1_11classes
+ignore_index: 255
+groups: {}
+classes: []
+""", encoding="utf-8")
+    with pytest.raises(OntologyError, match="non-empty list"):
+        load_ontology(yaml_path)  # parsed as YAML, then semantically rejected
+
+    malformed = tmp_path / "bad.yaml"
+    malformed.write_text("version: [unterminated", encoding="utf-8")
+    with pytest.raises(OntologyError, match="malformed YAML"):
+        load_ontology(malformed)
+
+
+def test_mask_dtype_is_checked_before_values_are_converted():
+    ontology = load_ontology()
+    assert validate_mask_ids(np.array([11, 255], dtype=np.uint8), ontology) == {11, 255}
+    for array in (
+        np.array([11.5, 255.9]),
+        np.array([11.0, 255.0]),
+        np.array([True, False]),
+        np.array(["11", "255"]),
+        np.array([11], dtype=object),
+    ):
+        with pytest.raises(OntologyError, match=r"dtype.*found IDs"):
+            validate_mask_ids(array, ontology, "typed-mask.npy")
+
+
+def test_unknown_ids_are_explicit():
+    with pytest.raises(OntologyError, match=r"mock.png: unknown mask IDs \[17\]"):
+        validate_mask_ids(np.array([17], dtype=np.int16), load_ontology(), "mock.png")
