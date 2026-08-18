@@ -86,32 +86,36 @@ def _plain(value: Any) -> Any:
 def _redact_url(value: str) -> str:
     try:
         parsed = urlsplit(value)
-    except ValueError:
-        return value
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return value
-    hostname = parsed.hostname or ""
-    if parsed.port is not None:
-        hostname = "{}:{}".format(hostname, parsed.port)
-    if parsed.username is not None or parsed.password is not None:
-        hostname = "[REDACTED]@{}".format(hostname)
-    query = []
-    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
-        redacted = (
-            "[REDACTED]"
-            if any(marker in key.lower() for marker in SECRET_MARKERS)
-            else item
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return value
+        netloc = parsed.netloc
+        if "@" in netloc:
+            netloc = "[REDACTED]@{}".format(netloc.rsplit("@", 1)[1])
+        query = []
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+            redacted = (
+                "[REDACTED]"
+                if any(marker in key.lower() for marker in SECRET_MARKERS)
+                else item
+            )
+            query.append((key, redacted))
+        return urlunsplit(
+            (parsed.scheme, netloc, parsed.path, urlencode(query), parsed.fragment)
         )
-        query.append((key, redacted))
-    return urlunsplit(
-        (parsed.scheme, hostname, parsed.path, urlencode(query), parsed.fragment)
-    )
+    except Exception:
+        # Redaction is a safety boundary and must never mask the experiment error.
+        return re.sub(r"(https?://)[^/@\s]+@", r"\1[REDACTED]@", value)
 
 
 def _redact_string(value: str) -> str:
     value = re.sub(
         r"(?i)\b(bearer|basic)\s+\S+",
         lambda match: "{} [REDACTED]".format(match.group(1)),
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(password|passwd|secret|token|api[_-]?key|apikey|authorization|access[_-]?key)=\S+",
+        lambda match: "{}=[REDACTED]".format(match.group(1)),
         value,
     )
     return re.sub(r"https?://[^\s]+", lambda match: _redact_url(match.group(0)), value)
@@ -135,8 +139,15 @@ def redact_secrets(value: Any) -> Any:
 
 
 def sanitize_error(exc: BaseException) -> Mapping[str, str]:
-    message = " ".join(str(exc).replace("\x00", "").split())[:MAX_ERROR_MESSAGE]
-    message = redact_secrets(message)
+    try:
+        raw_message = str(exc)
+    except Exception:
+        raw_message = "<unprintable exception message>"
+    message = " ".join(raw_message.replace("\x00", "").split())[:MAX_ERROR_MESSAGE]
+    try:
+        message = redact_secrets(message)
+    except Exception:
+        message = "<exception message could not be sanitized>"
     return {"error_type": type(exc).__name__, "message": message}
 
 
@@ -390,7 +401,11 @@ class Ledger:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            prior = self.read(verify=True) if self.path.exists() else []
+            if self.path.exists():
+                prior = self.read(verify=True)
+            else:
+                self._verify_terminal_seal([])
+                prior = []
             body = {
                 "schema_version": SCHEMA_VERSION,
                 "event_id": event.event_id or str(uuid4()),
@@ -415,6 +430,8 @@ class Ledger:
 
     def read(self, verify: bool = True) -> list[StoredEvent]:
         if not self.path.exists():
+            if verify:
+                self._verify_terminal_seal([])
             return []
         raw = self.path.read_bytes()
         if raw and not raw.endswith(b"\n"):

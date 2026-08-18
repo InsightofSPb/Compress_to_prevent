@@ -326,6 +326,7 @@ def test_ledger_run_refuses_overwrite(tmp_path: Path) -> None:
     failed_ledger = next(
         candidate
         for directory in root.iterdir()
+        if directory.is_dir()
         for candidate in [Ledger(root, directory.name)]
         if [event.event_type for event in candidate.read()]
         == ["run.started", "run.failed"]

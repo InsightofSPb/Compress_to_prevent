@@ -12,6 +12,7 @@ from .ledger import (
     canonical_hash,
     file_descriptor,
     ontology_snapshot,
+    redact_secrets,
     repository_snapshot,
     sanitize_error,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "canonical_hash",
     "file_descriptor",
     "ontology_snapshot",
+    "redact_secrets",
     "repository_snapshot",
     "sanitize_error",
 ]

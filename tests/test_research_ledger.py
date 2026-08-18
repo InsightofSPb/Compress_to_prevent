@@ -17,6 +17,7 @@ from research_ledger import (
     canonical_bytes,
     canonical_hash,
     ontology_snapshot,
+    redact_secrets,
     sanitize_error,
 )
 
@@ -108,6 +109,37 @@ def test_secret_values_are_redacted_recursively(tmp_path: Path) -> None:
     assert "secret" not in error["message"]
 
 
+def test_assignment_secrets_and_malformed_urls_are_safe(tmp_path: Path) -> None:
+    assignments = (
+        "password=hunter2 passwd=p secret=s token=abc api_key=xyz "
+        "api-key=q apikey=r authorization=auth access_key=k access-key=z"
+    )
+    sanitized = sanitize_error(RuntimeError(assignments))["message"]
+    for leaked in (
+        "hunter2",
+        "token=abc",
+        "api_key=xyz",
+        "authorization=auth",
+        "access_key=k",
+    ):
+        assert leaked not in sanitized
+    malformed = "http://alice:password@example.invalid:notaport/path"
+    payload = redact_secrets({"nested": [{"message": assignments}, malformed]})
+    assert "hunter2" not in payload["nested"][0]["message"]
+    assert "alice:password" not in payload["nested"][1]
+    assert sanitize_error(RuntimeError(malformed))["message"]
+
+
+def test_stage_malformed_url_reraises_original_exception(tmp_path: Path) -> None:
+    ledger = started_ledger(tmp_path)
+    original = RuntimeError("http://example.invalid:notaport/path")
+    with pytest.raises(RuntimeError) as caught:
+        with ledger.stage("score"):
+            raise original
+    assert caught.value is original
+    assert ledger.read()[-1].event_type == "stage.failed"
+
+
 @pytest.mark.parametrize(
     "operation", ["mutation", "deletion", "insertion", "reordering"]
 )
@@ -170,6 +202,23 @@ def test_terminal_seal_detects_complete_suffix_deletion(
         ledger.verify()
     with pytest.raises(LedgerError, match="does not match its seal"):
         ledger.reconstruct()
+
+
+def test_terminal_seal_detects_missing_entire_event_stream(tmp_path: Path) -> None:
+    sealed = started_ledger(tmp_path)
+    sealed.append(NewEvent("run.completed", {}))
+    sealed.path.unlink()
+    with pytest.raises(LedgerError, match="does not match its seal"):
+        sealed.read()
+    with pytest.raises(LedgerError, match="does not match its seal"):
+        sealed.reconstruct()
+    with pytest.raises(LedgerError, match="does not match its seal"):
+        sealed.append(NewEvent("run.started", {}))
+
+    new_run = Ledger(tmp_path, "unrelated-new-run")
+    assert new_run.read() == []
+    new_run.append(NewEvent("run.started", {}))
+    assert new_run.read()[0].event_type == "run.started"
 
 
 def test_concurrent_terminal_seals_remain_valid(tmp_path: Path) -> None:
