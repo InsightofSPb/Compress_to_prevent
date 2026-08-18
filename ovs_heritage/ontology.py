@@ -1,0 +1,290 @@
+"""Typed, strictly validated ontology loaded from the single YAML source."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from hashlib import sha256
+import json
+from pathlib import Path
+from typing import Any, Mapping
+
+import yaml
+from yaml import YAMLError
+
+
+IGNORE_INDEX = 255
+DEFAULT_ONTOLOGY = Path(__file__).parent / "configs" / "heritage_vocab.yaml"
+V1_VERSION = "heritage_facades_v1_11classes"
+V2_VERSION = "heritage_facades_v2_12concepts_two_heads"
+V2_CLASS_NAMES = (
+    "background", "crack", "spalling", "delamination", "missing_element",
+    "water_stain", "efflorescence", "corrosion", "ornament_region",
+    "repairs", "text_or_images", "advertisements",
+)
+V1_CLASS_NAMES = V2_CLASS_NAMES[:8] + ("ornament_intact",) + V2_CLASS_NAMES[9:-1]
+VERSION_CLASS_NAMES = {
+    V1_VERSION: V1_CLASS_NAMES,
+    V2_VERSION: V2_CLASS_NAMES,
+}
+REQUIRED_V2_GROUPS = {
+    "STRUCTURAL_DAMAGE": V2_CLASS_NAMES[1:5],
+    "SURFACE_STAIN": V2_CLASS_NAMES[5:8],
+    "HUMAN_ACTIVITY": ("repairs", "text_or_images", "advertisements"),
+    "DAMAGE_MACRO": V2_CLASS_NAMES[1:8],
+}
+
+
+class OntologyError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class OntologyClass:
+    id: int
+    name: str
+    display_name: str
+    description: str
+    prompts: tuple[str, ...]
+    aliases: tuple[str, ...]
+    role: str
+    is_heritage: bool
+    evaluation_groups: tuple[str, ...]
+    color: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class Ontology:
+    version: str
+    ignore_index: int
+    classes: tuple[OntologyClass, ...]
+    groups: Mapping[str, tuple[str, ...]]
+    hash: str
+
+    @property
+    def class_names(self) -> tuple[str, ...]:
+        return tuple(item.name for item in self.classes)
+
+    @property
+    def display_names(self) -> tuple[str, ...]:
+        return tuple(item.display_name for item in self.classes)
+
+    @property
+    def palette(self) -> tuple[tuple[int, int, int], ...]:
+        return tuple(item.color for item in self.classes)
+
+    @property
+    def valid_ids(self) -> frozenset[int]:
+        return frozenset(item.id for item in self.classes)
+
+    def by_name(self, name: str) -> OntologyClass:
+        matches = [item for item in self.classes if item.name == name]
+        if not matches:
+            raise OntologyError(f"unknown canonical class name {name!r} in {self.version}")
+        return matches[0]
+
+    def resolve_name(self, name: str, *, allow_deprecated_alias: bool = False) -> OntologyClass:
+        try:
+            return self.by_name(name)
+        except OntologyError:
+            if allow_deprecated_alias:
+                matches = [item for item in self.classes if name in item.aliases]
+                if len(matches) == 1:
+                    return matches[0]
+            raise OntologyError(
+                f"unknown class name {name!r}; deprecated aliases require explicit resolution"
+            )
+
+
+def _canonical_hash(data: Mapping[str, Any]) -> str:
+    normalized = json.dumps(data, sort_keys=True, ensure_ascii=False,
+                            separators=(",", ":"))
+    return sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _type_error(path: str, expected: str, value: Any) -> OntologyError:
+    return OntologyError(f"{path} must be {expected}, got {value!r} ({type(value).__name__})")
+
+
+def _required_string(mapping: Mapping[str, Any], key: str, path: str) -> str:
+    value = mapping.get(key)
+    field_path = f"{path}.{key}" if path else key
+    if not isinstance(value, str) or not value.strip():
+        raise _type_error(field_path, "a non-empty string", value)
+    return value
+
+
+def _string_list(mapping: Mapping[str, Any], key: str, path: str, *, non_empty: bool) -> tuple[str, ...]:
+    value = mapping.get(key)
+    field_path = f"{path}.{key}"
+    if not isinstance(value, list):
+        raise _type_error(field_path, "a list of strings", value)
+    if non_empty and not value:
+        raise OntologyError(f"{field_path} must be a non-empty list of non-empty strings")
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise _type_error(f"{field_path}[{index}]", "a non-empty string", item)
+    return tuple(value)
+
+
+def _parse_config(data: Mapping[str, Any]) -> tuple[str, int, tuple[OntologyClass, ...], dict[str, tuple[str, ...]]]:
+    """Strict schema boundary: validate raw values before any conversion."""
+    if not isinstance(data, Mapping):
+        raise _type_error("root", "a mapping", data)
+    version = data.get("version")
+    supported = sorted(VERSION_CLASS_NAMES)
+    if not isinstance(version, str) or not version.strip():
+        raise OntologyError(
+            f"version must be a non-empty string, got {version!r} ({type(version).__name__}); "
+            f"supported versions: {supported}"
+        )
+    if version not in VERSION_CLASS_NAMES:
+        raise OntologyError(
+            f"version {version!r} is unsupported; supported versions: {supported}"
+        )
+    ignore = data.get("ignore_index")
+    if type(ignore) is not int:
+        raise _type_error("ignore_index", "an integer", ignore)
+    raw_classes = data.get("classes")
+    if not isinstance(raw_classes, list) or not raw_classes:
+        raise _type_error("classes", "a non-empty list", raw_classes)
+
+    classes = []
+    for index, raw in enumerate(raw_classes):
+        path = f"classes[{index}]"
+        if not isinstance(raw, Mapping):
+            raise _type_error(path, "a mapping", raw)
+        raw_id = raw.get("id")
+        if type(raw_id) is not int:
+            raise _type_error(f"{path}.id", "an integer", raw_id)
+        name = _required_string(raw, "name", path)
+        display_name = _required_string(raw, "display_name", path)
+        description = _required_string(raw, "description", path)
+        role = _required_string(raw, "role", path)
+        is_heritage = raw.get("is_heritage")
+        if type(is_heritage) is not bool:
+            raise _type_error(f"{path}.is_heritage", "a boolean", is_heritage)
+        prompts = _string_list(raw, "prompts", path, non_empty=True)
+        aliases = _string_list(raw, "aliases", path, non_empty=False)
+        evaluation_groups = _string_list(raw, "evaluation_groups", path, non_empty=False)
+        color = raw.get("color")
+        if not isinstance(color, list) or len(color) != 3:
+            raise _type_error(f"{path}.color", "a list of exactly three integers", color)
+        for component_index, component in enumerate(color):
+            if type(component) is not int or not 0 <= component <= 255:
+                raise _type_error(f"{path}.color[{component_index}]", "an integer in 0..255", component)
+        classes.append(OntologyClass(raw_id, name, display_name, description, prompts, aliases,
+                                     role, is_heritage, evaluation_groups, tuple(color)))
+
+    raw_groups = data.get("groups")
+    if not isinstance(raw_groups, Mapping):
+        raise _type_error("evaluation_groups", "a mapping", raw_groups)
+    groups = {}
+    for group_name, members in raw_groups.items():
+        if not isinstance(group_name, str) or not group_name.strip():
+            raise _type_error("evaluation_groups.<key>", "a non-empty string", group_name)
+        group_path = f"evaluation_groups.{group_name}"
+        if not isinstance(members, list):
+            raise _type_error(group_path, "a list of strings", members)
+        for member_index, member in enumerate(members):
+            if not isinstance(member, str) or not member.strip():
+                raise _type_error(f"{group_path}[{member_index}]", "a non-empty string", member)
+        groups[group_name] = tuple(members)
+    return version, ignore, tuple(classes), groups
+
+
+def ontology_from_mapping(data: Mapping[str, Any]) -> Ontology:
+    version, ignore, classes, groups = _parse_config(data)
+    ids, names = [c.id for c in classes], [c.name for c in classes]
+    if len(ids) != len(set(ids)):
+        raise OntologyError("duplicate numeric class IDs")
+    if len(names) != len(set(names)):
+        raise OntologyError("duplicate canonical class names")
+    if ignore in ids:
+        raise OntologyError(f"ignore_index {ignore} must not be a class")
+    aliases = [a.casefold() for c in classes for a in c.aliases]
+    reserved = {n.casefold() for n in names}
+    if len(aliases) != len(set(aliases)) or reserved.intersection(aliases):
+        raise OntologyError("duplicate/conflicting aliases")
+    colors = [c.color for c in classes]
+    if len(colors) != len(set(colors)):
+        raise OntologyError("palette colors must be unique")
+    expected_names = VERSION_CLASS_NAMES[version]
+    if ignore != IGNORE_INDEX:
+        raise OntologyError(f"{version} requires ignore_index=255, got {ignore}")
+    if ids != list(range(len(expected_names))):
+        raise OntologyError(f"{version} requires ordered IDs 0..{len(expected_names) - 1}, got {ids}")
+    if tuple(names) != expected_names:
+        raise OntologyError(f"{version} requires canonical class order {list(expected_names)}, got {names}")
+    if len(colors) != len(expected_names):
+        raise OntologyError(f"{version} requires exactly {len(expected_names)} palette entries")
+    known = set(names)
+    for group, members in groups.items():
+        unknown = set(members) - known
+        if unknown:
+            raise OntologyError(f"group {group} references unknown classes: {sorted(unknown)}")
+    for c in classes:
+        unknown_groups = set(c.evaluation_groups) - set(groups)
+        if unknown_groups:
+            raise OntologyError(f"class {c.name} references unknown groups: {sorted(unknown_groups)}")
+        for group in c.evaluation_groups:
+            if c.name not in groups[group]:
+                raise OntologyError(f"inconsistent membership for {c.name} in {group}")
+    class_groups = {c.name: set(c.evaluation_groups) for c in classes}
+    for group, members in groups.items():
+        for member in members:
+            if group not in class_groups[member]:
+                raise OntologyError(
+                    f"inconsistent membership: top-level group {group} contains {member}, "
+                    f"but {member}.evaluation_groups omits {group}"
+                )
+    if version == V2_VERSION:
+        for group, required_members in REQUIRED_V2_GROUPS.items():
+            actual = groups.get(group)
+            if actual is None:
+                raise OntologyError(f"{version} requires evaluation group {group}")
+            if tuple(actual) != tuple(required_members):
+                raise OntologyError(f"{group} must be {list(required_members)}, got {list(actual)}")
+        ornament = groups.get("ORNAMENT")
+        if ornament != ("ornament_region",):
+            raise OntologyError("ORNAMENT must contain exactly ['ornament_region']")
+    return Ontology(version, ignore, tuple(classes), groups, _canonical_hash(data))
+
+
+def load_ontology(path: str | Path = DEFAULT_ONTOLOGY) -> Ontology:
+    path = Path(path)
+    try:
+        with path.open(encoding="utf-8") as stream:
+            data = yaml.safe_load(stream)
+    except YAMLError as exc:
+        raise OntologyError(f"{path}: malformed YAML: {exc}") from exc
+    return ontology_from_mapping(data)
+
+
+def validate_mask_ids(values: Any, ontology: Ontology, source: str = "mask") -> set[int]:
+    found = extract_mask_ids(values, source)
+    unknown = found - ontology.valid_ids - {ontology.ignore_index}
+    if unknown:
+        raise OntologyError(f"{source}: unknown mask IDs {sorted(unknown)}; allowed IDs are "
+                            f"{sorted(ontology.valid_ids)} plus ignore {ontology.ignore_index}")
+    return found
+
+
+def extract_mask_ids(values: Any, source: str = "mask") -> set[int]:
+    """Extract IDs only after proving that a mask has a non-boolean integer dtype."""
+    import numpy as np
+    array = np.asarray(values)
+    found_values = _display_unique_values(array)
+    if array.dtype == np.bool_ or not np.issubdtype(array.dtype, np.integer):
+        raise OntologyError(
+            f"{source}: mask dtype must be an integer dtype, got {array.dtype}; "
+            f"found IDs {found_values}"
+        )
+    return set(np.unique(array).tolist())
+
+
+def _display_unique_values(array: Any) -> list[Any]:
+    """Return JSON/error-friendly unique values without coercing their type."""
+    import numpy as np
+    try:
+        return np.unique(array).tolist()
+    except (TypeError, ValueError):
+        return list(dict.fromkeys(repr(value) for value in np.asarray(array).flat))

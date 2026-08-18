@@ -1,0 +1,305 @@
+{
+  "version": "heritage_facades_v2_12concepts_two_heads",
+  "ignore_index": 255,
+  "groups": {
+    "STRUCTURAL_DAMAGE": [
+      "crack",
+      "spalling",
+      "delamination",
+      "missing_element"
+    ],
+    "SURFACE_STAIN": [
+      "water_stain",
+      "efflorescence",
+      "corrosion"
+    ],
+    "HUMAN_ACTIVITY": [
+      "repairs",
+      "text_or_images",
+      "advertisements"
+    ],
+    "DAMAGE_MACRO": [
+      "crack",
+      "spalling",
+      "delamination",
+      "missing_element",
+      "water_stain",
+      "efflorescence",
+      "corrosion"
+    ],
+    "ORNAMENT": [
+      "ornament_region"
+    ]
+  },
+  "classes": [
+    {
+      "id": 0,
+      "name": "background",
+      "display_name": "BACKGROUND",
+      "description": "background area of a facade",
+      "prompts": [
+        "a building facade background"
+      ],
+      "aliases": [],
+      "role": "background",
+      "is_heritage": true,
+      "evaluation_groups": [],
+      "color": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": 1,
+      "name": "crack",
+      "display_name": "CRACK",
+      "description": "a visible crack in facade material",
+      "prompts": [
+        "a crack in a building facade",
+        "cracked masonry on a facade"
+      ],
+      "aliases": [
+        "fissure"
+      ],
+      "role": "damage",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "STRUCTURAL_DAMAGE",
+        "DAMAGE_MACRO"
+      ],
+      "color": [
+        229,
+        57,
+        53
+      ]
+    },
+    {
+      "id": 2,
+      "name": "spalling",
+      "display_name": "SPALLING",
+      "description": "loss or flaking of facade surface",
+      "prompts": [
+        "spalling concrete on a facade",
+        "flaking masonry surface"
+      ],
+      "aliases": [],
+      "role": "damage",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "STRUCTURAL_DAMAGE",
+        "DAMAGE_MACRO"
+      ],
+      "color": [
+        30,
+        136,
+        229
+      ]
+    },
+    {
+      "id": 3,
+      "name": "delamination",
+      "display_name": "DELAMINATION",
+      "description": "separation of facade material layers",
+      "prompts": [
+        "delamination on a building facade",
+        "separated facade material layers"
+      ],
+      "aliases": [],
+      "role": "damage",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "STRUCTURAL_DAMAGE",
+        "DAMAGE_MACRO"
+      ],
+      "color": [
+        67,
+        160,
+        71
+      ]
+    },
+    {
+      "id": 4,
+      "name": "missing_element",
+      "display_name": "MISSING_ELEMENT",
+      "description": "a missing architectural element",
+      "prompts": [
+        "a missing element on a building facade",
+        "a lost architectural facade component"
+      ],
+      "aliases": [],
+      "role": "damage",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "STRUCTURAL_DAMAGE",
+        "DAMAGE_MACRO"
+      ],
+      "color": [
+        251,
+        140,
+        0
+      ]
+    },
+    {
+      "id": 5,
+      "name": "water_stain",
+      "display_name": "WATER_STAIN",
+      "description": "staining caused by water",
+      "prompts": [
+        "a water stain on a building facade",
+        "water discoloration on masonry"
+      ],
+      "aliases": [],
+      "role": "damage",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "SURFACE_STAIN",
+        "DAMAGE_MACRO"
+      ],
+      "color": [
+        142,
+        36,
+        170
+      ]
+    },
+    {
+      "id": 6,
+      "name": "efflorescence",
+      "display_name": "EFFLORESCENCE",
+      "description": "salt deposits on a facade",
+      "prompts": [
+        "efflorescence on masonry",
+        "white salt deposits on a facade"
+      ],
+      "aliases": [],
+      "role": "damage",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "SURFACE_STAIN",
+        "DAMAGE_MACRO"
+      ],
+      "color": [
+        253,
+        216,
+        53
+      ]
+    },
+    {
+      "id": 7,
+      "name": "corrosion",
+      "display_name": "CORROSION",
+      "description": "visible corrosion on facade material",
+      "prompts": [
+        "corrosion on a building facade",
+        "rust corrosion on facade metal"
+      ],
+      "aliases": [
+        "rust"
+      ],
+      "role": "damage",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "SURFACE_STAIN",
+        "DAMAGE_MACRO"
+      ],
+      "color": [
+        0,
+        172,
+        193
+      ]
+    },
+    {
+      "id": 8,
+      "name": "ornament_region",
+      "display_name": "ORNAMENT_REGION",
+      "description": "visible ornamental or decorative facade geometry, independently of damage or surface condition",
+      "prompts": [
+        "visible ornamental geometry on a historic facade",
+        "a decorative architectural region on a building facade"
+      ],
+      "aliases": [
+        "ornament_intact"
+      ],
+      "role": "heritage",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "ORNAMENT"
+      ],
+      "color": [
+        158,
+        158,
+        158
+      ]
+    },
+    {
+      "id": 9,
+      "name": "repairs",
+      "display_name": "REPAIRS",
+      "description": "visible repair work or patching",
+      "prompts": [
+        "a repaired area on a building facade",
+        "patch repair on facade material"
+      ],
+      "aliases": [],
+      "role": "human_activity",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "HUMAN_ACTIVITY"
+      ],
+      "color": [
+        78,
+        158,
+        158
+      ]
+    },
+    {
+      "id": 10,
+      "name": "text_or_images",
+      "display_name": "TEXT_OR_IMAGES",
+      "description": "non-commercial writing, graffiti, imagery, or visual content",
+      "prompts": [
+        "non-commercial writing on a building facade",
+        "graffiti or an image on a facade",
+        "non-commercial visual content on a building"
+      ],
+      "aliases": [
+        "graffiti"
+      ],
+      "role": "human_activity",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "HUMAN_ACTIVITY"
+      ],
+      "color": [
+        142,
+        126,
+        71
+      ]
+    },
+    {
+      "id": 11,
+      "name": "advertisements",
+      "display_name": "ADVERTISEMENTS",
+      "description": "commercial advertising attached to or displayed on a facade",
+      "prompts": [
+        "an advertisement attached to a building facade",
+        "a commercial advertising sign or banner on a facade",
+        "an advertising poster or billboard on a building"
+      ],
+      "aliases": [
+        "advertising sign",
+        "commercial banner"
+      ],
+      "role": "human_activity",
+      "is_heritage": true,
+      "evaluation_groups": [
+        "HUMAN_ACTIVITY"
+      ],
+      "color": [
+        216,
+        27,
+        96
+      ]
+    }
+  ]
+}
