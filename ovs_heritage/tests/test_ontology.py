@@ -142,6 +142,9 @@ def test_v1_is_exactly_zero_through_ten():
     data = config()
     data["version"] = "heritage_facades_v1_11classes"
     data["classes"] = data["classes"][:11]
+    data["classes"][8]["name"] = "ornament_intact"
+    data["classes"][8]["aliases"] = []
+    data["groups"]["ORNAMENT"] = ["ornament_intact"]
     data["groups"]["HUMAN_ACTIVITY"].remove("advertisements")
     v1 = ontology_from_mapping(data)
     assert v1.class_names[-1] == "text_or_images"

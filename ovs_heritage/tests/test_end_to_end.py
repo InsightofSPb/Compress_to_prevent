@@ -9,12 +9,12 @@ from ovs_heritage.losses import combined_two_head_loss
 from ovs_heritage.metadata import make_metadata
 from ovs_heritage.ontology import load_ontology
 from ovs_heritage.projection import OntologyProjection
-from ovs_heritage.validate_dataset import validate_splits
+from ovs_heritage.validate_dataset import V2_DATASET_SCHEMA, validate_splits
 
 
 def test_cpu_two_map_p0_flow(tmp_path):
     ontology = load_ontology()
-    projection = OntologyProjection.canonical_v2()
+    projection = OntologyProjection.from_ontology(ontology)
     main_path = tmp_path / "main.png"
     ornament_path = tmp_path / "ornament.png"
     Image.fromarray(np.array([[7, 5, 11, 255]], dtype=np.uint8)).save(main_path)
@@ -25,7 +25,10 @@ def test_cpu_two_map_p0_flow(tmp_path):
         writer.writeheader()
         writer.writerow({"main_mask_path": main_path.name, "ornament_mask_path": ornament_path.name,
                          "facade_id": "facade_1"})
-    report = validate_splits({"test": manifest}, ontology)
+    report = validate_splits(
+        {"test": manifest}, ontology,
+        schema_version=V2_DATASET_SCHEMA, ontology_version=ontology.version,
+    )
     assert report["valid"]
 
     y_main = torch.tensor([[[7, 5, 11, 255]]])

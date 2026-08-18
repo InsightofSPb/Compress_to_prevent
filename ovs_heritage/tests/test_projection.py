@@ -1,11 +1,12 @@
 import pytest
 import torch
 
+from ovs_heritage.ontology import load_ontology
 from ovs_heritage.projection import MAIN_SEMANTIC_IDS, MappingEntry, OntologyProjection
 
 
 def test_exact_two_head_mapping_and_round_trip():
-    projection = OntologyProjection.canonical_v2()
+    projection = OntologyProjection.from_ontology(load_ontology())
     assert projection.main_channel_count == 11
     assert projection.for_semantic_id(8).output_head == "ornament"
     assert projection.for_semantic_id(8).channel_index == 0
@@ -19,7 +20,7 @@ def test_exact_two_head_mapping_and_round_trip():
 
 
 def test_projection_rejects_ornament_and_unknown_in_main():
-    projection = OntologyProjection.canonical_v2()
+    projection = OntologyProjection.from_ontology(load_ontology())
     with pytest.raises(ValueError, match="semantic ID 8"):
         projection.semantic_main_to_channels(torch.tensor([[[8]]]))
     with pytest.raises(ValueError, match="99"):
@@ -33,3 +34,20 @@ def test_duplicate_head_channel_is_ambiguous():
     )
     with pytest.raises(ValueError, match="duplicate channel"):
         OntologyProjection(entries)
+
+
+def test_projection_rejects_ontology_name_drift_and_invalid_predictions():
+    from dataclasses import replace
+
+    ontology = load_ontology()
+    changed_classes = tuple(
+        replace(item, name="ornament_changed") if item.id == 8 else item
+        for item in ontology.classes
+    )
+    with pytest.raises(ValueError, match="ornament_region"):
+        OntologyProjection.from_ontology(replace(ontology, classes=changed_classes))
+    projection = OntologyProjection.from_ontology(ontology)
+    with pytest.raises(ValueError, match="non-finite"):
+        projection.main_logits_to_semantic(torch.full((1, 11, 1, 1), float("nan")))
+    with pytest.raises(ValueError, match="threshold"):
+        projection.ornament_logits_to_binary(torch.zeros(1, 1, 1, 1), threshold=float("nan"))

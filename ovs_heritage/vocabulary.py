@@ -4,12 +4,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 import json
-from typing import Callable, Iterable
+from types import MappingProxyType
+from typing import Callable, Iterable, Mapping
 
 import torch
 import torch.nn.functional as F
 
 from .ontology import Ontology
+
+
+def _freeze_settings(value):
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_settings(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_settings(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -27,7 +36,10 @@ class PrototypeSet:
     semantic_ids: tuple[int | None, ...]
     vocabulary_specification_hash: str
     ontology_hash: str | None
-    prompt_settings: dict[str, object]
+    prompt_settings: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "prompt_settings", _freeze_settings(dict(self.prompt_settings)))
 
     @property
     def vocabulary_hash(self) -> str:

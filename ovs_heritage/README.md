@@ -79,6 +79,14 @@ Reports distinguish manifest rows, valid and failed samples, main and ornament
 mask counts, and source counts; they do not call unchecked rows “images”.
 Unknown IDs are excluded from valid statistics.
 
+Validation also requires explicit `schema_version` and `ontology_version`
+declarations, either at the dataset-config level or through the corresponding
+CLI options. V2 uses `heritage_two_map_v2`; legacy v1 uses
+`heritage_single_mask_v1`. Missing, unknown, conflicting, or ontology-mismatched
+declarations are errors and never trigger schema inference. Per-split reports
+separate manifest rows, valid/failed sample rows, and inventory-level split
+errors; error-message count is not used as a sample count.
+
 Reports include the component/schema versions, ontology version/hash, complete
 projection, split fingerprints, overlaps, duplicated paths, warnings/errors,
 and a deterministic neutral metadata record. Hashed payloads contain no current
@@ -88,6 +96,8 @@ no competing registry or provenance JSONL is introduced.
 ```bash
 python -m ovs_heritage.validate_dataset \
   --ontology ovs_heritage/configs/heritage_vocab.yaml \
+  --schema-version heritage_two_map_v2 \
+  --ontology-version heritage_facades_v2_12concepts_two_heads \
   --train train.csv --val val.csv --test test.csv \
   --output validation-report.json --strict
 ```

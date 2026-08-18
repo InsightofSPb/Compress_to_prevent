@@ -3,13 +3,14 @@ import torch.nn.functional as F
 import pytest
 
 from ovs_heritage.losses import combined_two_head_loss, main_segmentation_loss, ornament_region_loss
+from ovs_heritage.ontology import load_ontology
 from ovs_heritage.projection import OntologyProjection
 
 
 def test_main_loss_maps_semantic_ids_and_uses_raw_logits():
     logits = torch.randn(1, 11, 1, 2, requires_grad=True)
     semantic = torch.tensor([[[9, 255]]])
-    channels = OntologyProjection.canonical_v2().semantic_main_to_channels(semantic)
+    channels = OntologyProjection.from_ontology(load_ontology()).semantic_main_to_channels(semantic)
     got = main_segmentation_loss(logits, semantic)
     assert torch.allclose(got, F.cross_entropy(logits, channels, ignore_index=255))
 
@@ -44,7 +45,7 @@ def test_combined_loss_settings_and_overlap_targets():
         combined_two_head_loss(main, ornament, y_main, y_ornament, lambda_ornament=-1)
 
 
-def test_probability_like_main_input_is_rejected():
-    probabilities = torch.softmax(torch.randn(1, 11, 2, 2), dim=1)
-    with pytest.raises(ValueError, match="normalized probabilities"):
-        main_segmentation_loss(probabilities, torch.zeros(1, 2, 2, dtype=torch.long))
+def test_probability_simplex_values_are_not_used_to_guess_provenance():
+    simplex_values = torch.softmax(torch.randn(1, 11, 2, 2), dim=1)
+    loss = main_segmentation_loss(simplex_values, torch.zeros(1, 2, 2, dtype=torch.long))
+    assert torch.isfinite(loss)

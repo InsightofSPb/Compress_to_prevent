@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn.functional as F
 
+from .ontology import load_ontology
 from .projection import OntologyProjection
 
 
@@ -18,25 +19,21 @@ class CombinedLoss:
     metadata: dict[str, float | None]
 
 
-def _validate_raw_logits(logits: torch.Tensor, label: str, *, detect_softmax: bool = False) -> None:
+def _validate_raw_logits(logits: torch.Tensor, label: str) -> None:
     if not logits.is_floating_point():
         raise ValueError(f"{label} must be floating-point raw logits")
     if torch.isfinite(logits).logical_not().any():
         raise ValueError(f"{label} contain non-finite values")
-    if detect_softmax and logits.numel() and logits.min() >= 0 and logits.max() <= 1:
-        sums = logits.sum(dim=1)
-        if torch.allclose(sums, torch.ones_like(sums), atol=1e-5):
-            raise ValueError(f"{label} appear to be normalized probabilities; raw logits are required")
 
 
 def main_segmentation_loss(
     main_logits: torch.Tensor, y_main: torch.Tensor,
     projection: OntologyProjection | None = None,
 ) -> torch.Tensor:
-    projection = projection or OntologyProjection.canonical_v2()
+    projection = projection or OntologyProjection.from_ontology(load_ontology())
     if main_logits.ndim != 4 or main_logits.shape[1] != projection.main_channel_count:
         raise ValueError(f"main_logits must be [N,{projection.main_channel_count},H,W]")
-    _validate_raw_logits(main_logits, "main_logits", detect_softmax=True)
+    _validate_raw_logits(main_logits, "main_logits")
     if y_main.ndim == 4 and y_main.shape[1] == 1:
         y_main = y_main[:, 0]
     if y_main.ndim != 3 or main_logits.shape[0] != y_main.shape[0] or main_logits.shape[2:] != y_main.shape[1:]:

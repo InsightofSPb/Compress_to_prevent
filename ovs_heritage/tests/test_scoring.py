@@ -27,3 +27,17 @@ def test_dimension_and_shape_errors():
         RawCosineScorer()(torch.randn(1, 3, 2, 2), torch.randn(2, 4))
     with pytest.raises(ValueError, match="prototypes"):
         RawCosineScorer()(torch.randn(3, 2, 2), torch.randn(3))
+
+
+def test_scorer_rejects_non_floating_nonfinite_zero_norm_and_bad_eps():
+    with pytest.raises(ValueError, match="eps"):
+        RawCosineScorer(eps=0)
+    scorer = RawCosineScorer()
+    with pytest.raises(ValueError, match="floating-point"):
+        scorer(torch.ones(1, 3, 2, 2, dtype=torch.int64), torch.ones(2, 3))
+    with pytest.raises(ValueError, match="finite"):
+        scorer(torch.full((1, 3, 2, 2), float("nan")), torch.ones(2, 3))
+    with pytest.raises(ValueError, match="non-zero"):
+        scorer(torch.ones(1, 3, 2, 2), torch.zeros(2, 3))
+    with pytest.raises(ValueError, match="scale must be finite"):
+        scorer(torch.ones(1, 3, 2, 2), torch.ones(2, 3), scale=float("inf"))

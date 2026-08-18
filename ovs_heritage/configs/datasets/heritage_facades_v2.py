@@ -4,9 +4,10 @@ from ovs_heritage.ontology import load_ontology
 from ovs_heritage.projection import OntologyProjection
 
 _ONTOLOGY = load_ontology()
-_PROJECTION = OntologyProjection.canonical_v2()
+_PROJECTION = OntologyProjection.from_ontology(_ONTOLOGY)
 ONTOLOGY_VERSION = _ONTOLOGY.version
 ONTOLOGY_HASH = _ONTOLOGY.hash
+DATASET_SCHEMA_VERSION = "heritage_two_map_v2"
 SEMANTIC_CONCEPTS = _ONTOLOGY.display_names
 PALETTE = _ONTOLOGY.palette
 MAIN_SEMANTIC_IDS = tuple(entry.semantic_id for entry in _PROJECTION.main_entries)

@@ -1,12 +1,17 @@
 """Raw cosine dense scorer; intentionally contains no softmax or vocabulary state."""
 from __future__ import annotations
+import math
+
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
+
 
 class RawCosineScorer(nn.Module):
     def __init__(self, scale: float = 100.0, eps: float = 1e-12):
         super().__init__()
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError("eps must be finite and positive")
         self.scale = float(scale)
         self.eps = eps
 
@@ -17,6 +22,12 @@ class RawCosineScorer(nn.Module):
             raise ValueError("features must be [D,H,W] or [N,D,H,W]")
         if prototypes.ndim != 2:
             raise ValueError("prototypes must be [C,D]")
+        if not features.is_floating_point() or not prototypes.is_floating_point():
+            raise ValueError("features and prototypes must be floating-point tensors")
+        if not torch.isfinite(features).all() or not torch.isfinite(prototypes).all():
+            raise ValueError("features and prototypes must be finite")
+        if torch.any(torch.linalg.vector_norm(prototypes, dim=1) <= self.eps):
+            raise ValueError("prototypes must have finite non-zero norms")
         unbatched = features.ndim == 3
         if unbatched:
             features = features.unsqueeze(0)
@@ -31,6 +42,8 @@ class RawCosineScorer(nn.Module):
         for value, label in ((scale, "scale"), (bias, "bias")):
             if value.ndim > 1 or (value.ndim == 1 and value.numel() not in (1, prototypes.shape[0])):
                 raise ValueError(f"{label} must be scalar or have one value per class")
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{label} must be finite")
         if scale.ndim:
             scale = scale.view(1, -1, 1, 1)
         if bias.ndim:

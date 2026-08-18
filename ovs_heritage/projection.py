@@ -2,17 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Iterable
+import math
 
 import torch
 
+from .ontology import Ontology, V2_VERSION
+
+
 IGNORE_INDEX = 255
 MAIN_SEMANTIC_IDS = (0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11)
-MAIN_NAMES = (
-    "background", "crack", "spalling", "delamination", "missing_element",
-    "water_stain", "efflorescence", "corrosion", "repairs",
-    "text_or_images", "advertisements",
-)
 
 
 @dataclass(frozen=True)
@@ -32,13 +30,28 @@ class OntologyProjection:
     ignore_index: int = IGNORE_INDEX
 
     @classmethod
-    def canonical_v2(cls) -> "OntologyProjection":
+    def from_ontology(cls, ontology: Ontology) -> "OntologyProjection":
+        if ontology.version != V2_VERSION:
+            raise ValueError(f"canonical two-head projection requires {V2_VERSION}")
+        if ontology.by_name("ornament_region").id != 8:
+            raise ValueError("semantic ID 8 must be exactly ornament_region")
+        if tuple(sorted(ontology.valid_ids)) != tuple(range(12)):
+            raise ValueError("v2 projection requires semantic IDs 0..11")
         main = tuple(
-            MappingEntry(semantic_id, name, "main", channel, "multiclass_softmax")
-            for channel, (semantic_id, name) in enumerate(zip(MAIN_SEMANTIC_IDS, MAIN_NAMES))
+            MappingEntry(
+                semantic_id,
+                ontology.by_name(next(item.name for item in ontology.classes if item.id == semantic_id)).name,
+                "main",
+                channel,
+                "multiclass_softmax",
+            )
+            for channel, semantic_id in enumerate(MAIN_SEMANTIC_IDS)
         )
-        ornament = MappingEntry(8, "ornament_region", "ornament", 0, "independent_sigmoid")
-        return cls(main + (ornament,))
+        ornament = MappingEntry(8, ontology.by_name("ornament_region").name, "ornament", 0, "independent_sigmoid")
+        projection = cls(main + (ornament,))
+        if tuple(entry.channel_index for entry in projection.main_entries) != tuple(range(11)):
+            raise ValueError("main channel indices must be contiguous 0..10")
+        return projection
 
     def __post_init__(self) -> None:
         semantic_ids = [entry.semantic_id for entry in self.entries]
@@ -97,15 +110,19 @@ class OntologyProjection:
         return result
 
     def main_logits_to_semantic(self, logits: torch.Tensor) -> torch.Tensor:
-        if logits.ndim != 4 or logits.shape[1] != self.main_channel_count:
-            raise ValueError(f"main logits must be [N,{self.main_channel_count},H,W]")
+        if logits.ndim != 4 or logits.shape[1] != self.main_channel_count or not logits.is_floating_point():
+            raise ValueError(f"main logits must be finite floating [N,{self.main_channel_count},H,W]")
+        if not torch.isfinite(logits).all():
+            raise ValueError("main logits contain non-finite values")
         return self.main_channels_to_semantic(logits.argmax(dim=1))
 
     def ornament_logits_to_binary(self, logits: torch.Tensor, *, threshold: float = 0.5) -> torch.Tensor:
         if logits.ndim != 4 or logits.shape[1] != 1 or not logits.is_floating_point():
             raise ValueError("ornament logits must be floating [N,1,H,W] raw logits")
-        if not 0 <= threshold <= 1:
+        if not math.isfinite(threshold) or not 0 <= threshold <= 1:
             raise ValueError("ornament threshold must be in 0..1")
+        if not torch.isfinite(logits).all():
+            raise ValueError("ornament logits contain non-finite values")
         return (torch.sigmoid(logits) >= threshold).to(torch.uint8)
 
     def as_dict(self) -> dict[str, object]:
@@ -121,7 +138,3 @@ class OntologyProjection:
             raise ValueError(f"{label} must have an integer dtype, got {target.dtype}")
         if target.ndim not in (2, 3, 4):
             raise ValueError(f"{label} must be a spatial target tensor, got shape {tuple(target.shape)}")
-
-
-def mapping_semantic_ids(entries: Iterable[MappingEntry]) -> tuple[int, ...]:
-    return tuple(entry.semantic_id for entry in entries)

@@ -29,3 +29,12 @@ def test_prompt_settings_change_specification_hash_without_persistent_state():
     assert plain.vocabulary_specification_hash != aliases.vocabulary_specification_hash
     assert plain.prompt_settings["include_alias_prompts"] is False
     assert RawCosineScorer().state_dict() == {}
+
+
+def test_prompt_settings_are_defensively_copied():
+    classes = (RuntimeClass("one", ("first",), semantic_id=None),)
+    result = build_prototypes(classes, encoder)
+    settings = result.prompt_settings
+    import pytest
+    with pytest.raises(TypeError):
+        settings["method"] = "changed"

@@ -21,6 +21,8 @@ from .projection import MAIN_SEMANTIC_IDS, OntologyProjection
 COMPONENT_NAME = "ovs_heritage.dataset_validator"
 COMPONENT_VERSION = "0.2.0"
 VALIDATOR_SCHEMA_VERSION = "heritage-target-validation-v2"
+V1_DATASET_SCHEMA = "heritage_single_mask_v1"
+V2_DATASET_SCHEMA = "heritage_two_map_v2"
 V1_MASK_COLUMNS = ("mask_path", "seg_map_path", "annotation", "mask", "label_path")
 
 
@@ -58,7 +60,12 @@ def _resolve_path(value: str, manifest: Path) -> Path:
     return path if path.is_absolute() else manifest.parent / path
 
 
-def _inventory(source: Path, ontology: Ontology) -> tuple[list[dict[str, Any]], str, bool]:
+def _inventory(
+    source: Path,
+    ontology: Ontology,
+    schema_version: str,
+    ontology_version: str,
+) -> tuple[list[dict[str, Any]], str, bool]:
     if source.is_dir():
         if ontology.version != V1_VERSION:
             raise ValueError("v2 requires an explicit manifest with main_mask_path and ornament_mask_path")
@@ -67,6 +74,17 @@ def _inventory(source: Path, ontology: Ontology) -> tuple[list[dict[str, Any]], 
         fingerprint = sha256("\n".join(str(path) for path in paths).encode()).hexdigest()
         return rows, fingerprint, False
     rows = _manifest_rows(source)
+    for index, row in enumerate(rows):
+        for field, expected in (
+            ("schema_version", schema_version),
+            ("ontology_version", ontology_version),
+        ):
+            declared = row.get(field)
+            if declared not in (None, "", expected):
+                raise ValueError(
+                    f"{source}: row {index + 1} declares conflicting {field}={declared!r}; "
+                    f"expected {expected!r}"
+                )
     return rows, _file_hash(source), "source_id" in (rows[0] if rows else {})
 
 
@@ -117,14 +135,31 @@ def _validate_v1_row(row: dict[str, Any], index: int, manifest: Path) -> dict[st
     }
 
 
-def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[str, Any]:
-    projection = OntologyProjection.canonical_v2()
+def validate_splits(
+    sources: dict[str, str | Path],
+    ontology: Ontology,
+    *,
+    schema_version: str,
+    ontology_version: str,
+) -> dict[str, Any]:
+    supported_schemas = {V1_DATASET_SCHEMA, V2_DATASET_SCHEMA}
+    if schema_version not in supported_schemas:
+        raise ValueError(f"unsupported dataset schema {schema_version!r}; supported: {sorted(supported_schemas)}")
+    if ontology_version != ontology.version:
+        raise ValueError(
+            f"declared ontology_version {ontology_version!r} does not match loaded {ontology.version!r}"
+        )
+    expected_schema = V2_DATASET_SCHEMA if ontology.version == V2_VERSION else V1_DATASET_SCHEMA
+    if schema_version != expected_schema:
+        raise ValueError(f"ontology {ontology.version} requires dataset schema {expected_schema}")
+    projection = OntologyProjection.from_ontology(ontology) if ontology.version == V2_VERSION else None
     report: dict[str, Any] = {
         "component": {"name": COMPONENT_NAME, "version": COMPONENT_VERSION},
         "validator_schema_version": VALIDATOR_SCHEMA_VERSION,
+        "dataset_schema_version": schema_version,
         "ontology_version": ontology.version,
         "ontology_hash": ontology.hash,
-        "semantic_projection": projection.as_dict() if ontology.version == V2_VERSION else None,
+        "semantic_projection": projection.as_dict() if projection is not None else None,
         "ignore_index": ontology.ignore_index,
         "sources": {name: str(value) for name, value in sources.items()},
         "source_fingerprints": {},
@@ -139,15 +174,20 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
     for split, source_value in sources.items():
         source = Path(source_value)
         valid_samples: list[dict[str, Any]] = []
-        failures = []
+        sample_failures = []
+        split_errors = []
+        inventory_read = False
         try:
-            rows, fingerprint, uses_source_id = _inventory(source, ontology)
+            rows, fingerprint, uses_source_id = _inventory(
+                source, ontology, schema_version, ontology_version,
+            )
+            inventory_read = True
             report["source_fingerprints"][split] = fingerprint
         except Exception as exc:
             rows, uses_source_id = [], False
-            failures.append(str(exc))
-        if not rows:
-            failures.append(f"{source}: split is empty")
+            split_errors.append(str(exc))
+        if inventory_read and not rows:
+            split_errors.append(f"{source}: split is empty")
         for index, row in enumerate(rows):
             try:
                 sample = (
@@ -157,7 +197,7 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
                 )
                 valid_samples.append(sample)
             except Exception as exc:
-                failures.append(str(exc))
+                sample_failures.append(str(exc))
         main_counts: Counter[int] = Counter()
         ornament_counts: Counter[int] = Counter()
         for sample in valid_samples:
@@ -175,17 +215,19 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
         source_ids = {sample["source_id"] for sample in valid_samples if sample["source_id"]}
         if ontology.version == V2_VERSION and main_counts[11] == 0:
             report["warnings"].append(f"{split}: ADVERTISEMENTS (semantic ID 11) is absent")
-        report["errors"].extend(f"{split}: {failure}" for failure in failures)
+        report["errors"].extend(f"{split}: {failure}" for failure in split_errors + sample_failures)
         report["splits"][split] = {
             "manifest_row_count": len(rows),
             "source_count": len(source_ids) if uses_source_id else len(valid_samples),
             "valid_sample_count": len(valid_samples),
-            "failed_sample_count": len(failures),
+            "failed_sample_count": len(sample_failures),
+            "split_error_count": len(split_errors),
             "main_mask_count": len(valid_samples),
             "ornament_mask_count": len(valid_samples) if ontology.version == V2_VERSION else 0,
             "main_pixel_count": {str(key): main_counts[key] for key in sorted(main_counts)},
             "ornament_pixel_count": {str(key): ornament_counts[key] for key in sorted(ornament_counts)},
-            "errors": failures,
+            "sample_errors": sample_failures,
+            "split_errors": split_errors,
         }
     names = list(sources)
     for index, left in enumerate(names):
@@ -205,7 +247,7 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
         component_version=COMPONENT_VERSION,
         ontology_version=ontology.version,
         ontology_hash=ontology.hash,
-        mapping=projection.as_dict() if ontology.version == V2_VERSION else {},
+        mapping=projection.as_dict() if projection is not None else {},
         validator_schema_version=VALIDATOR_SCHEMA_VERSION,
         source_fingerprints=report["source_fingerprints"],
     )
@@ -214,36 +256,61 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
     return report
 
 
-def _dataset_config(path: Path) -> dict[str, str]:
+def _dataset_config(path: Path) -> tuple[dict[str, str], str, str]:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except YAMLError as exc:
         raise ValueError(f"{path}: malformed YAML dataset config: {exc}") from exc
-    splits = data.get("splits", data)
-    return {
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: dataset config must be a mapping")
+    schema_version = data.get("schema_version")
+    ontology_version = data.get("ontology_version")
+    if not isinstance(schema_version, str) or not isinstance(ontology_version, str):
+        raise ValueError(f"{path}: dataset config requires schema_version and ontology_version")
+    splits = data.get("splits", {})
+    sources = {
         ("val" if name == "validation" else name): str(
             (path.parent / value).resolve() if not Path(value).is_absolute() else Path(value)
         )
         for name, value in splits.items()
         if name in {"train", "val", "validation", "test"}
     }
+    return sources, schema_version, ontology_version
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ontology", default=str(DEFAULT_ONTOLOGY))
     parser.add_argument("--dataset-config", type=Path)
+    parser.add_argument("--schema-version")
+    parser.add_argument("--ontology-version")
     for split in ("train", "val", "test"):
         parser.add_argument(f"--{split}")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args(argv)
-    sources = _dataset_config(args.dataset_config) if args.dataset_config else {}
+    if args.dataset_config:
+        sources, schema_version, ontology_version = _dataset_config(args.dataset_config)
+        if args.schema_version and args.schema_version != schema_version:
+            parser.error("--schema-version conflicts with dataset config")
+        if args.ontology_version and args.ontology_version != ontology_version:
+            parser.error("--ontology-version conflicts with dataset config")
+    else:
+        sources = {}
+        schema_version = args.schema_version
+        ontology_version = args.ontology_version
     sources.update({name: getattr(args, name) for name in ("train", "val", "test") if getattr(args, name)})
     if not sources:
         parser.error("provide --dataset-config or at least one split source")
+    if not schema_version or not ontology_version:
+        parser.error("explicit --schema-version and --ontology-version are required")
     try:
-        report = validate_splits(sources, load_ontology(args.ontology))
+        report = validate_splits(
+            sources,
+            load_ontology(args.ontology),
+            schema_version=schema_version,
+            ontology_version=ontology_version,
+        )
     except Exception as exc:
         report = {"valid": False, "errors": [str(exc)], "warnings": [], "sources": sources}
     args.output.parent.mkdir(parents=True, exist_ok=True)
