@@ -236,6 +236,7 @@ def validate_splits(
         source = Path(source_value)
         valid_samples: list[dict[str, Any]] = []
         sample_failures = []
+        failed_row_count = 0
         split_errors = []
         inventory_read = False
         try:
@@ -271,6 +272,7 @@ def validate_splits(
         for index, row in enumerate(rows):
             if index in declaration_errors:
                 sample_failures.extend(declaration_errors[index])
+                failed_row_count += 1
                 continue
             try:
                 sample = (
@@ -281,6 +283,7 @@ def validate_splits(
                 valid_samples.append(sample)
             except Exception as exc:
                 sample_failures.append(str(exc))
+                failed_row_count += 1
         main_counts: Counter[int] = Counter()
         ornament_counts: Counter[int] = Counter()
         for sample in valid_samples:
@@ -302,7 +305,7 @@ def validate_splits(
             "manifest_row_count": len(rows),
             "source_count": len(source_ids) if uses_source_id else len(valid_samples),
             "valid_sample_count": len(valid_samples),
-            "failed_sample_count": len(sample_failures),
+            "failed_sample_count": failed_row_count,
             "split_error_count": len(split_errors),
             "main_mask_count": len(valid_samples),
             "ornament_mask_count": len(valid_samples) if ontology.version == V2_VERSION else 0,

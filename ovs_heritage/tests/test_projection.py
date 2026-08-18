@@ -29,8 +29,8 @@ def test_projection_rejects_ornament_and_unknown_in_main():
 
 def test_duplicate_head_channel_is_ambiguous():
     entries = (
-        MappingEntry(0, "a", "main", 0, "multiclass_softmax"),
-        MappingEntry(1, "b", "main", 0, "multiclass_softmax"),
+        MappingEntry(0, "background", "main", 0, "multiclass_softmax"),
+        MappingEntry(1, "crack", "main", 0, "multiclass_softmax"),
     )
     with pytest.raises(ValueError, match="duplicate channel"):
         OntologyProjection(entries)
@@ -85,6 +85,17 @@ def test_projection_validates_public_constructor_contract():
         OntologyProjection(tuple(wrong_name))
     with pytest.raises(ValueError, match="MappingEntry"):
         OntologyProjection(canonical[:-1] + ({"semantic_id": 8},))
+    false_policy = list(canonical)
+    false_policy[0] = MappingEntry(
+        0,
+        "background",
+        "main",
+        0,
+        "multiclass_softmax",
+        ignore_behavior="ignore values may be rewritten",
+    )
+    with pytest.raises(ValueError, match="canonical ignore policy"):
+        OntologyProjection(tuple(false_policy))
 
 
 def test_projection_rejects_multichannel_spatial_targets():

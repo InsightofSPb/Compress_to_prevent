@@ -11,6 +11,8 @@ from .ontology import Ontology, V2_CLASS_NAMES, V2_VERSION
 
 IGNORE_INDEX = 255
 MAIN_SEMANTIC_IDS = (0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11)
+IGNORE_BEHAVIOR = "ignore value 255 is preserved and excluded from loss"
+UNKNOWN_BEHAVIOR = "unknown IDs raise an error and are never remapped to ignore"
 
 
 @dataclass(frozen=True)
@@ -20,8 +22,8 @@ class MappingEntry:
     output_head: str
     channel_index: int
     interpretation: str
-    ignore_behavior: str = "255 is preserved and excluded from loss"
-    unknown_behavior: str = "raise an error; never remap to ignore"
+    ignore_behavior: str = IGNORE_BEHAVIOR
+    unknown_behavior: str = UNKNOWN_BEHAVIOR
 
 
 @dataclass(frozen=True)
@@ -82,10 +84,14 @@ class OntologyProjection:
                 raise ValueError(f"entries[{index}] has inconsistent output interpretation")
             if type(entry.channel_index) is not int or entry.channel_index < 0:
                 raise ValueError(f"entries[{index}].channel_index must be a non-negative integer")
-            if not isinstance(entry.ignore_behavior, str) or not entry.ignore_behavior.strip():
-                raise ValueError(f"entries[{index}].ignore_behavior must be non-empty")
-            if not isinstance(entry.unknown_behavior, str) or not entry.unknown_behavior.strip():
-                raise ValueError(f"entries[{index}].unknown_behavior must be non-empty")
+            if entry.ignore_behavior != IGNORE_BEHAVIOR:
+                raise ValueError(
+                    f"entries[{index}].ignore_behavior must be the canonical ignore policy"
+                )
+            if entry.unknown_behavior != UNKNOWN_BEHAVIOR:
+                raise ValueError(
+                    f"entries[{index}].unknown_behavior must be the canonical unknown-ID policy"
+                )
         semantic_ids = [entry.semantic_id for entry in self.entries]
         if len(semantic_ids) != len(set(semantic_ids)):
             raise ValueError("projection has duplicate semantic IDs")

@@ -225,6 +225,30 @@ def test_empty_and_unreadable_manifests_are_split_errors(tmp_path):
     assert unreadable["split_error_count"] == 1
 
 
+def test_two_declaration_errors_count_as_one_failed_row(tmp_path):
+    main_mask = tmp_path / "declaration_main.png"
+    ornament_mask = tmp_path / "declaration_ornament.png"
+    save(main_mask, [[0]])
+    save(ornament_mask, [[0]])
+    manifest = tmp_path / "two_conflicts.json"
+    manifest.write_text(json.dumps([{
+        "main_mask_path": main_mask.name,
+        "ornament_mask_path": ornament_mask.name,
+        "facade_id": "facade",
+        "schema_version": "wrong_schema",
+        "ontology_version": "wrong_ontology",
+    }]))
+    split = validate_v2({"test": manifest})["splits"]["test"]
+    assert split["manifest_row_count"] == 1
+    assert split["valid_sample_count"] == 0
+    assert split["failed_sample_count"] == 1
+    assert split["split_error_count"] == 0
+    assert len(split["sample_errors"]) == 2
+    assert "conflicting schema_version" in split["sample_errors"][0]
+    assert "conflicting ontology_version" in split["sample_errors"][1]
+    assert split["valid_sample_count"] + split["failed_sample_count"] == 1
+
+
 def test_multiple_invalid_rows_count_as_failed_samples(tmp_path):
     ornament = tmp_path / "ornament.png"
     save(ornament, [[0]])
