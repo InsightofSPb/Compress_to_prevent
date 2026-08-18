@@ -1,5 +1,6 @@
 import csv
 import json
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -22,6 +23,18 @@ def validate_v2(sources):
         schema_version=V2_DATASET_SCHEMA,
         ontology_version=ontology.version,
     )
+
+
+def make_v1_ontology():
+    with open("ovs_heritage/configs/heritage_vocab.yaml", encoding="utf-8") as stream:
+        data = json.load(stream)
+    data["version"] = V1_VERSION
+    data["classes"] = data["classes"][:11]
+    data["classes"][8]["name"] = "ornament_intact"
+    data["classes"][8]["aliases"] = []
+    data["groups"]["ORNAMENT"] = ["ornament_intact"]
+    data["groups"]["HUMAN_ACTIVITY"].remove("advertisements")
+    return ontology_from_mapping(data)
 
 
 def save(path, values):
@@ -91,14 +104,7 @@ def test_facade_and_path_leakage_across_splits(tmp_path):
 
 
 def test_v1_explicit_schema_rejects_id11(tmp_path):
-    data = json.load(open("ovs_heritage/configs/heritage_vocab.yaml"))
-    data["version"] = V1_VERSION
-    data["classes"] = data["classes"][:11]
-    data["classes"][8]["name"] = "ornament_intact"
-    data["classes"][8]["aliases"] = []
-    data["groups"]["ORNAMENT"] = ["ornament_intact"]
-    data["groups"]["HUMAN_ACTIVITY"].remove("advertisements")
-    ontology = ontology_from_mapping(data)
+    ontology = make_v1_ontology()
     mask = tmp_path / "legacy.png"
     save(mask, [[11]])
     manifest = tmp_path / "legacy.csv"
@@ -197,6 +203,7 @@ def test_conflicting_row_declaration_and_split_statistics(tmp_path):
             "ontology_version": ontology.version,
         })
     conflict_report = validate_v2({"test": conflict})
+    assert conflict_report["splits"]["test"]["manifest_row_count"] == 1
     assert conflict_report["splits"]["test"]["split_error_count"] == 1
     assert conflict_report["splits"]["test"]["failed_sample_count"] == 0
 
@@ -230,3 +237,119 @@ def test_multiple_invalid_rows_count_as_failed_samples(tmp_path):
     assert split["valid_sample_count"] == 0
     assert split["failed_sample_count"] == 2
     assert split["split_error_count"] == 0
+
+
+def write_v2_manifest_with_image(path, rows):
+    fields = ["image_path", "main_mask_path", "ornament_mask_path", "facade_id", "source_id"]
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_source_id_and_image_path_leakage_with_different_masks(tmp_path):
+    image = tmp_path / "image.png"
+    save(image, [[0]])
+    manifests = []
+    for split in ("train", "test"):
+        main_mask = tmp_path / f"{split}_main.png"
+        ornament_mask = tmp_path / f"{split}_ornament.png"
+        save(main_mask, [[0]])
+        save(ornament_mask, [[0]])
+        manifest = tmp_path / f"{split}_source.csv"
+        write_v2_manifest_with_image(manifest, [{
+            "image_path": image.name,
+            "main_mask_path": main_mask.name,
+            "ornament_mask_path": ornament_mask.name,
+            "facade_id": f"facade_{split}",
+            "source_id": "repeated_source",
+        }])
+        manifests.append(manifest)
+    report = validate_v2({"train": manifests[0], "test": manifests[1]})
+    assert report["source_id_overlaps"][0]["source_ids"] == ["repeated_source"]
+    reused = report["duplicated_paths"][0]["paths"]
+    assert {item["field"] for item in reused} == {"image_path"}
+    assert report["splits"]["train"]["verified_image_count"] == 1
+
+
+def test_optional_image_must_be_readable_and_match_mask_grid(tmp_path):
+    main_mask = tmp_path / "main.png"
+    ornament_mask = tmp_path / "ornament.png"
+    save(main_mask, [[0]])
+    save(ornament_mask, [[0]])
+    for image_name, expected in (("missing.png", "missing or unreadable"), ("corrupt.png", "missing or unreadable")):
+        if image_name == "corrupt.png":
+            (tmp_path / image_name).write_text("not an image")
+        manifest = tmp_path / f"{image_name}.csv"
+        write_v2_manifest_with_image(manifest, [{
+            "image_path": image_name,
+            "main_mask_path": main_mask.name,
+            "ornament_mask_path": ornament_mask.name,
+            "facade_id": "facade",
+            "source_id": image_name,
+        }])
+        assert expected in " ".join(validate_v2({"test": manifest})["errors"])
+    large_image = tmp_path / "large.png"
+    save(large_image, [[0, 0]])
+    mismatch = tmp_path / "mismatch.csv"
+    write_v2_manifest_with_image(mismatch, [{
+        "image_path": large_image.name,
+        "main_mask_path": main_mask.name,
+        "ornament_mask_path": ornament_mask.name,
+        "facade_id": "facade",
+        "source_id": "large",
+    }])
+    assert "image/mask grid mismatch" in " ".join(validate_v2({"test": mismatch})["errors"])
+
+
+def test_facade_leakage_survives_corrupted_mask_and_whitespace_is_rejected(tmp_path):
+    ornament = tmp_path / "ornament.png"
+    good_main = tmp_path / "good.png"
+    save(ornament, [[0]])
+    save(good_main, [[0]])
+    train = tmp_path / "train_corrupt.csv"
+    test = tmp_path / "test_good.csv"
+    write_v2_manifest(train, [{
+        "main_mask_path": "missing.png", "ornament_mask_path": ornament.name,
+        "facade_id": "shared", "source_id": "train",
+    }])
+    write_v2_manifest(test, [{
+        "main_mask_path": good_main.name, "ornament_mask_path": ornament.name,
+        "facade_id": "shared", "source_id": "test",
+    }])
+    report = validate_v2({"train": train, "test": test})
+    assert report["facade_overlaps"][0]["facade_ids"] == ["shared"]
+
+    whitespace = tmp_path / "whitespace.csv"
+    write_v2_manifest(whitespace, [{
+        "main_mask_path": good_main.name, "ornament_mask_path": ornament.name,
+        "facade_id": " shared", "source_id": "sample ",
+    }])
+    errors = " ".join(validate_v2({"test": whitespace})["errors"])
+    assert "surrounding whitespace" in errors
+
+
+def test_v1_relative_directory_content_fingerprint_is_root_independent(tmp_path, monkeypatch):
+    ontology = make_v1_ontology()
+    first = tmp_path / "first" / "masks"
+    second = tmp_path / "second" / "masks"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    save(first / "a.png", [[1]])
+    save(second / "a.png", [[1]])
+    monkeypatch.chdir(tmp_path)
+
+    def validate_directory(path):
+        return validate_splits(
+            {"test": path}, ontology,
+            schema_version=V1_DATASET_SCHEMA,
+            ontology_version=ontology.version,
+        )
+
+    first_report = validate_directory(Path("first/masks"))
+    second_report = validate_directory(Path("second/masks"))
+    assert first_report["valid"] and second_report["valid"]
+    assert first_report["source_fingerprints"]["test"] == second_report["source_fingerprints"]["test"]
+    save(first / "a.png", [[2]])
+    changed = validate_directory(Path("first/masks"))
+    assert changed["source_fingerprints"]["test"] != first_report["source_fingerprints"]["test"]

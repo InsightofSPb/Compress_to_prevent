@@ -74,7 +74,10 @@ optional positive `pos_weight`; P0 does not tune either value or a threshold.
 V2 manifests explicitly contain `main_mask_path`, `ornament_mask_path`, and
 `facade_id` (optionally `image_path` and `source_id`). The validator checks both
 files, shape equality, strict dtypes/IDs, empty splits, missing facade IDs,
-facade leakage, and reused mask paths. Missing advertisements is a warning.
+facade/source-ID leakage, and reused image or mask paths. Optional `image_path`
+values are opened and verified; when present, their pixel dimensions must match
+both target grids. Reports count those files as `verified_image_count` rather
+than treating every manifest row as a verified image. Missing advertisements is a warning.
 Reports distinguish manifest rows, valid and failed samples, main and ornament
 mask counts, and source counts; they do not call unchecked rows “images”.
 Unknown IDs are excluded from valid statistics.
@@ -86,6 +89,11 @@ CLI options. V2 uses `heritage_two_map_v2`; legacy v1 uses
 declarations are errors and never trigger schema inference. Per-split reports
 separate manifest rows, valid/failed sample rows, and inventory-level split
 errors; error-message count is not used as a sample count.
+
+Legacy-v1 directory inventories remain supported. Their deterministic
+fingerprint uses root-relative canonical paths plus each mask's content hash, so
+content changes alter the fingerprint while moving an unchanged inventory does
+not. Relative directory paths resolve files exactly once.
 
 Reports include the component/schema versions, ontology version/hash, complete
 projection, split fingerprints, overlaps, duplicated paths, warnings/errors,

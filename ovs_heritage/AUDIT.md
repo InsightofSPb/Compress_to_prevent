@@ -39,21 +39,21 @@ Semicolon-separated labels are expanded in `_get_class_embeddings`: every alias 
 | `tools/finetune.py` | metric groups | HUMAN_ACTIVITY omits advertisements | two-name set | consume v2 groups in future trainer | deferred to P1/P2 |
 | `tools/compare_models_facades.py` | groups | eleven-class evaluation | local sets | re-evaluate both models on common v2 test set | deferred to P1/P2 |
 | `tools/render_temporal_qualitative_grids.py` | defaults | eleven names/colors | literal lists | legacy figures remain reproducible | legacy intentionally preserved |
-| `models/maskclip/maskclip.py` | head outputs | channel count follows expanded strings | embedding convolution | P0 scorer supports runtime C | changed |
+| `models/maskclip/maskclip.py` | head outputs | channel count follows expanded strings | embedding convolution | legacy file is unchanged; separate P0 scorer supports runtime C | legacy intentionally preserved |
 | `ovs_heritage/configs/datasets/heritage_facades_v2.py` | adapter exports | twelve concepts projected to 11 main channels plus one ornament channel | values loaded from canonical source and projection | use only with explicit two-map v2 manifests | changed |
 | README temporal semantics | ontology prose | text/signage combined | explicitly says combined class | update only when downstream temporal contract migrates | legacy intentionally preserved |
 
-No existing tracked occurrence of `ADVERTISEMENTS` was found: the user addition is not present in this branch/status/history-visible working tree. Thus there was no existing color to preserve. P0 assigns unique visualization RGB `(216, 27, 96)` and leaves colors 0..10 unchanged. No annotation pixels were created, moved, or converted.
+The legacy/base code audited before P0 had no tracked `ADVERTISEMENTS` class in its converter or eleven-class dataset configurations. This PR now contains the canonical P0 `ADVERTISEMENTS` concept at semantic ID 11 with visualization RGB `(216, 27, 96)`, while the legacy consumers listed above remain unchanged. No annotation pixels were created, moved, or converted.
 
 ## 8. LPOSS inference
 
 **Confirmed syntax/semantic defect:** `segmentation/evaluation/lposs_eval.py:LPOSS_Infrencer.forward` has a duplicated conditional expression immediately after `else i`. Python parses this as attempting to call `i` (often a Tensor) with the following parenthesized result. P0.1 removed the earlier AST test because it passed only while the bug remained and therefore encoded the defect as expected behavior. The safe legacy fix and a regression test that exercises successful inference belong with the P1 LPOSS wrapper/integration work. A later wrapper must distinguish DINO graph refinement (feature graph propagation in LPOSS), LPOSS+ pixel refinement (`pixel_refine`, CuPy Laplacian), and fallback: without CuPy pixel refinement is explicitly skipped; FAISS/CUDA availability affects graph implementations and is not equivalent to LPOSS+.
 
-A second independently observed defect is `LPOSS_Infrencer.encode_decode` referring to undefined `x`; it is not the requested duplicated-expression issue and is left untouched because the new wrapper is out of P0 scope.
+`LPOSS_Infrencer.encode_decode` currently calls `self.model(img)` and does not reference an undefined `x`; the earlier audit statement claiming otherwise was incorrect and has been removed. The duplicated conditional-expression defect above remains separately verified. Any LPOSS fix and positive integration regression test remain outside P0.
 
 ## 9. Historical metrics
 
-Values such as mIoU 0.0551→0.1676 or DAMAGE_MACRO_MIOU 0.0209→0.0802, wherever retained as experiment references, are not P0 results. Eleven- and twelve-class mIoU are not directly comparable. Stock and adapted models must be evaluated again on the identical twelve-class test set. Future reports must distinguish `stock_repo_exact` from `stock_shared_scorer` (stock dense features with the P0 scorer).
+Values such as mIoU 0.0551→0.1676 or DAMAGE_MACRO_MIOU 0.0209→0.0802, wherever retained as experiment references, are not P0 results. Legacy single-mask metrics and v2 two-map metrics are not directly comparable. Stock and adapted models must be evaluated again on the identical 12-concept two-map test set. Future reports must distinguish `stock_repo_exact` from `stock_shared_scorer` (stock dense features with the P0 scorer).
 
 ## 10. P0 two-map correction
 

@@ -54,12 +54,37 @@ class OntologyProjection:
         return projection
 
     def __post_init__(self) -> None:
+        if not isinstance(self.entries, tuple) or not self.entries:
+            raise ValueError("projection entries must be a non-empty tuple")
+        known_heads = {"main": "multiclass_softmax", "ornament": "independent_sigmoid"}
+        for index, entry in enumerate(self.entries):
+            if type(entry.semantic_id) is not int or entry.semantic_id < 0:
+                raise ValueError(f"entries[{index}].semantic_id must be a non-negative integer")
+            if not isinstance(entry.canonical_name, str) or not entry.canonical_name.strip():
+                raise ValueError(f"entries[{index}].canonical_name must be non-empty")
+            if entry.output_head not in known_heads:
+                raise ValueError(f"entries[{index}] has unknown output head {entry.output_head!r}")
+            if entry.interpretation != known_heads[entry.output_head]:
+                raise ValueError(f"entries[{index}] has inconsistent output interpretation")
+            if type(entry.channel_index) is not int or entry.channel_index < 0:
+                raise ValueError(f"entries[{index}].channel_index must be a non-negative integer")
         semantic_ids = [entry.semantic_id for entry in self.entries]
         if len(semantic_ids) != len(set(semantic_ids)):
             raise ValueError("projection has duplicate semantic IDs")
         head_channels = [(entry.output_head, entry.channel_index) for entry in self.entries]
         if len(head_channels) != len(set(head_channels)):
             raise ValueError("projection has duplicate channel indices within an output head")
+        main_entries = tuple(entry for entry in self.entries if entry.output_head == "main")
+        ornament_entries = tuple(entry for entry in self.entries if entry.output_head == "ornament")
+        if tuple(entry.semantic_id for entry in main_entries) != MAIN_SEMANTIC_IDS:
+            raise ValueError(f"main semantic IDs must be exactly {list(MAIN_SEMANTIC_IDS)}")
+        if tuple(entry.channel_index for entry in main_entries) != tuple(range(len(MAIN_SEMANTIC_IDS))):
+            raise ValueError("main channel indices must be contiguous 0..10")
+        if len(ornament_entries) != 1 or (
+            ornament_entries[0].semantic_id,
+            ornament_entries[0].channel_index,
+        ) != (8, 0):
+            raise ValueError("ornament projection must be semantic ID 8 at channel 0")
 
     @property
     def main_entries(self) -> tuple[MappingEntry, ...]:
@@ -87,26 +112,28 @@ class OntologyProjection:
     def semantic_main_to_channels(self, target: torch.Tensor) -> torch.Tensor:
         self._validate_integer_target(target, "Y_main")
         found = set(torch.unique(target.detach()).cpu().tolist())
-        allowed = set(MAIN_SEMANTIC_IDS) | {self.ignore_index}
+        semantic_to_channel = {entry.semantic_id: entry.channel_index for entry in self.main_entries}
+        allowed = set(semantic_to_channel) | {self.ignore_index}
         invalid = sorted(found - allowed)
         if invalid:
             detail = "semantic ID 8 belongs to the ornament target" if 8 in invalid else "unknown IDs"
             raise ValueError(f"Y_main contains invalid semantic IDs {invalid}: {detail}")
         result = torch.full_like(target, self.ignore_index, dtype=torch.long)
-        for entry in self.main_entries:
-            result[target == entry.semantic_id] = entry.channel_index
+        for semantic_id, channel_index in semantic_to_channel.items():
+            result[target == semantic_id] = channel_index
         return result
 
     def main_channels_to_semantic(self, channels: torch.Tensor) -> torch.Tensor:
         self._validate_integer_target(channels, "main channel prediction")
         found = set(torch.unique(channels.detach()).cpu().tolist())
-        allowed = set(range(self.main_channel_count)) | {self.ignore_index}
+        channel_to_semantic = {entry.channel_index: entry.semantic_id for entry in self.main_entries}
+        allowed = set(channel_to_semantic) | {self.ignore_index}
         invalid = sorted(found - allowed)
         if invalid:
             raise ValueError(f"main channel prediction contains unknown channel indices {invalid}")
         result = torch.full_like(channels, self.ignore_index, dtype=torch.long)
-        for entry in self.main_entries:
-            result[channels == entry.channel_index] = entry.semantic_id
+        for channel_index, semantic_id in channel_to_semantic.items():
+            result[channels == channel_index] = semantic_id
         return result
 
     def main_logits_to_semantic(self, logits: torch.Tensor) -> torch.Tensor:
