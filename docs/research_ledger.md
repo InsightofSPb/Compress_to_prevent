@@ -28,6 +28,8 @@ Each invocation owns `<ledger-dir>/<run-id>/events.jsonl`; that JSONL stream is
 the only authoritative ledger record. With recording enabled, the score CSV and
 its `.report.json` path must not already exist. A second run must use a new
 output path, preventing a recorded artifact from being silently overwritten.
+Terminal runs are additionally anchored in the root-level append-only
+`<ledger-dir>/terminal_seals.jsonl` stream.
 
 ## Verify a run
 
@@ -69,7 +71,16 @@ The notebook captures:
   and source event references.
 
 It never dumps environment variables and does not store images, masks, arrays,
-weights, credentials, signed URLs, or private endpoints in event payloads.
+weights, or known credential representations in event payloads. Secret-named
+fields, Bearer/Basic authorization values, URL user-info, and common sensitive
+query parameters are redacted recursively before hashing and writing. This is
+defence in depth, not a promise that arbitrary novel secret formats can always
+be recognized; callers must still use the event-specific allowlisted fields.
+
+For ledger-enabled deep scoring, H1 fails closed where effective provenance is
+not yet reliable: LPIPS is rejected, DINOv2 requires both a local Git repository
+and explicit weights, and DINOv2 feature-cache reuse is rejected. Legacy runs
+without `--ledger-dir` keep their existing model-loading and cache behaviour.
 
 ## Failures and integrity
 
@@ -80,11 +91,25 @@ scoring failures append `run.failed` and re-raise the original exception. A
 scoring failure also records `stage.failed`; interruption is never recorded as
 success. A torn last line is reported without rewriting its valid prefix.
 Retries and corrections are new events or new runs—committed lines are not edited.
+A successful `run.completed` is invalid while any stage is active. Normal CLI
+scoring failures record `stage.failed` and then `run.failed`. If recording the
+stage failure itself fails, the original exception is preserved and annotated
+or warned about; `run.failed` is still attempted and may seal an emergency
+failure with the stage left active rather than falsely claiming completion.
+Reconstruction labels such an emergency unresolved stage
+`abandoned_on_run_failure` instead of presenting it as still running.
 
 Appends use an inter-process lock, flush, and `fsync`. The current locking
 implementation uses `fcntl.flock` and targets Linux/POSIX, including WSL. It is
 not compatible with native Windows Python. Hash chains are tamper-evident but
 are not signatures, trusted timestamps, or an externally notarized chain head.
+
+The independent terminal-seal chain detects deletion of one or more complete
+events from the end of a locally sealed completed/failed run. Both streams are
+locked and `fsync`ed. It cannot protect against an attacker who consistently
+rewrites both the run stream and every independent seal. A genuinely unsealed,
+still-running local stream has no externally expected head, so arbitrary suffix
+deletion from such a stream is inherently unverifiable by this local design.
 
 H2 capability seams and a future orchestrator remain follow-up work. H3 metric
 and paper-table lineage beyond these two CLI artifacts is also intentionally

@@ -17,6 +17,7 @@ from research_ledger import (
     canonical_bytes,
     canonical_hash,
     ontology_snapshot,
+    sanitize_error,
 )
 
 FIXED = datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -28,6 +29,12 @@ def clock():
 
 def _append(root: str, run_id: str, number: int) -> None:
     Ledger(root, run_id).append(NewEvent("warning.recorded", {"number": number}))
+
+
+def _terminal_run(root: str, run_id: str) -> None:
+    ledger = Ledger(root, run_id)
+    ledger.append(NewEvent("run.started", {}))
+    ledger.append(NewEvent("run.completed", {}))
 
 
 def started_ledger(tmp_path: Path) -> Ledger:
@@ -70,6 +77,35 @@ def test_round_trip_reconstruction_and_secret_redaction(tmp_path: Path) -> None:
     two = ledger.reconstruct()
     assert one == two
     assert one.status == "completed" and one.event_count == 3
+
+
+def test_secret_values_are_redacted_recursively(tmp_path: Path) -> None:
+    ledger = started_ledger(tmp_path)
+    event = ledger.append(
+        NewEvent(
+            "warning.recorded",
+            {
+                "secret": "literal",
+                "header": "Bearer abc123",
+                "endpoint": "https://alice:password@example.invalid/private",
+                "signed": "https://example.invalid/x?ok=yes&api_key=abc&signature=xyz",
+                "nested": [{"value": "Basic Zm9vOmJhcg=="}],
+                "benign": "ordinary text",
+            },
+        )
+    )
+    assert event.payload["secret"] == "[REDACTED]"
+    assert event.payload["header"] == "Bearer [REDACTED]"
+    assert "alice" not in event.payload["endpoint"]
+    assert "abc" not in event.payload["signed"] and "xyz" not in event.payload["signed"]
+    assert event.payload["nested"][0]["value"] == "Basic [REDACTED]"
+    assert event.payload["benign"] == "ordinary text"
+    error = sanitize_error(
+        RuntimeError("Bearer abc https://alice:password@example.invalid/x?token=secret")
+    )
+    assert "abc" not in error["message"]
+    assert "alice" not in error["message"]
+    assert "secret" not in error["message"]
 
 
 @pytest.mark.parametrize(
@@ -121,6 +157,38 @@ def test_torn_line_preserves_prefix(tmp_path: Path) -> None:
     assert ledger.path.read_bytes().startswith(prefix)
 
 
+@pytest.mark.parametrize("removed_lines", [1, 2])
+def test_terminal_seal_detects_complete_suffix_deletion(
+    tmp_path: Path, removed_lines: int
+) -> None:
+    ledger = started_ledger(tmp_path)
+    ledger.append(NewEvent("warning.recorded", {"message": "before terminal"}))
+    ledger.append(NewEvent("run.completed", {}))
+    lines = ledger.path.read_bytes().splitlines(keepends=True)
+    ledger.path.write_bytes(b"".join(lines[:-removed_lines]))
+    with pytest.raises(LedgerError, match="does not match its seal"):
+        ledger.verify()
+    with pytest.raises(LedgerError, match="does not match its seal"):
+        ledger.reconstruct()
+
+
+def test_concurrent_terminal_seals_remain_valid(tmp_path: Path) -> None:
+    processes = [
+        multiprocessing.Process(
+            target=_terminal_run, args=(str(tmp_path), "run-{}".format(n))
+        )
+        for n in range(8)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+    for n in range(8):
+        Ledger(tmp_path, "run-{}".format(n)).verify()
+    assert len((tmp_path / "terminal_seals.jsonl").read_text().splitlines()) == 8
+
+
 def test_stage_failure_records_and_propagates_original(tmp_path: Path) -> None:
     ledger = started_ledger(tmp_path)
     error = RuntimeError("boom")
@@ -157,6 +225,24 @@ def test_terminal_rules(tmp_path: Path) -> None:
         ledger.append(NewEvent("run.failed", {}))
     with pytest.raises(LedgerError, match="after terminal"):
         ledger.append(NewEvent("warning.recorded", {}))
+
+
+def test_completed_run_rejects_active_stage(tmp_path: Path) -> None:
+    ledger = started_ledger(tmp_path)
+    ledger.append(NewEvent("stage.started", {"stage": "score"}))
+    with pytest.raises(LedgerError, match="active stage"):
+        ledger.append(NewEvent("run.completed", {}))
+
+
+def test_failed_run_resolves_unrecorded_stage_failure_as_abandoned(
+    tmp_path: Path,
+) -> None:
+    ledger = started_ledger(tmp_path)
+    ledger.append(NewEvent("stage.started", {"stage": "score"}))
+    ledger.append(
+        NewEvent("run.failed", {"error_type": "RuntimeError", "message": "x"})
+    )
+    assert ledger.reconstruct().stages["score"] == "abandoned_on_run_failure"
 
 
 def test_stage_state_and_reference_rules(tmp_path: Path) -> None:

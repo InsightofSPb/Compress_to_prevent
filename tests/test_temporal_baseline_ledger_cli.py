@@ -5,12 +5,16 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
 
 from research_ledger import Ledger, canonical_hash
-from tools.run_temporal_change_baselines import _validate_and_inventory
+from tools.run_temporal_change_baselines import (
+    _validate_and_inventory,
+    _validate_deep_provenance,
+)
 
 ROOT = Path(__file__).parents[1]
 
@@ -76,7 +80,7 @@ def _run(
 
 
 def _ledger(root: Path) -> Ledger:
-    run_dir = sorted(root.iterdir())[-1]
+    run_dir = sorted(path for path in root.iterdir() if path.is_dir())[-1]
     return Ledger(root, run_dir.name)
 
 
@@ -193,6 +197,121 @@ def test_duplicate_pair_leakage_and_missing_file_rejected(tmp_path: Path) -> Non
     )
     with pytest.raises(FileNotFoundError):
         _validate_and_inventory(missing, None)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("facade_id", "F1 "), ("pair_id", " p1"), ("split", "test ")],
+)
+def test_manifest_identity_whitespace_rejected(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    prev, curr = tmp_path / "p.ppm", tmp_path / "c.ppm"
+    _ppm(prev, 0)
+    _ppm(curr, 1)
+    row = {
+        "pair_id": "p1",
+        "facade_id": "F1",
+        "split": "train",
+        "prev_aligned_path": prev,
+        "curr_image_path": curr,
+    }
+    row[field] = value
+    with pytest.raises(ValueError, match="whitespace"):
+        _validate_and_inventory(_fixture(tmp_path, [row]), None)
+
+
+def test_facade_whitespace_cannot_hide_cross_split_leakage(tmp_path: Path) -> None:
+    prev, curr = tmp_path / "p.ppm", tmp_path / "c.ppm"
+    _ppm(prev, 0)
+    _ppm(curr, 1)
+    manifest = _fixture(
+        tmp_path,
+        [
+            {
+                "pair_id": "p1",
+                "facade_id": "F1",
+                "split": "train",
+                "prev_aligned_path": prev,
+                "curr_image_path": curr,
+            },
+            {
+                "pair_id": "p2",
+                "facade_id": "F1 ",
+                "split": "test",
+                "prev_aligned_path": prev,
+                "curr_image_path": curr,
+            },
+        ],
+    )
+    with pytest.raises(ValueError, match="whitespace in facade_id"):
+        _validate_and_inventory(manifest, None)
+
+
+def test_duplicate_pair_across_filtered_partition_and_empty_selection(
+    tmp_path: Path,
+) -> None:
+    prev, curr = tmp_path / "p.ppm", tmp_path / "c.ppm"
+    _ppm(prev, 0)
+    _ppm(curr, 1)
+    manifest = _fixture(
+        tmp_path,
+        [
+            {
+                "pair_id": "same",
+                "facade_id": "train-f",
+                "split": "train",
+                "prev_aligned_path": prev,
+                "curr_image_path": curr,
+            },
+            {
+                "pair_id": "same",
+                "facade_id": "test-f",
+                "split": "test",
+                "prev_aligned_path": prev,
+                "curr_image_path": curr,
+            },
+        ],
+    )
+    with pytest.raises(ValueError, match="complete manifest"):
+        _validate_and_inventory(manifest, ["test"])
+    valid = _fixture(
+        tmp_path,
+        [
+            {
+                "pair_id": "p",
+                "facade_id": "f",
+                "split": "train",
+                "prev_aligned_path": prev,
+                "curr_image_path": curr,
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="zero pairs"):
+        _validate_and_inventory(valid, ["test"])
+
+
+def test_ledger_deep_provenance_fails_closed_for_models_and_cache() -> None:
+    base = dict(
+        skip_deep_baselines=False,
+        dinov2_repo_dir=None,
+        dinov2_weights_path=None,
+        feature_cache_dir=None,
+    )
+    with pytest.raises(ValueError, match="LPIPS"):
+        _validate_deep_provenance(SimpleNamespace(**base), ["lpips_change"])
+    with pytest.raises(ValueError, match="requires"):
+        _validate_deep_provenance(SimpleNamespace(**base), ["dinov2_patch_cosine"])
+    explicit = dict(
+        base,
+        dinov2_repo_dir=Path("repo"),
+        dinov2_weights_path=Path("weights"),
+        feature_cache_dir=Path("cache"),
+    )
+    with pytest.raises(ValueError, match="cache provenance"):
+        _validate_deep_provenance(SimpleNamespace(**explicit), ["dinov2_patch_cosine"])
+    # Because every ledger-enabled cache reuse is rejected, neither changed input nor
+    # changed model identity can hit a stale entry under the same pair ID.
 
 
 def test_ledger_run_refuses_overwrite(tmp_path: Path) -> None:

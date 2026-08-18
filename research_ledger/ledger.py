@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import warnings
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence, Tuple, Union
 from uuid import uuid4
@@ -49,6 +50,10 @@ SECRET_MARKERS = (
     "api_key",
     "apikey",
     "credential",
+    "access_key",
+    "accesskey",
+    "signature",
+    "authorization",
 )
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 MAX_ERROR_MESSAGE = 2000
@@ -78,6 +83,40 @@ def _plain(value: Any) -> Any:
     raise TypeError("unsupported ledger value: {}".format(type(value).__name__))
 
 
+def _redact_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return value
+    hostname = parsed.hostname or ""
+    if parsed.port is not None:
+        hostname = "{}:{}".format(hostname, parsed.port)
+    if parsed.username is not None or parsed.password is not None:
+        hostname = "[REDACTED]@{}".format(hostname)
+    query = []
+    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        redacted = (
+            "[REDACTED]"
+            if any(marker in key.lower() for marker in SECRET_MARKERS)
+            else item
+        )
+        query.append((key, redacted))
+    return urlunsplit(
+        (parsed.scheme, hostname, parsed.path, urlencode(query), parsed.fragment)
+    )
+
+
+def _redact_string(value: str) -> str:
+    value = re.sub(
+        r"(?i)\b(bearer|basic)\s+\S+",
+        lambda match: "{} [REDACTED]".format(match.group(1)),
+        value,
+    )
+    return re.sub(r"https?://[^\s]+", lambda match: _redact_url(match.group(0)), value)
+
+
 def redact_secrets(value: Any) -> Any:
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
@@ -90,17 +129,14 @@ def redact_secrets(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [redact_secrets(item) for item in value]
+    if isinstance(value, str):
+        return _redact_string(value)
     return value
 
 
 def sanitize_error(exc: BaseException) -> Mapping[str, str]:
     message = " ".join(str(exc).replace("\x00", "").split())[:MAX_ERROR_MESSAGE]
-    message = re.sub(r"(https?://[^\s?]+)\?\S+", r"\1?[REDACTED]", message)
-    message = re.sub(
-        r"(?i)\b(bearer\s+|password=|passwd=|secret=|token=|api[_-]?key=)\S+",
-        r"\1[REDACTED]",
-        message,
-    )
+    message = redact_secrets(message)
     return {"error_type": type(exc).__name__, "message": message}
 
 
@@ -344,6 +380,8 @@ class Ledger:
             raise ValueError("run directory must not be a symbolic link")
         self.path = self.run_dir / "events.jsonl"
         self.lock_path = self.run_dir / ".lock"
+        self.seals_path = self.root / "terminal_seals.jsonl"
+        self.seals_lock_path = self.root / ".terminal-seals.lock"
 
     def append(self, event: NewEvent) -> StoredEvent:
         if event.event_type not in EVENT_TYPES:
@@ -366,11 +404,13 @@ class Ledger:
             }
             body["event_hash"] = canonical_hash(body)
             stored = StoredEvent(**body)
-            self.verify(prior + [stored])
+            self.verify(prior + [stored], check_terminal_seal=False)
             with self.path.open("ab") as stream:
                 stream.write(canonical_bytes(body) + b"\n")
                 stream.flush()
                 os.fsync(stream.fileno())
+            if stored.event_type in TERMINAL_TYPES:
+                self._append_terminal_seal(stored)
             return stored
 
     def read(self, verify: bool = True) -> list[StoredEvent]:
@@ -405,7 +445,11 @@ class Ledger:
             self.verify(events)
         return events
 
-    def verify(self, events: Optional[Sequence[StoredEvent]] = None) -> None:
+    def verify(
+        self,
+        events: Optional[Sequence[StoredEvent]] = None,
+        check_terminal_seal: bool = True,
+    ) -> None:
         checked = list(events) if events is not None else self.read(verify=False)
         previous = None
         ids = set()
@@ -517,8 +561,81 @@ class Ledger:
                     if not completed_event_ids.intersection(refs):
                         raise LedgerError("artifact producing stage is not completed")
             if event.event_type in TERMINAL_TYPES:
+                if event.event_type == "run.completed" and any(
+                    state["status"] == "started" for state in stage_states.values()
+                ):
+                    raise LedgerError("run.completed cannot contain an active stage")
                 terminal = True
             previous = event.event_hash
+        if check_terminal_seal:
+            self._verify_terminal_seal(checked)
+
+    def _read_terminal_seals(self) -> list[Mapping[str, Any]]:
+        if not self.seals_path.exists():
+            return []
+        raw = self.seals_path.read_bytes()
+        if raw and not raw.endswith(b"\n"):
+            raise LedgerError("torn terminal seal line")
+        seals = []
+        previous = None
+        for line_number, line in enumerate(raw.splitlines(), 1):
+            try:
+                seal = json.loads(line)
+                observed = seal.pop("seal_hash")
+                if seal.get("previous_seal_hash") != previous:
+                    raise ValueError("broken terminal seal chain")
+                if canonical_hash(seal) != observed:
+                    raise ValueError("terminal seal hash mismatch")
+                seal["seal_hash"] = observed
+                previous = observed
+                seals.append(seal)
+            except Exception as exc:
+                raise LedgerError(
+                    "invalid terminal seal at line {}".format(line_number)
+                ) from exc
+        return seals
+
+    def _append_terminal_seal(self, terminal: StoredEvent) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self.seals_lock_path.open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            seals = self._read_terminal_seals()
+            if any(seal["run_id"] == self.run_id for seal in seals):
+                raise LedgerError("terminal seal already exists for run")
+            body = {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": self.run_id,
+                "terminal_event_type": terminal.event_type,
+                "event_count": terminal.sequence,
+                "head_event_hash": terminal.event_hash,
+                "timestamp_utc": terminal.timestamp_utc,
+                "previous_seal_hash": seals[-1]["seal_hash"] if seals else None,
+            }
+            body["seal_hash"] = canonical_hash(body)
+            with self.seals_path.open("ab") as stream:
+                stream.write(canonical_bytes(body) + b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+    def _verify_terminal_seal(self, events: Sequence[StoredEvent]) -> None:
+        seals = self._read_terminal_seals()
+        matches = [seal for seal in seals if seal["run_id"] == self.run_id]
+        terminal = (
+            events[-1] if events and events[-1].event_type in TERMINAL_TYPES else None
+        )
+        if matches:
+            if len(matches) != 1 or terminal is None:
+                raise LedgerError("terminal event stream does not match its seal")
+            seal = matches[0]
+            if (
+                seal["terminal_event_type"] != terminal.event_type
+                or seal["event_count"] != len(events)
+                or seal["head_event_hash"] != terminal.event_hash
+                or seal["timestamp_utc"] != terminal.timestamp_utc
+            ):
+                raise LedgerError("terminal event stream does not match its seal")
+        elif terminal is not None:
+            raise LedgerError("terminal event has no independent seal")
 
     def verify_artifacts(self) -> None:
         for event in self.read():
@@ -557,6 +674,11 @@ class Ledger:
                 status = "completed"
             if family == "run.failed":
                 status = "failed"
+        if status == "failed":
+            stages = {
+                name: ("abandoned_on_run_failure" if state == "started" else state)
+                for name, state in stages.items()
+            }
         return RunProjection(
             self.run_id,
             status,

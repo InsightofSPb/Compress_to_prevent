@@ -86,10 +86,21 @@ def _validate_and_inventory(
 ) -> Tuple[List[Mapping[str, Any]], Mapping[str, List[str]], List[str], List[str]]:
     rows = _read_manifest(manifest)
     full_splits: Dict[str, List[str]] = {}
+    all_pair_ids = set()
     for index, row in enumerate(rows, 2):
         for field in ("pair_id", "facade_id", "split"):
-            if not row.get(field, "").strip():
+            value = row.get(field, "")
+            if not value.strip():
                 raise ValueError("manifest row {} has missing {}".format(index, field))
+            if value != value.strip():
+                raise ValueError(
+                    "manifest row {} has whitespace in {}".format(index, field)
+                )
+        if row["pair_id"] in all_pair_ids:
+            raise ValueError(
+                "duplicate pair_id in complete manifest: {}".format(row["pair_id"])
+            )
+        all_pair_ids.add(row["pair_id"])
         full_splits.setdefault(row["split"], []).append(row["facade_id"])
     owners: Dict[str, str] = {}
     for split, facades in full_splits.items():
@@ -104,6 +115,8 @@ def _validate_and_inventory(
     }
     permitted = set(requested_splits or [])
     selected = [row for row in rows if not permitted or row["split"] in permitted]
+    if requested_splits and not selected:
+        raise ValueError("requested split selection produced zero pairs")
     seen = set()
     inventory = []
     chronology_fields = (
@@ -116,8 +129,6 @@ def _validate_and_inventory(
     )
     for row in selected:
         pair_id = row["pair_id"]
-        if pair_id in seen:
-            raise ValueError("duplicate selected pair_id: {}".format(pair_id))
         seen.add(pair_id)
         item: Dict[str, Any] = {
             "pair_id": pair_id,
@@ -182,6 +193,24 @@ def _append_failure(ledger: Ledger, exc: BaseException) -> None:
         if hasattr(exc, "add_note"):
             exc.add_note(note)
         warnings.warn(note, RuntimeWarning)
+
+
+def _validate_deep_provenance(args: argparse.Namespace, methods: Sequence[str]) -> None:
+    if args.skip_deep_baselines:
+        return
+    if "lpips_change" in methods:
+        raise ValueError(
+            "ledger-enabled LPIPS is disabled until effective weights can be fingerprinted"
+        )
+    if "dinov2_patch_cosine" in methods:
+        if args.dinov2_repo_dir is None or args.dinov2_weights_path is None:
+            raise ValueError(
+                "ledger-enabled DINOv2 requires --dinov2-repo-dir and --dinov2-weights-path"
+            )
+        if args.feature_cache_dir is not None:
+            raise ValueError(
+                "ledger-enabled DINOv2 feature-cache reuse is disabled until cache provenance is content-addressed"
+            )
 
 
 def _record_snapshots(
@@ -319,6 +348,7 @@ def main() -> None:
                 raise FileExistsError(
                     "ledger-enabled runs require new score and report paths"
                 )
+            _validate_deep_provenance(args, methods)
             config_hash, source_event_ids = _record_snapshots(
                 ledger, args, methods, splits
             )
