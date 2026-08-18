@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from .ontology import Ontology, V2_VERSION
+from .ontology import Ontology, V2_CLASS_NAMES, V2_VERSION
 
 
 IGNORE_INDEX = 255
@@ -54,20 +54,38 @@ class OntologyProjection:
         return projection
 
     def __post_init__(self) -> None:
+        if type(self.ignore_index) is not int or self.ignore_index != IGNORE_INDEX:
+            raise ValueError("ignore_index must be the exact integer 255")
         if not isinstance(self.entries, tuple) or not self.entries:
             raise ValueError("projection entries must be a non-empty tuple")
         known_heads = {"main": "multiclass_softmax", "ornament": "independent_sigmoid"}
         for index, entry in enumerate(self.entries):
-            if type(entry.semantic_id) is not int or entry.semantic_id < 0:
-                raise ValueError(f"entries[{index}].semantic_id must be a non-negative integer")
+            if not isinstance(entry, MappingEntry):
+                raise ValueError(f"entries[{index}] must be a MappingEntry")
+            if (
+                type(entry.semantic_id) is not int
+                or not 0 <= entry.semantic_id < len(V2_CLASS_NAMES)
+            ):
+                raise ValueError(
+                    f"entries[{index}].semantic_id must be an integer in 0..{len(V2_CLASS_NAMES) - 1}"
+                )
             if not isinstance(entry.canonical_name, str) or not entry.canonical_name.strip():
                 raise ValueError(f"entries[{index}].canonical_name must be non-empty")
+            if entry.canonical_name != V2_CLASS_NAMES[entry.semantic_id]:
+                raise ValueError(
+                    f"entries[{index}].canonical_name must be "
+                    f"{V2_CLASS_NAMES[entry.semantic_id]!r} for semantic ID {entry.semantic_id}"
+                )
             if entry.output_head not in known_heads:
                 raise ValueError(f"entries[{index}] has unknown output head {entry.output_head!r}")
             if entry.interpretation != known_heads[entry.output_head]:
                 raise ValueError(f"entries[{index}] has inconsistent output interpretation")
             if type(entry.channel_index) is not int or entry.channel_index < 0:
                 raise ValueError(f"entries[{index}].channel_index must be a non-negative integer")
+            if not isinstance(entry.ignore_behavior, str) or not entry.ignore_behavior.strip():
+                raise ValueError(f"entries[{index}].ignore_behavior must be non-empty")
+            if not isinstance(entry.unknown_behavior, str) or not entry.unknown_behavior.strip():
+                raise ValueError(f"entries[{index}].unknown_behavior must be non-empty")
         semantic_ids = [entry.semantic_id for entry in self.entries]
         if len(semantic_ids) != len(set(semantic_ids)):
             raise ValueError("projection has duplicate semantic IDs")
@@ -165,3 +183,5 @@ class OntologyProjection:
             raise ValueError(f"{label} must have an integer dtype, got {target.dtype}")
         if target.ndim not in (2, 3, 4):
             raise ValueError(f"{label} must be a spatial target tensor, got shape {tuple(target.shape)}")
+        if target.ndim == 4 and target.shape[1] != 1:
+            raise ValueError(f"{label} four-dimensional targets must have exactly one channel")

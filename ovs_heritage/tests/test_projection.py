@@ -71,3 +71,26 @@ def test_unmapped_values_never_become_ignore():
         projection.main_channels_to_semantic(torch.tensor([[[99]]]))
     assert projection.semantic_main_to_channels(torch.tensor([[[255]]])).item() == 255
     assert projection.main_channels_to_semantic(torch.tensor([[[255]]])).item() == 255
+
+
+def test_projection_validates_public_constructor_contract():
+    canonical = OntologyProjection.from_ontology(load_ontology()).entries
+    with pytest.raises(ValueError, match="exact integer 255"):
+        OntologyProjection(canonical, ignore_index=254)
+    with pytest.raises(ValueError, match="exact integer 255"):
+        OntologyProjection(canonical, ignore_index=True)
+    wrong_name = list(canonical)
+    wrong_name[0] = MappingEntry(0, "not_background", "main", 0, "multiclass_softmax")
+    with pytest.raises(ValueError, match="background"):
+        OntologyProjection(tuple(wrong_name))
+    with pytest.raises(ValueError, match="MappingEntry"):
+        OntologyProjection(canonical[:-1] + ({"semantic_id": 8},))
+
+
+def test_projection_rejects_multichannel_spatial_targets():
+    projection = OntologyProjection.from_ontology(load_ontology())
+    target = torch.zeros((1, 2, 3, 4), dtype=torch.long)
+    with pytest.raises(ValueError, match="exactly one channel"):
+        projection.semantic_main_to_channels(target)
+    with pytest.raises(ValueError, match="exactly one channel"):
+        projection.main_channels_to_semantic(target)

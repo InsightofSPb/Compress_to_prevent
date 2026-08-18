@@ -203,9 +203,12 @@ def test_conflicting_row_declaration_and_split_statistics(tmp_path):
             "ontology_version": ontology.version,
         })
     conflict_report = validate_v2({"test": conflict})
-    assert conflict_report["splits"]["test"]["manifest_row_count"] == 1
-    assert conflict_report["splits"]["test"]["split_error_count"] == 1
-    assert conflict_report["splits"]["test"]["failed_sample_count"] == 0
+    conflict_split = conflict_report["splits"]["test"]
+    assert conflict_split["manifest_row_count"] == 1
+    assert conflict_split["split_error_count"] == 0
+    assert conflict_split["valid_sample_count"] == 0
+    assert conflict_split["failed_sample_count"] == 1
+    assert "conflicting schema_version" in conflict_split["sample_errors"][0]
 
 
 def test_empty_and_unreadable_manifests_are_split_errors(tmp_path):
@@ -268,7 +271,7 @@ def test_source_id_and_image_path_leakage_with_different_masks(tmp_path):
     report = validate_v2({"train": manifests[0], "test": manifests[1]})
     assert report["source_id_overlaps"][0]["source_ids"] == ["repeated_source"]
     reused = report["duplicated_paths"][0]["paths"]
-    assert {item["field"] for item in reused} == {"image_path"}
+    assert reused[0]["roles"] == {"train": ["image_path"], "test": ["image_path"]}
     assert report["splits"]["train"]["verified_image_count"] == 1
 
 
@@ -353,3 +356,77 @@ def test_v1_relative_directory_content_fingerprint_is_root_independent(tmp_path,
     save(first / "a.png", [[2]])
     changed = validate_directory(Path("first/masks"))
     assert changed["source_fingerprints"]["test"] != first_report["source_fingerprints"]["test"]
+
+
+def test_physical_path_leakage_is_role_independent(tmp_path):
+    shared = tmp_path / "shared.png"
+    train_ornament = tmp_path / "train_ornament.png"
+    test_main = tmp_path / "test_main.png"
+    save(shared, [[0]])
+    save(train_ornament, [[0]])
+    save(test_main, [[0]])
+    train = tmp_path / "train_roles.csv"
+    test = tmp_path / "test_roles.csv"
+    write_v2_manifest(train, [{
+        "main_mask_path": shared.name,
+        "ornament_mask_path": train_ornament.name,
+        "facade_id": "train_facade",
+        "source_id": "train_source",
+    }])
+    write_v2_manifest(test, [{
+        "main_mask_path": test_main.name,
+        "ornament_mask_path": shared.name,
+        "facade_id": "test_facade",
+        "source_id": "test_source",
+    }])
+    report = validate_v2({"train": train, "test": test})
+    duplicate = report["duplicated_paths"][0]["paths"][0]
+    assert duplicate["roles"] == {
+        "train": ["main_mask_path"],
+        "test": ["ornament_mask_path"],
+    }
+
+
+def test_v2_rejects_one_physical_file_in_multiple_roles(tmp_path):
+    shared = tmp_path / "shared_roles.png"
+    save(shared, [[0]])
+    manifest = tmp_path / "same_row_roles.csv"
+    write_v2_manifest(manifest, [{
+        "main_mask_path": shared.name,
+        "ornament_mask_path": shared.name,
+        "facade_id": "facade",
+        "source_id": "source",
+    }])
+    errors = validate_v2({"test": manifest})["splits"]["test"]["sample_errors"]
+    assert "one physical file cannot serve multiple roles" in errors[0]
+
+
+@pytest.mark.parametrize("field,value", [("facade_id", " bad"), ("source_id", 7)])
+def test_v1_optional_identifiers_are_strict(tmp_path, field, value):
+    ontology = make_v1_ontology()
+    mask = tmp_path / "legacy_id.png"
+    save(mask, [[0]])
+    manifest = tmp_path / f"legacy_{field}.json"
+    row = {"mask_path": mask.name, field: value}
+    manifest.write_text(json.dumps([row]))
+    report = validate_splits(
+        {"test": manifest},
+        ontology,
+        schema_version=V1_DATASET_SCHEMA,
+        ontology_version=ontology.version,
+    )
+    assert report["splits"]["test"]["failed_sample_count"] == 1
+    assert field in report["splits"]["test"]["sample_errors"][0]
+
+
+def test_v1_does_not_coerce_non_string_mask_path(tmp_path):
+    ontology = make_v1_ontology()
+    manifest = tmp_path / "legacy_numeric_path.json"
+    manifest.write_text(json.dumps([{"mask_path": 123}]))
+    report = validate_splits(
+        {"test": manifest},
+        ontology,
+        schema_version=V1_DATASET_SCHEMA,
+        ontology_version=ontology.version,
+    )
+    assert "mask_path must be a non-empty string" in " ".join(report["errors"])

@@ -65,17 +65,17 @@ def _inventory(
     ontology: Ontology,
     schema_version: str,
     ontology_version: str,
-) -> tuple[list[dict[str, Any]], str, bool, list[str]]:
+) -> tuple[list[dict[str, Any]], str, bool, dict[int, list[str]]]:
     if source.is_dir():
         if ontology.version != V1_VERSION:
             raise ValueError("v2 requires an explicit manifest with main_mask_path and ornament_mask_path")
         paths = sorted(path for path in source.rglob("*") if path.suffix.lower() in {".png", ".tif", ".tiff", ".npy"})
-        rows = [{"mask_path": str(path.resolve()), "facade_id": None} for path in paths]
+        rows = [{"mask_path": str(path.resolve())} for path in paths]
         inventory = [f"{path.relative_to(source).as_posix()}:{_file_hash(path)}" for path in paths]
         fingerprint = sha256("\n".join(inventory).encode()).hexdigest()
-        return rows, fingerprint, False, []
+        return rows, fingerprint, False, {}
     rows = _manifest_rows(source)
-    declaration_errors = []
+    declaration_errors: dict[int, list[str]] = {}
     for index, row in enumerate(rows):
         for field, expected in (
             ("schema_version", schema_version),
@@ -83,7 +83,7 @@ def _inventory(
         ):
             declared = row.get(field)
             if declared not in (None, "", expected):
-                declaration_errors.append(
+                declaration_errors.setdefault(index, []).append(
                     f"{source}: row {index + 1} declares conflicting {field}={declared!r}; "
                     f"expected {expected!r}"
                 )
@@ -101,20 +101,32 @@ def _validate_v2_row(row: dict[str, Any], index: int, manifest: Path) -> dict[st
     if source_id not in (None, ""):
         if not isinstance(source_id, str) or source_id != source_id.strip():
             raise ValueError(f"{label}: source_id must be a string without surrounding whitespace")
+    main_path = _resolve_path(row["main_mask_path"], manifest)
+    ornament_path = _resolve_path(row["ornament_mask_path"], manifest)
     image_path = None
     image_shape = None
     if "image_path" in row:
         if not isinstance(row.get("image_path"), str) or not row["image_path"].strip():
             raise ValueError(f"{label}: image_path must be a non-empty string when present")
         image_path = _resolve_path(row["image_path"], manifest)
+    physical_paths = {
+        "main_mask_path": main_path.resolve(),
+        "ornament_mask_path": ornament_path.resolve(),
+        **({"image_path": image_path.resolve()} if image_path is not None else {}),
+    }
+    if len(set(physical_paths.values())) != len(physical_paths):
+        roles: dict[str, list[str]] = {}
+        for role, path in physical_paths.items():
+            roles.setdefault(str(path), []).append(role)
+        reused = {path: names for path, names in roles.items() if len(names) > 1}
+        raise ValueError(f"{label}: one physical file cannot serve multiple roles: {reused}")
+    if image_path is not None:
         try:
             with Image.open(image_path) as image:
                 image.load()
                 image_shape = (image.height, image.width)
         except Exception as exc:
             raise ValueError(f"{image_path}: image is missing or unreadable: {exc}") from exc
-    main_path = _resolve_path(row["main_mask_path"], manifest)
-    ornament_path = _resolve_path(row["ornament_mask_path"], manifest)
     main = _read_mask(main_path)
     ornament = _read_mask(ornament_path)
     if main.shape != ornament.shape:
@@ -145,17 +157,34 @@ def _validate_v2_row(row: dict[str, Any], index: int, manifest: Path) -> dict[st
 
 
 def _validate_v1_row(row: dict[str, Any], index: int, manifest: Path) -> dict[str, Any]:
-    key = next((key for key in V1_MASK_COLUMNS if row.get(key)), None)
+    label = f"{manifest}: row {index + 1}"
+    for identifier in ("facade_id", "source_id"):
+        if identifier in row:
+            value = row[identifier]
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(
+                    f"{label}: {identifier} must be a non-empty string without surrounding whitespace"
+                )
+    key = next(
+        (
+            key
+            for key in V1_MASK_COLUMNS
+            if key in row and row[key] is not None and row[key] != ""
+        ),
+        None,
+    )
     if key is None:
-        raise ValueError(f"{manifest}: row {index + 1} has no legacy mask path")
-    path = _resolve_path(str(row[key]), manifest)
+        raise ValueError(f"{label} has no legacy mask path")
+    if not isinstance(row[key], str) or not row[key].strip():
+        raise ValueError(f"{label}: {key} must be a non-empty string")
+    path = _resolve_path(row[key], manifest)
     mask = _read_mask(path)
     ids = extract_mask_ids(mask, str(path))
     invalid = sorted(ids - set(range(11)) - {255})
     if invalid:
         raise ValueError(f"{path}: invalid legacy-v1 IDs {invalid}")
     return {
-        "facade_id": row.get("facade_id") or None,
+        "facade_id": row.get("facade_id"),
         "paths": {"mask_path": str(path.resolve())},
         "main": mask,
         "ornament": None,
@@ -201,7 +230,7 @@ def validate_splits(
     }
     facade_sets: dict[str, set[str]] = {}
     source_id_sets: dict[str, set[str]] = {}
-    path_sets: dict[str, set[tuple[str, str]]] = {}
+    path_roles: dict[str, dict[str, set[str]]] = {}
     report["source_id_overlaps"] = []
     for split, source_value in sources.items():
         source = Path(source_value)
@@ -214,10 +243,9 @@ def validate_splits(
                 source, ontology, schema_version, ontology_version,
             )
             inventory_read = True
-            split_errors.extend(declaration_errors)
             report["source_fingerprints"][split] = fingerprint
         except Exception as exc:
-            rows, uses_source_id = [], False
+            rows, uses_source_id, declaration_errors = [], False, {}
             split_errors.append(str(exc))
         if inventory_read and not rows:
             split_errors.append(f"{source}: split is empty")
@@ -233,13 +261,17 @@ def validate_splits(
             and row["source_id"]
             and row["source_id"] == row["source_id"].strip()
         }
-        declared_paths = set()
+        declared_paths: dict[str, set[str]] = {}
         for row in rows:
             for field in ("image_path", "main_mask_path", "ornament_mask_path", *V1_MASK_COLUMNS):
                 value = row.get(field)
                 if isinstance(value, str) and value.strip():
-                    declared_paths.add((field, str(_resolve_path(value, source).resolve())))
+                    physical = str(_resolve_path(value, source).resolve())
+                    declared_paths.setdefault(physical, set()).add(field)
         for index, row in enumerate(rows):
+            if index in declaration_errors:
+                sample_failures.extend(declaration_errors[index])
+                continue
             try:
                 sample = (
                     _validate_v2_row(row, index, source)
@@ -261,7 +293,7 @@ def validate_splits(
                         ornament_counts[int(value)] += int(count)
         facade_sets[split] = declared_facades
         source_id_sets[split] = declared_source_ids
-        path_sets[split] = declared_paths
+        path_roles[split] = declared_paths
         source_ids = {sample["source_id"] for sample in valid_samples if sample["source_id"]}
         if ontology.version == V2_VERSION and main_counts[11] == 0:
             report["warnings"].append(f"{split}: ADVERTISEMENTS (semantic ID 11) is absent")
@@ -286,7 +318,9 @@ def validate_splits(
         for right in names[index + 1:]:
             facade_overlap = sorted(facade_sets.get(left, set()) & facade_sets.get(right, set()))
             source_id_overlap = sorted(source_id_sets.get(left, set()) & source_id_sets.get(right, set()))
-            path_overlap = sorted(path_sets.get(left, set()) & path_sets.get(right, set()))
+            left_paths = path_roles.get(left, {})
+            right_paths = path_roles.get(right, {})
+            path_overlap = sorted(set(left_paths) & set(right_paths))
             if facade_overlap:
                 item = {"splits": [left, right], "facade_ids": facade_overlap}
                 report["facade_overlaps"].append(item)
@@ -300,10 +334,21 @@ def validate_splits(
             if path_overlap:
                 item = {
                     "splits": [left, right],
-                    "paths": [{"field": field, "path": path} for field, path in path_overlap],
+                    "paths": [
+                        {
+                            "path": path,
+                            "roles": {
+                                left: sorted(left_paths[path]),
+                                right: sorted(right_paths[path]),
+                            },
+                        }
+                        for path in path_overlap
+                    ],
                 }
                 report["duplicated_paths"].append(item)
-                report["errors"].append(f"mask paths reused between {left} and {right}: {path_overlap}")
+                report["errors"].append(
+                    f"physical paths reused between {left} and {right}: {path_overlap}"
+                )
     metadata = make_metadata(
         component_name=COMPONENT_NAME,
         component_version=COMPONENT_VERSION,
