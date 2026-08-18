@@ -1,27 +1,44 @@
 #!/usr/bin/env python3
 """Compute tile-level temporal change baseline scores on aligned RGB pairs."""
+
 from __future__ import annotations
 
 import argparse
+import csv
+from dataclasses import asdict
+from hashlib import sha256
 import json
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from compression.baselines import compute_baseline_tile_scores  # noqa: E402
+from research_ledger import ArtifactDescriptor, Ledger, NewEvent, canonical_hash  # noqa: E402
+from research_ledger.ledger import repository_snapshot, validate_facade_splits  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compute valid-region tile-level temporal change baselines.")
+    parser = argparse.ArgumentParser(
+        description="Compute valid-region tile-level temporal change baselines."
+    )
     parser.add_argument("--residual-manifest", type=Path, required=True)
     parser.add_argument("--out-csv", type=Path, required=True)
-    parser.add_argument("--methods", type=str, default="absdiff_l1,ssim_change",
-                        help="Comma-separated: absdiff_l1,absdiff_l2,grayscale_absdiff,ssim_change,lpips_change,dinov2_patch_cosine")
-    parser.add_argument("--splits", type=str, default="",
-                        help="Optional comma-separated split restriction, e.g. val,test. Empty evaluates all manifest rows.")
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default="absdiff_l1,ssim_change",
+        help="Comma-separated: absdiff_l1,absdiff_l2,grayscale_absdiff,ssim_change,lpips_change,dinov2_patch_cosine",
+    )
+    parser.add_argument(
+        "--splits",
+        type=str,
+        default="",
+        help="Optional comma-separated split restriction, e.g. val,test. Empty evaluates all manifest rows.",
+    )
     parser.add_argument("--tile-size", type=int, default=32)
     parser.add_argument("--min-valid-ratio", type=float, default=0.50)
     parser.add_argument("--device", default="cpu")
@@ -31,11 +48,98 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dinov2-weights-path", type=Path, default=None)
     parser.add_argument("--dinov2-repo-dir", type=Path, default=None)
     parser.add_argument("--lpips-net", default="alex")
-    parser.add_argument("--deep-batch-size", type=int, default=128,
-                        help="Batch size for tile-level deep baselines such as LPIPS.")
+    parser.add_argument(
+        "--deep-batch-size",
+        type=int,
+        default=128,
+        help="Batch size for tile-level deep baselines such as LPIPS.",
+    )
     parser.add_argument("--skip-deep-baselines", action="store_true")
-    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
+    parser.add_argument(
+        "--no-progress", action="store_true", help="Disable tqdm progress bars."
+    )
+    parser.add_argument(
+        "--ledger-dir",
+        type=Path,
+        default=None,
+        help="Optional root for an append-only experiment ledger.",
+    )
     return parser.parse_args()
+
+
+def _ledger_snapshots(ledger: Ledger, args: argparse.Namespace) -> list[str]:
+    repo = repository_snapshot(PROJECT_ROOT)
+    started = ledger.append(
+        NewEvent(
+            "run.started",
+            {
+                "git_commit": repo.git_commit,
+                "dirty_tree_fingerprint": repo.dirty_tree_fingerprint,
+                "entrypoint": "tools/run_temporal_change_baselines.py",
+            },
+        )
+    )
+    source_bytes = args.residual_manifest.read_bytes()
+    source = ledger.append(
+        NewEvent(
+            "source.snapshot",
+            {
+                "manifest_path": str(args.residual_manifest.resolve()),
+                "sha256": sha256(source_bytes).hexdigest(),
+            },
+        )
+    )
+    resolved = {
+        key: (str(value.resolve()) if isinstance(value, Path) else value)
+        for key, value in vars(args).items()
+        if key != "ledger_dir"
+    }
+    config = ledger.append(
+        NewEvent(
+            "config.snapshot",
+            {
+                "arguments": resolved,
+                "arguments_hash": canonical_hash(resolved),
+            },
+        )
+    )
+    with args.residual_manifest.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    facade_ids = sorted(
+        {row.get("facade_id", "") for row in rows if row.get("facade_id", "")}
+    )
+    pair_ids = sorted(
+        {row.get("pair_id", "") for row in rows if row.get("pair_id", "")}
+    )
+    dataset = ledger.append(
+        NewEvent(
+            "dataset.snapshot",
+            {
+                "facade_ids": facade_ids,
+                "temporal_pair_ids": pair_ids,
+                "fingerprint": canonical_hash(
+                    {"facade_ids": facade_ids, "temporal_pair_ids": pair_ids}
+                ),
+            },
+        )
+    )
+    splits: dict[str, list[str]] = {}
+    for row in rows:
+        facade, split = row.get("facade_id", ""), row.get("split", "")
+        if facade and split:
+            splits.setdefault(split, []).append(facade)
+    splits = {key: sorted(set(value)) for key, value in sorted(splits.items())}
+    validate_facade_splits(splits)
+    split = ledger.append(
+        NewEvent(
+            "split.snapshot",
+            {
+                "definitions": splits,
+                "fingerprint": canonical_hash(splits),
+            },
+        )
+    )
+    return [event.event_id for event in (started, source, config, dataset, split)]
 
 
 def main() -> None:
@@ -46,25 +150,56 @@ def main() -> None:
         raise ValueError("deep-batch-size must be positive")
     methods = [item.strip() for item in args.methods.split(",") if item.strip()]
     splits = [item.strip() for item in args.splits.split(",") if item.strip()] or None
-    args.out_csv.parent.mkdir(parents=True, exist_ok=True)
-    rows = compute_baseline_tile_scores(
-        residual_manifest_csv=args.residual_manifest,
-        out_scores_csv=args.out_csv,
-        methods=methods,
-        tile_size=args.tile_size,
-        min_valid_ratio=args.min_valid_ratio,
-        device=args.device,
-        feature_cache_dir=args.feature_cache_dir,
-        dinov2_model_name=args.dinov2_model_name,
-        dinov2_cache_dir=args.dinov2_cache_dir,
-        dinov2_weights_path=args.dinov2_weights_path,
-        dinov2_repo_dir=args.dinov2_repo_dir,
-        lpips_net=args.lpips_net,
-        skip_deep_baselines=args.skip_deep_baselines,
-        include_splits=splits,
-        deep_batch_size=args.deep_batch_size,
-        show_progress=not args.no_progress,
-    )
+    ledger = Ledger(args.ledger_dir, str(uuid4())) if args.ledger_dir else None
+    source_event_ids: list[str] = []
+    if ledger:
+        try:
+            source_event_ids = _ledger_snapshots(ledger, args)
+        except BaseException as exc:
+            ledger.append(
+                NewEvent(
+                    "run.failed",
+                    {"error_type": type(exc).__name__, "message": str(exc)},
+                )
+            )
+            raise
+
+    def execute():
+        args.out_csv.parent.mkdir(parents=True, exist_ok=True)
+        return compute_baseline_tile_scores(
+            residual_manifest_csv=args.residual_manifest,
+            out_scores_csv=args.out_csv,
+            methods=methods,
+            tile_size=args.tile_size,
+            min_valid_ratio=args.min_valid_ratio,
+            device=args.device,
+            feature_cache_dir=args.feature_cache_dir,
+            dinov2_model_name=args.dinov2_model_name,
+            dinov2_cache_dir=args.dinov2_cache_dir,
+            dinov2_weights_path=args.dinov2_weights_path,
+            dinov2_repo_dir=args.dinov2_repo_dir,
+            lpips_net=args.lpips_net,
+            skip_deep_baselines=args.skip_deep_baselines,
+            include_splits=splits,
+            deep_batch_size=args.deep_batch_size,
+            show_progress=not args.no_progress,
+        )
+
+    try:
+        if ledger:
+            with ledger.stage("temporal_change_baselines"):
+                rows = execute()
+        else:
+            rows = execute()
+    except BaseException as exc:
+        if ledger:
+            ledger.append(
+                NewEvent(
+                    "run.failed",
+                    {"error_type": type(exc).__name__, "message": str(exc)},
+                )
+            )
+        raise
     method_counts = {}
     split_counts = {}
     for row in rows:
@@ -88,7 +223,34 @@ def main() -> None:
         "lpips_edge_tile_policy": "right/bottom partial tiles are edge-padded to fixed tile size before LPIPS inference",
     }
     report_path = args.out_csv.with_suffix(".report.json")
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        report_path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        if ledger:
+            artifact = ArtifactDescriptor.from_path(
+                args.out_csv,
+                "text/csv",
+                "temporal_change_baselines",
+                source_event_ids,
+            )
+            artifact_event = ledger.append(
+                NewEvent("artifact.created", asdict(artifact))
+            )
+            ledger.append(
+                NewEvent(
+                    "run.completed", {"source_event_ids": [artifact_event.event_id]}
+                )
+            )
+    except BaseException as exc:
+        if ledger:
+            ledger.append(
+                NewEvent(
+                    "run.failed",
+                    {"error_type": type(exc).__name__, "message": str(exc)},
+                )
+            )
+        raise
     print("Built tile baseline score rows: {}".format(len(rows)))
     print("Rows by method: {}".format(method_counts))
     print("Rows by split across methods: {}".format(split_counts))
