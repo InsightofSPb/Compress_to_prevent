@@ -4,125 +4,99 @@ import json
 import numpy as np
 from PIL import Image
 
-from ovs_heritage.ontology import load_ontology, ontology_from_mapping
+from ovs_heritage.ontology import V1_VERSION, load_ontology, ontology_from_mapping
 from ovs_heritage.validate_dataset import main, validate_splits
 
 
-def save_png(path, values):
-    Image.fromarray(np.array(values, dtype=np.uint8)).save(path)
+def save(path, values):
+    Image.fromarray(np.asarray(values, dtype=np.uint8)).save(path)
 
 
-def test_report_unknown_filename_and_json_is_preserved(tmp_path):
-    good = tmp_path / "good.png"
-    bad = tmp_path / "unknown.png"
-    save_png(good, [[0, 1, 10, 11, 255]])
-    save_png(bad, [[42]])
-    report = validate_splits({"train": tmp_path}, load_ontology())
-    assert not report["valid"]
-    assert report["splits"]["train"]["unknown_ids"] == [42]
-    assert report["splits"]["train"]["files_with_unknown_ids"] == [
-        {"file": str(bad), "ids": [42]}
+def write_v2_manifest(path, rows):
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["main_mask_path", "ornament_mask_path", "facade_id", "source_id"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_v2_two_maps_preserve_overlap_advertisements_and_metadata(tmp_path):
+    main = tmp_path / "main.png"
+    ornament = tmp_path / "ornament.png"
+    save(main, [[7, 5, 11, 255]])
+    save(ornament, [[1, 1, 0, 255]])
+    manifest = tmp_path / "v2.csv"
+    write_v2_manifest(manifest, [{"main_mask_path": main.name, "ornament_mask_path": ornament.name,
+                                  "facade_id": "facade_1", "source_id": "source_1"}])
+    report = validate_splits({"test": manifest}, load_ontology())
+    assert report["valid"]
+    assert report["splits"]["test"]["valid_sample_count"] == 1
+    assert report["splits"]["test"]["main_pixel_count"]["7"] == 1
+    assert report["splits"]["test"]["ornament_pixel_count"]["1"] == 2
+    assert report["reproducibility"]["hash"]
+    assert report["semantic_projection"]["entries"][-1]["semantic_id"] == 8
+
+
+def test_v2_invalid_labels_shape_missing_facade_and_empty_split(tmp_path):
+    cases = [
+        ([[8]], [[1]], "f", "invalid Y_main"),
+        ([[42]], [[0]], "f", "invalid Y_main"),
+        ([[0]], [[2]], "f", "invalid Y_ornament"),
+        ([[0, 1]], [[0]], "f", "shape mismatch"),
+        ([[0]], [[0]], "", "requires non-empty facade_id"),
     ]
-    assert "42" in " ".join(report["errors"])
-
-    output = tmp_path / "report.json"
-    assert main(["--train", str(tmp_path), "--output", str(output), "--strict"]) == 1
-    saved = json.loads(output.read_text())
-    assert saved["splits"]["train"]["unknown_ids"] == [42]
-    assert str(bad) in json.dumps(saved)
-
-
-def test_npy_float_and_boolean_masks_are_rejected_with_dtype_values_and_filename(tmp_path):
-    masks = {
-        "fractional.npy": np.array([[11.5, 255.9]]),
-        "integral_float.npy": np.array([[11.0, 255.0]]),
-        "boolean.npy": np.array([[True, False]]),
-    }
-    for name, array in masks.items():
-        np.save(tmp_path / name, array)
-    report = validate_splits({"test": tmp_path}, load_ontology())
-    assert not report["valid"]
-    errors = "\n".join(report["errors"])
-    for name in masks:
-        assert name in errors
-    assert "float64" in errors and "bool" in errors
-    assert "11.5" in errors and "11.0" in errors
+    for index, (main_values, ornament_values, facade, message) in enumerate(cases):
+        main = tmp_path / f"m{index}.png"
+        ornament = tmp_path / f"o{index}.png"
+        save(main, main_values)
+        save(ornament, ornament_values)
+        manifest = tmp_path / f"case{index}.csv"
+        write_v2_manifest(manifest, [{"main_mask_path": main.name, "ornament_mask_path": ornament.name,
+                                      "facade_id": facade, "source_id": str(index)}])
+        report = validate_splits({"test": manifest}, load_ontology())
+        assert not report["valid"] and message in " ".join(report["errors"])
+    empty = tmp_path / "empty.csv"
+    write_v2_manifest(empty, [])
+    assert "split is empty" in " ".join(validate_splits({"test": empty}, load_ontology())["errors"])
 
 
-def test_facade_overlap_and_absent_advertisements_warning(tmp_path):
-    mask = tmp_path / "no_ads.png"
-    save_png(mask, [[0, 1, 255]])
+def test_facade_and_path_leakage_across_splits(tmp_path):
+    main = tmp_path / "main.png"
+    ornament = tmp_path / "ornament.png"
+    save(main, [[0]])
+    save(ornament, [[0]])
     manifests = []
     for split in ("train", "test"):
-        path = tmp_path / f"{split}.csv"
-        with path.open("w", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=["mask_path", "facade_id"])
-            writer.writeheader()
-            writer.writerow({"mask_path": "no_ads.png", "facade_id": "same"})
-        manifests.append(path)
+        manifest = tmp_path / f"{split}.csv"
+        write_v2_manifest(manifest, [{"main_mask_path": main.name, "ornament_mask_path": ornament.name,
+                                      "facade_id": "same", "source_id": "same"}])
+        manifests.append(manifest)
     report = validate_splits({"train": manifests[0], "test": manifests[1]}, load_ontology())
-    assert any("overlap" in error for error in report["errors"])
-    assert any("ADVERTISEMENTS" in warning for warning in report["warnings"])
+    assert report["facade_overlaps"] and report["duplicated_paths"] and not report["valid"]
 
 
-def test_id_11_is_valid_in_v2_and_rejected_in_v1(tmp_path):
-    mask = tmp_path / "advertisement.png"
-    save_png(mask, [[11]])
-    assert validate_splits({"test": tmp_path}, load_ontology())["valid"]
-
-    with open("ovs_heritage/configs/heritage_vocab.yaml", encoding="utf-8") as stream:
-        data = json.load(stream)
-    data["version"] = "heritage_facades_v1_11classes"
+def test_v1_explicit_schema_rejects_id11(tmp_path):
+    data = json.load(open("ovs_heritage/configs/heritage_vocab.yaml"))
+    data["version"] = V1_VERSION
     data["classes"] = data["classes"][:11]
+    data["classes"][8]["name"] = "ornament_intact"
+    data["classes"][8]["aliases"] = []
+    data["groups"]["ORNAMENT"] = ["ornament_intact"]
     data["groups"]["HUMAN_ACTIVITY"].remove("advertisements")
-    report = validate_splits({"test": tmp_path}, ontology_from_mapping(data))
-    assert not report["valid"]
-    assert report["splits"]["test"]["unknown_ids"] == [11]
-    assert "advertisement.png" in "\n".join(report["errors"])
-
-
-def test_tile_manifest_counts_unique_non_empty_source_ids(tmp_path):
-    mask_paths = []
-    for name in ("tile_a.png", "tile_b.png", "tile_c.png"):
-        path = tmp_path / name
-        save_png(path, [[0, 11]])
-        mask_paths.append(path)
-    manifest = tmp_path / "tiles.csv"
+    ontology = ontology_from_mapping(data)
+    mask = tmp_path / "legacy.png"
+    save(mask, [[11]])
+    manifest = tmp_path / "legacy.csv"
     with manifest.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=["source_id", "mask_path", "facade_id"])
-        writer.writeheader()
-        writer.writerows([
-            {"source_id": "facade_001", "mask_path": mask_paths[0].name, "facade_id": "f1"},
-            {"source_id": "facade_001", "mask_path": mask_paths[1].name, "facade_id": "f1"},
-            {"source_id": "facade_002", "mask_path": mask_paths[2].name, "facade_id": "f2"},
-        ])
-    split = validate_splits({"test": manifest}, load_ontology())["splits"]["test"]
-    assert split["image_count"] == 2
-    assert split["mask_count"] == 3
-    assert split["tile_count"] == 3
-    assert split["image_count_source"] == "unique non-empty source_id"
-
-
-def test_image_manifest_counts_rows_and_empty_tile_source_id_is_error(tmp_path):
-    for name in ("image_a.png", "image_b.png"):
-        save_png(tmp_path / name, [[0, 11]])
-    ordinary = tmp_path / "ordinary.csv"
-    with ordinary.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=["mask_path", "facade_id"])
         writer.writeheader()
-        writer.writerows([
-            {"mask_path": "image_a.png", "facade_id": "f1"},
-            {"mask_path": "image_b.png", "facade_id": "f2"},
-        ])
-    split = validate_splits({"test": ordinary}, load_ontology())["splits"]["test"]
-    assert split["image_count"] == 2 and split["mask_count"] == 2
-    assert split["tile_count"] is None
+        writer.writerow({"mask_path": mask.name, "facade_id": "f"})
+    report = validate_splits({"test": manifest}, ontology)
+    assert not report["valid"] and "invalid legacy-v1 IDs [11]" in " ".join(report["errors"])
 
-    invalid = tmp_path / "invalid_tiles.csv"
-    with invalid.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=["source_id", "mask_path"])
-        writer.writeheader()
-        writer.writerow({"source_id": "", "mask_path": "image_a.png"})
-    report = validate_splits({"test": invalid}, load_ontology())
-    assert not report["valid"]
-    assert "empty source_id" in "\n".join(report["errors"])
+
+def test_cli_writes_report_on_failure(tmp_path):
+    manifest = tmp_path / "empty.csv"
+    write_v2_manifest(manifest, [])
+    output = tmp_path / "report.json"
+    assert main(["--test", str(manifest), "--output", str(output), "--strict"]) == 1
+    assert output.exists() and json.loads(output.read_text())["valid"] is False

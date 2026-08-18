@@ -14,13 +14,13 @@ from yaml import YAMLError
 IGNORE_INDEX = 255
 DEFAULT_ONTOLOGY = Path(__file__).parent / "configs" / "heritage_vocab.yaml"
 V1_VERSION = "heritage_facades_v1_11classes"
-V2_VERSION = "heritage_facades_v2_12classes"
+V2_VERSION = "heritage_facades_v2_12concepts_two_heads"
 V2_CLASS_NAMES = (
     "background", "crack", "spalling", "delamination", "missing_element",
-    "water_stain", "efflorescence", "corrosion", "ornament_intact",
+    "water_stain", "efflorescence", "corrosion", "ornament_region",
     "repairs", "text_or_images", "advertisements",
 )
-V1_CLASS_NAMES = V2_CLASS_NAMES[:-1]
+V1_CLASS_NAMES = V2_CLASS_NAMES[:8] + ("ornament_intact",) + V2_CLASS_NAMES[9:-1]
 VERSION_CLASS_NAMES = {
     V1_VERSION: V1_CLASS_NAMES,
     V2_VERSION: V2_CLASS_NAMES,
@@ -60,15 +60,38 @@ class Ontology:
     hash: str
 
     @property
-    def class_names(self) -> tuple[str, ...]: return tuple(c.name for c in self.classes)
+    def class_names(self) -> tuple[str, ...]:
+        return tuple(item.name for item in self.classes)
+
     @property
-    def display_names(self) -> tuple[str, ...]: return tuple(c.display_name for c in self.classes)
+    def display_names(self) -> tuple[str, ...]:
+        return tuple(item.display_name for item in self.classes)
+
     @property
-    def palette(self) -> tuple[tuple[int, int, int], ...]: return tuple(c.color for c in self.classes)
+    def palette(self) -> tuple[tuple[int, int, int], ...]:
+        return tuple(item.color for item in self.classes)
+
     @property
-    def valid_ids(self) -> frozenset[int]: return frozenset(c.id for c in self.classes)
+    def valid_ids(self) -> frozenset[int]:
+        return frozenset(item.id for item in self.classes)
+
     def by_name(self, name: str) -> OntologyClass:
-        return next(c for c in self.classes if c.name == name)
+        matches = [item for item in self.classes if item.name == name]
+        if not matches:
+            raise OntologyError(f"unknown canonical class name {name!r} in {self.version}")
+        return matches[0]
+
+    def resolve_name(self, name: str, *, allow_deprecated_alias: bool = False) -> OntologyClass:
+        try:
+            return self.by_name(name)
+        except OntologyError:
+            if allow_deprecated_alias:
+                matches = [item for item in self.classes if name in item.aliases]
+                if len(matches) == 1:
+                    return matches[0]
+            raise OntologyError(
+                f"unknown class name {name!r}; deprecated aliases require explicit resolution"
+            )
 
 
 def _canonical_hash(data: Mapping[str, Any]) -> str:
@@ -171,17 +194,22 @@ def _parse_config(data: Mapping[str, Any]) -> tuple[str, int, tuple[OntologyClas
 def ontology_from_mapping(data: Mapping[str, Any]) -> Ontology:
     version, ignore, classes, groups = _parse_config(data)
     ids, names = [c.id for c in classes], [c.name for c in classes]
-    if len(ids) != len(set(ids)): raise OntologyError("duplicate numeric class IDs")
-    if len(names) != len(set(names)): raise OntologyError("duplicate canonical class names")
-    if ignore in ids: raise OntologyError(f"ignore_index {ignore} must not be a class")
+    if len(ids) != len(set(ids)):
+        raise OntologyError("duplicate numeric class IDs")
+    if len(names) != len(set(names)):
+        raise OntologyError("duplicate canonical class names")
+    if ignore in ids:
+        raise OntologyError(f"ignore_index {ignore} must not be a class")
     aliases = [a.casefold() for c in classes for a in c.aliases]
     reserved = {n.casefold() for n in names}
     if len(aliases) != len(set(aliases)) or reserved.intersection(aliases):
         raise OntologyError("duplicate/conflicting aliases")
     colors = [c.color for c in classes]
-    if len(colors) != len(set(colors)): raise OntologyError("palette colors must be unique")
+    if len(colors) != len(set(colors)):
+        raise OntologyError("palette colors must be unique")
     expected_names = VERSION_CLASS_NAMES[version]
-    if ignore != IGNORE_INDEX: raise OntologyError(f"{version} requires ignore_index=255, got {ignore}")
+    if ignore != IGNORE_INDEX:
+        raise OntologyError(f"{version} requires ignore_index=255, got {ignore}")
     if ids != list(range(len(expected_names))):
         raise OntologyError(f"{version} requires ordered IDs 0..{len(expected_names) - 1}, got {ids}")
     if tuple(names) != expected_names:
@@ -191,12 +219,15 @@ def ontology_from_mapping(data: Mapping[str, Any]) -> Ontology:
     known = set(names)
     for group, members in groups.items():
         unknown = set(members) - known
-        if unknown: raise OntologyError(f"group {group} references unknown classes: {sorted(unknown)}")
+        if unknown:
+            raise OntologyError(f"group {group} references unknown classes: {sorted(unknown)}")
     for c in classes:
         unknown_groups = set(c.evaluation_groups) - set(groups)
-        if unknown_groups: raise OntologyError(f"class {c.name} references unknown groups: {sorted(unknown_groups)}")
+        if unknown_groups:
+            raise OntologyError(f"class {c.name} references unknown groups: {sorted(unknown_groups)}")
         for group in c.evaluation_groups:
-            if c.name not in groups[group]: raise OntologyError(f"inconsistent membership for {c.name} in {group}")
+            if c.name not in groups[group]:
+                raise OntologyError(f"inconsistent membership for {c.name} in {group}")
     class_groups = {c.name: set(c.evaluation_groups) for c in classes}
     for group, members in groups.items():
         for member in members:
@@ -212,6 +243,9 @@ def ontology_from_mapping(data: Mapping[str, Any]) -> Ontology:
                 raise OntologyError(f"{version} requires evaluation group {group}")
             if tuple(actual) != tuple(required_members):
                 raise OntologyError(f"{group} must be {list(required_members)}, got {list(actual)}")
+        ornament = groups.get("ORNAMENT")
+        if ornament != ("ornament_region",):
+            raise OntologyError("ORNAMENT must contain exactly ['ornament_region']")
     return Ontology(version, ignore, tuple(classes), groups, _canonical_hash(data))
 
 

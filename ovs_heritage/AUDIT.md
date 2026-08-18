@@ -40,7 +40,7 @@ Semicolon-separated labels are expanded in `_get_class_embeddings`: every alias 
 | `tools/compare_models_facades.py` | groups | eleven-class evaluation | local sets | re-evaluate both models on common v2 test set | deferred to P1/P2 |
 | `tools/render_temporal_qualitative_grids.py` | defaults | eleven names/colors | literal lists | legacy figures remain reproducible | legacy intentionally preserved |
 | `models/maskclip/maskclip.py` | head outputs | channel count follows expanded strings | embedding convolution | P0 scorer supports runtime C | changed |
-| `ovs_heritage/configs/datasets/heritage_facades_v2.py` | adapter exports | twelve-class v2 | values loaded from canonical source | use for new masks | changed |
+| `ovs_heritage/configs/datasets/heritage_facades_v2.py` | adapter exports | twelve concepts projected to 11 main channels plus one ornament channel | values loaded from canonical source and projection | use only with explicit two-map v2 manifests | changed |
 | README temporal semantics | ontology prose | text/signage combined | explicitly says combined class | update only when downstream temporal contract migrates | legacy intentionally preserved |
 
 No existing tracked occurrence of `ADVERTISEMENTS` was found: the user addition is not present in this branch/status/history-visible working tree. Thus there was no existing color to preserve. P0 assigns unique visualization RGB `(216, 27, 96)` and leaves colors 0..10 unchanged. No annotation pixels were created, moved, or converted.
@@ -54,3 +54,18 @@ A second independently observed defect is `LPOSS_Infrencer.encode_decode` referr
 ## 9. Historical metrics
 
 Values such as mIoU 0.0551→0.1676 or DAMAGE_MACRO_MIOU 0.0209→0.0802, wherever retained as experiment references, are not P0 results. Eleven- and twelve-class mIoU are not directly comparable. Stock and adapted models must be evaluated again on the identical twelve-class test set. Future reports must distinguish `stock_repo_exact` from `stock_shared_scorer` (stock dense features with the P0 scorer).
+
+## 10. P0 two-map correction
+
+The current P0 representation supersedes the earlier single-raster v2 assumption.
+Canonical concept 8 is now `ornament_region`: visible decorative geometry in an
+independent binary target, not a mutually exclusive “intact ornament” class.
+Legacy converters and v1 masks flatten overlaps and cannot be losslessly
+reinterpreted without original overlapping annotations. The new projection,
+losses, and validator do not modify legacy files or implement a two-head model.
+
+The repository has a temporal semantic backend registry, but no shared neutral
+experiment-metadata record suitable for segmentation validation/loss settings.
+P0 therefore exposes a small deterministic JSON-serializable record only; it
+does not duplicate the backend registry or implement the future experiment
+ledger. LPOSS model integration remains outside P0.

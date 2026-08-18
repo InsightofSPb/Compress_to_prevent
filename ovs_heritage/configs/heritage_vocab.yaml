@@ -1,5 +1,5 @@
 {
-  "version": "heritage_facades_v2_12classes",
+  "version": "heritage_facades_v2_12concepts_two_heads",
   "ignore_index": 255,
   "groups": {
     "STRUCTURAL_DAMAGE": [
@@ -28,7 +28,7 @@
       "corrosion"
     ],
     "ORNAMENT": [
-      "ornament_intact"
+      "ornament_region"
     ]
   },
   "classes": [
@@ -210,14 +210,16 @@
     },
     {
       "id": 8,
-      "name": "ornament_intact",
-      "display_name": "ORNAMENT_INTACT",
-      "description": "an intact decorative architectural element",
+      "name": "ornament_region",
+      "display_name": "ORNAMENT_REGION",
+      "description": "visible ornamental or decorative facade geometry, independently of damage or surface condition",
       "prompts": [
-        "an intact ornament on a historic facade",
-        "preserved architectural decoration"
+        "visible ornamental geometry on a historic facade",
+        "a decorative architectural region on a building facade"
       ],
-      "aliases": [],
+      "aliases": [
+        "ornament_intact"
+      ],
       "role": "heritage",
       "is_heritage": true,
       "evaluation_groups": [

@@ -1,4 +1,3 @@
-import copy
 import json
 
 import numpy as np
@@ -26,6 +25,7 @@ def test_exact_v2_ontology_and_groups():
     assert ontology.by_name("background").id == 0
     assert ontology.by_name("text_or_images").id == 10
     assert ontology.by_name("advertisements").id == 11
+    assert ontology.by_name("ornament_region").id == 8
     assert "advertisements" in ontology.groups["HUMAN_ACTIVITY"]
     assert "advertisements" not in ontology.groups["DAMAGE_MACRO"]
     assert tuple(ontology.groups["DAMAGE_MACRO"]) == ontology.class_names[1:8]
@@ -50,7 +50,7 @@ def test_ontology_ids_must_be_real_integers(bad_id):
 
 
 @pytest.mark.parametrize("version", [
-    "heritage_facades_v2_12classe",
+    "heritage_facades_v2_12concepts_two_head",
     "arbitrary_unseen_ontology",
     "",
     2,
@@ -58,7 +58,7 @@ def test_ontology_ids_must_be_real_integers(bad_id):
 def test_unknown_empty_and_non_string_versions_are_rejected(version):
     data = config()
     data["version"] = version
-    with pytest.raises(OntologyError, match=r"supported versions:.*v1_11classes.*v2_12classes"):
+    with pytest.raises(OntologyError, match=r"supported versions:.*v1_11classes.*v2_12concepts_two_heads"):
         ontology_from_mapping(data)
 
 
@@ -194,3 +194,15 @@ def test_mask_dtype_is_checked_before_values_are_converted():
 def test_unknown_ids_are_explicit():
     with pytest.raises(OntologyError, match=r"mock.png: unknown mask IDs \[17\]"):
         validate_mask_ids(np.array([17], dtype=np.int16), load_ontology(), "mock.png")
+
+
+def test_ornament_region_is_canonical_and_legacy_alias_is_explicit():
+    ontology = load_ontology()
+    assert ontology.by_name("ornament_region").id == 8
+    with pytest.raises(OntologyError, match="unknown canonical"):
+        ontology.by_name("ornament_intact")
+    with pytest.raises(OntologyError, match="explicit resolution"):
+        ontology.resolve_name("ornament_intact")
+    assert ontology.resolve_name("ornament_intact", allow_deprecated_alias=True).name == "ornament_region"
+    with pytest.raises(OntologyError, match="unknown canonical"):
+        ontology.by_name("does_not_exist")
