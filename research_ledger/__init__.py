@@ -10,7 +10,10 @@ from .ledger import (
     StoredEvent,
     canonical_bytes,
     canonical_hash,
+    file_descriptor,
     ontology_snapshot,
+    repository_snapshot,
+    sanitize_error,
 )
 
 __all__ = [
@@ -23,5 +26,8 @@ __all__ = [
     "StoredEvent",
     "canonical_bytes",
     "canonical_hash",
+    "file_descriptor",
     "ontology_snapshot",
+    "repository_snapshot",
+    "sanitize_error",
 ]

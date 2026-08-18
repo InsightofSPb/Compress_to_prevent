@@ -16,8 +16,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: python -m pip install numpy pillow pytest ruff
+          python-version: "3.9"
+      - run: python -m pip install numpy==1.26.4 pillow==10.4.0 pyyaml==6.0.2 pytest==8.3.3 ruff==0.6.9
       - run: python -m compileall -q research_ledger tools/run_temporal_change_baselines.py
       - run: pytest -q tests/test_research_ledger.py tests/test_temporal_baseline_ledger_cli.py
       - run: ruff check research_ledger tools/run_temporal_change_baselines.py tests/test_research_ledger.py tests/test_temporal_baseline_ledger_cli.py
+      - run: ruff format --check research_ledger tools/run_temporal_change_baselines.py tests/test_research_ledger.py tests/test_temporal_baseline_ledger_cli.py
