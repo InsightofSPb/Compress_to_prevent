@@ -45,7 +45,64 @@ def test_hash_independent_of_mapping_key_order_and_yaml_format(tmp_path):
 def test_ontology_ids_must_be_real_integers(bad_id):
     data = config()
     data["classes"][11]["id"] = bad_id
-    with pytest.raises(OntologyError, match="class ID must be an integer"):
+    with pytest.raises(OntologyError, match=r"classes\[11\]\.id must be an integer"):
+        ontology_from_mapping(data)
+
+
+@pytest.mark.parametrize("version", [
+    "heritage_facades_v2_12classe",
+    "arbitrary_unseen_ontology",
+    "",
+    2,
+])
+def test_unknown_empty_and_non_string_versions_are_rejected(version):
+    data = config()
+    data["version"] = version
+    with pytest.raises(OntologyError, match=r"supported versions:.*v1_11classes.*v2_12classes"):
+        ontology_from_mapping(data)
+
+
+def test_unknown_version_is_rejected_before_other_corruption():
+    data = config()
+    data["version"] = "future_unregistered_version"
+    data["ignore_index"] = 254
+    data["classes"][9], data["classes"][11] = data["classes"][11], data["classes"][9]
+    with pytest.raises(OntologyError, match=r"version 'future_unregistered_version' is unsupported"):
+        ontology_from_mapping(data)
+
+
+@pytest.mark.parametrize(
+    ("class_index", "field", "value", "error_path"),
+    [
+        (11, "is_heritage", "false", r"classes\[11\]\.is_heritage"),
+        (3, "prompts", "abc", r"classes\[3\]\.prompts"),
+        (11, "aliases", "ad", r"classes\[11\]\.aliases"),
+        (11, "evaluation_groups", "HUMAN_ACTIVITY", r"classes\[11\]\.evaluation_groups"),
+        (2, "name", 123, r"classes\[2\]\.name"),
+        (4, "id", True, r"classes\[4\]\.id"),
+        (5, "color", [0, True, 2], r"classes\[5\]\.color\[1\]"),
+    ],
+)
+def test_class_schema_rejects_coercible_wrong_types(class_index, field, value, error_path):
+    data = config()
+    data["classes"][class_index][field] = value
+    with pytest.raises(OntologyError, match=error_path):
+        ontology_from_mapping(data)
+
+
+def test_prompt_and_alias_lists_accept_only_schema_valid_lists():
+    data = config()
+    data["classes"][0]["prompts"] = ["a valid non-empty prompt"]
+    data["classes"][0]["aliases"] = []
+    ontology = ontology_from_mapping(data)
+    assert ontology.classes[0].prompts == ("a valid non-empty prompt",)
+    assert ontology.classes[0].aliases == ()
+
+
+def test_top_level_group_schema_paths_are_strict():
+    data = config()
+    data["groups"]["HUMAN_ACTIVITY"] = "advertisements"
+    with pytest.raises(OntologyError, match=r"evaluation_groups\.HUMAN_ACTIVITY"):
         ontology_from_mapping(data)
 
 

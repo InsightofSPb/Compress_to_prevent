@@ -79,3 +79,50 @@ def test_id_11_is_valid_in_v2_and_rejected_in_v1(tmp_path):
     assert not report["valid"]
     assert report["splits"]["test"]["unknown_ids"] == [11]
     assert "advertisement.png" in "\n".join(report["errors"])
+
+
+def test_tile_manifest_counts_unique_non_empty_source_ids(tmp_path):
+    mask_paths = []
+    for name in ("tile_a.png", "tile_b.png", "tile_c.png"):
+        path = tmp_path / name
+        save_png(path, [[0, 11]])
+        mask_paths.append(path)
+    manifest = tmp_path / "tiles.csv"
+    with manifest.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["source_id", "mask_path", "facade_id"])
+        writer.writeheader()
+        writer.writerows([
+            {"source_id": "facade_001", "mask_path": mask_paths[0].name, "facade_id": "f1"},
+            {"source_id": "facade_001", "mask_path": mask_paths[1].name, "facade_id": "f1"},
+            {"source_id": "facade_002", "mask_path": mask_paths[2].name, "facade_id": "f2"},
+        ])
+    split = validate_splits({"test": manifest}, load_ontology())["splits"]["test"]
+    assert split["image_count"] == 2
+    assert split["mask_count"] == 3
+    assert split["tile_count"] == 3
+    assert split["image_count_source"] == "unique non-empty source_id"
+
+
+def test_image_manifest_counts_rows_and_empty_tile_source_id_is_error(tmp_path):
+    for name in ("image_a.png", "image_b.png"):
+        save_png(tmp_path / name, [[0, 11]])
+    ordinary = tmp_path / "ordinary.csv"
+    with ordinary.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["mask_path", "facade_id"])
+        writer.writeheader()
+        writer.writerows([
+            {"mask_path": "image_a.png", "facade_id": "f1"},
+            {"mask_path": "image_b.png", "facade_id": "f2"},
+        ])
+    split = validate_splits({"test": ordinary}, load_ontology())["splits"]["test"]
+    assert split["image_count"] == 2 and split["mask_count"] == 2
+    assert split["tile_count"] is None
+
+    invalid = tmp_path / "invalid_tiles.csv"
+    with invalid.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["source_id", "mask_path"])
+        writer.writeheader()
+        writer.writerow({"source_id": "", "mask_path": "image_a.png"})
+    report = validate_splits({"test": invalid}, load_ontology())
+    assert not report["valid"]
+    assert "empty source_id" in "\n".join(report["errors"])

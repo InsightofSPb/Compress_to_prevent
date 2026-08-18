@@ -13,6 +13,15 @@ hashes the parsed data as canonical JSON with sorted mapping keys, so paths,
 YAML comments/whitespace, and mapping-key order cannot affect it. Runtime list
 order remains meaningful and is the exact output-channel order.
 
+Only the explicitly registered `heritage_facades_v1_11classes` and
+`heritage_facades_v2_12classes` ontology versions are accepted. An empty,
+misspelled, unknown, or non-string version is an error rather than a fallback
+to relaxed validation. This registry is deliberately separate from runtime
+vocabularies, which may still contain arbitrary unseen classes and ordering.
+Raw configuration fields are schema-checked before tuple construction: strings
+are not treated as lists, numeric/string values are not coerced, and booleans
+are not accepted as integer IDs or palette components.
+
 `heritage_facades_v2_12classes` has 12 mask classes (0..11), 11 foreground classes (1..11), and 7 damage classes (1..7). `IGNORE=255` is neither a class nor a palette/vocabulary entry. `BACKGROUND=0` is valid. `TEXT_OR_IMAGES=10` means non-commercial writing/graffiti/images; `ADVERTISEMENTS=11` is separate commercial advertising. Prompts affect only text prototypes and never relabel masks.
 
 A runtime vocabulary may be heritage-only, unseen-only, mixed, reordered, and any size. Each class's normalized prompt embeddings are averaged and normalized again. Aliases may add prompt variants but never classes/channels. The injectable encoder makes CPU mocks possible. Prototypes and metadata are returned runtime objects rather than persistent checkpoint weights, preventing checkpoint dependence on vocabulary length/order.
@@ -35,6 +44,12 @@ python -m ovs_heritage.validate_dataset \
 ```
 
 Alternatively pass `--train`, `--val`, and/or `--test`, each a manifest or mask directory. The JSON report contains timestamp/sources, ontology version/hash, ignore index, image/mask counts, IDs, per-ID pixels/frequencies/image incidence, missing classes, unknown IDs/files, warnings, errors, and facade overlaps. The validator is read-only, writes reports even on data errors, and strict mode exits nonzero. Missing advertisements is a warning; unknown IDs and cross-split facade overlap are errors. A v1 source with IDs 0..10 rejects ID 11.
+
+For repository tile manifests, `image_count` is the number of unique non-empty
+`source_id` values, while `mask_count` and `tile_count` remain the number of
+checked tile masks. Empty `source_id` values in a manifest that declares that
+column are errors. For ordinary manifests without `source_id`, `image_count`
+and `mask_count` both count rows; mask directories count files.
 
 Masks must have a non-boolean integer dtype. Floating-point masks (including
 integral-looking values such as `11.0`), booleans, strings, and objects are

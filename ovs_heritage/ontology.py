@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import yaml
 from yaml import YAMLError
@@ -21,6 +21,10 @@ V2_CLASS_NAMES = (
     "repairs", "text_or_images", "advertisements",
 )
 V1_CLASS_NAMES = V2_CLASS_NAMES[:-1]
+VERSION_CLASS_NAMES = {
+    V1_VERSION: V1_CLASS_NAMES,
+    V2_VERSION: V2_CLASS_NAMES,
+}
 REQUIRED_V2_GROUPS = {
     "STRUCTURAL_DAMAGE": V2_CLASS_NAMES[1:5],
     "SURFACE_STAIN": V2_CLASS_NAMES[5:8],
@@ -73,39 +77,99 @@ def _canonical_hash(data: Mapping[str, Any]) -> str:
     return sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def ontology_from_mapping(data: Mapping[str, Any]) -> Ontology:
-    if not isinstance(data, Mapping): raise OntologyError("ontology root must be a mapping")
-    version = data.get("version", "")
-    if not isinstance(version, str): raise OntologyError("ontology version must be a string")
-    ignore = data.get("ignore_index", IGNORE_INDEX)
+def _type_error(path: str, expected: str, value: Any) -> OntologyError:
+    return OntologyError(f"{path} must be {expected}, got {value!r} ({type(value).__name__})")
+
+
+def _required_string(mapping: Mapping[str, Any], key: str, path: str) -> str:
+    value = mapping.get(key)
+    field_path = f"{path}.{key}" if path else key
+    if not isinstance(value, str) or not value.strip():
+        raise _type_error(field_path, "a non-empty string", value)
+    return value
+
+
+def _string_list(mapping: Mapping[str, Any], key: str, path: str, *, non_empty: bool) -> tuple[str, ...]:
+    value = mapping.get(key)
+    field_path = f"{path}.{key}"
+    if not isinstance(value, list):
+        raise _type_error(field_path, "a list of strings", value)
+    if non_empty and not value:
+        raise OntologyError(f"{field_path} must be a non-empty list of non-empty strings")
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise _type_error(f"{field_path}[{index}]", "a non-empty string", item)
+    return tuple(value)
+
+
+def _parse_config(data: Mapping[str, Any]) -> tuple[str, int, tuple[OntologyClass, ...], dict[str, tuple[str, ...]]]:
+    """Strict schema boundary: validate raw values before any conversion."""
+    if not isinstance(data, Mapping):
+        raise _type_error("root", "a mapping", data)
+    version = data.get("version")
+    supported = sorted(VERSION_CLASS_NAMES)
+    if not isinstance(version, str) or not version.strip():
+        raise OntologyError(
+            f"version must be a non-empty string, got {version!r} ({type(version).__name__}); "
+            f"supported versions: {supported}"
+        )
+    if version not in VERSION_CLASS_NAMES:
+        raise OntologyError(
+            f"version {version!r} is unsupported; supported versions: {supported}"
+        )
+    ignore = data.get("ignore_index")
     if type(ignore) is not int:
-        raise OntologyError(f"ignore_index must be an integer, got {ignore!r} ({type(ignore).__name__})")
+        raise _type_error("ignore_index", "an integer", ignore)
     raw_classes = data.get("classes")
-    if not isinstance(raw_classes, Sequence) or isinstance(raw_classes, (str, bytes)) or not raw_classes:
-        raise OntologyError("classes must be a non-empty list")
+    if not isinstance(raw_classes, list) or not raw_classes:
+        raise _type_error("classes", "a non-empty list", raw_classes)
+
     classes = []
-    for raw in raw_classes:
-        if not isinstance(raw, Mapping): raise OntologyError(f"class entry must be a mapping: {raw!r}")
+    for index, raw in enumerate(raw_classes):
+        path = f"classes[{index}]"
+        if not isinstance(raw, Mapping):
+            raise _type_error(path, "a mapping", raw)
         raw_id = raw.get("id")
         if type(raw_id) is not int:
-            raise OntologyError(f"class ID must be an integer, got {raw_id!r} ({type(raw_id).__name__})")
-        try:
-            color = raw["color"]
-            if not isinstance(color, Sequence) or isinstance(color, (str, bytes)) or any(type(x) is not int for x in color):
-                raise OntologyError(f"color for {raw.get('name')!r} must contain three integers")
-            cls = OntologyClass(raw_id, str(raw["name"]), str(raw["display_name"]),
-                str(raw["description"]), tuple(raw["prompts"]), tuple(raw.get("aliases", [])),
-                str(raw["role"]), bool(raw["is_heritage"]),
-                tuple(raw.get("evaluation_groups", [])), tuple(color))
-        except OntologyError:
-            raise
-        except (KeyError, TypeError, ValueError) as exc:
-            raise OntologyError(f"invalid class entry: {raw!r}: {exc}") from exc
-        if not cls.prompts or any(not str(p).strip() for p in cls.prompts):
-            raise OntologyError(f"class {cls.name!r} has no usable prompts")
-        if len(cls.color) != 3 or any(x < 0 or x > 255 for x in cls.color):
-            raise OntologyError(f"invalid color for {cls.name!r}")
-        classes.append(cls)
+            raise _type_error(f"{path}.id", "an integer", raw_id)
+        name = _required_string(raw, "name", path)
+        display_name = _required_string(raw, "display_name", path)
+        description = _required_string(raw, "description", path)
+        role = _required_string(raw, "role", path)
+        is_heritage = raw.get("is_heritage")
+        if type(is_heritage) is not bool:
+            raise _type_error(f"{path}.is_heritage", "a boolean", is_heritage)
+        prompts = _string_list(raw, "prompts", path, non_empty=True)
+        aliases = _string_list(raw, "aliases", path, non_empty=False)
+        evaluation_groups = _string_list(raw, "evaluation_groups", path, non_empty=False)
+        color = raw.get("color")
+        if not isinstance(color, list) or len(color) != 3:
+            raise _type_error(f"{path}.color", "a list of exactly three integers", color)
+        for component_index, component in enumerate(color):
+            if type(component) is not int or not 0 <= component <= 255:
+                raise _type_error(f"{path}.color[{component_index}]", "an integer in 0..255", component)
+        classes.append(OntologyClass(raw_id, name, display_name, description, prompts, aliases,
+                                     role, is_heritage, evaluation_groups, tuple(color)))
+
+    raw_groups = data.get("groups")
+    if not isinstance(raw_groups, Mapping):
+        raise _type_error("evaluation_groups", "a mapping", raw_groups)
+    groups = {}
+    for group_name, members in raw_groups.items():
+        if not isinstance(group_name, str) or not group_name.strip():
+            raise _type_error("evaluation_groups.<key>", "a non-empty string", group_name)
+        group_path = f"evaluation_groups.{group_name}"
+        if not isinstance(members, list):
+            raise _type_error(group_path, "a list of strings", members)
+        for member_index, member in enumerate(members):
+            if not isinstance(member, str) or not member.strip():
+                raise _type_error(f"{group_path}[{member_index}]", "a non-empty string", member)
+        groups[group_name] = tuple(members)
+    return version, ignore, tuple(classes), groups
+
+
+def ontology_from_mapping(data: Mapping[str, Any]) -> Ontology:
+    version, ignore, classes, groups = _parse_config(data)
     ids, names = [c.id for c in classes], [c.name for c in classes]
     if len(ids) != len(set(ids)): raise OntologyError("duplicate numeric class IDs")
     if len(names) != len(set(names)): raise OntologyError("duplicate canonical class names")
@@ -116,17 +180,14 @@ def ontology_from_mapping(data: Mapping[str, Any]) -> Ontology:
         raise OntologyError("duplicate/conflicting aliases")
     colors = [c.color for c in classes]
     if len(colors) != len(set(colors)): raise OntologyError("palette colors must be unique")
-    expected_names = V2_CLASS_NAMES if version == V2_VERSION else V1_CLASS_NAMES if version == V1_VERSION else None
-    if expected_names is not None:
-        if ignore != IGNORE_INDEX: raise OntologyError(f"{version} requires ignore_index=255, got {ignore}")
-        if ids != list(range(len(expected_names))):
-            raise OntologyError(f"{version} requires ordered IDs 0..{len(expected_names) - 1}, got {ids}")
-        if tuple(names) != expected_names:
-            raise OntologyError(f"{version} requires canonical class order {list(expected_names)}, got {names}")
-        if len(colors) != len(expected_names):
-            raise OntologyError(f"{version} requires exactly {len(expected_names)} palette entries")
-    groups_raw = data.get("groups", {})
-    groups = {str(k): tuple(str(x) for x in v) for k, v in groups_raw.items()}
+    expected_names = VERSION_CLASS_NAMES[version]
+    if ignore != IGNORE_INDEX: raise OntologyError(f"{version} requires ignore_index=255, got {ignore}")
+    if ids != list(range(len(expected_names))):
+        raise OntologyError(f"{version} requires ordered IDs 0..{len(expected_names) - 1}, got {ids}")
+    if tuple(names) != expected_names:
+        raise OntologyError(f"{version} requires canonical class order {list(expected_names)}, got {names}")
+    if len(colors) != len(expected_names):
+        raise OntologyError(f"{version} requires exactly {len(expected_names)} palette entries")
     known = set(names)
     for group, members in groups.items():
         unknown = set(members) - known

@@ -20,18 +20,27 @@ def _manifest_rows(path: Path) -> list[dict[str, Any]]:
     if not isinstance(data, list): raise ValueError(f"{path}: manifest must contain a list of samples")
     return [dict(x) for x in data]
 
-def _resolve_source(source: str | Path) -> tuple[list[tuple[Path, str | None]], int, str]:
+def _resolve_source(source: str | Path) -> tuple[list[tuple[Path, str | None]], int, str, bool]:
     path = Path(source)
     if path.is_dir():
         masks = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".png", ".tif", ".tiff", ".npy"})
-        return [(p, None) for p in masks], len(masks), str(path)
-    rows = _manifest_rows(path); result = []
+        return [(p, None) for p in masks], len(masks), str(path), False
+    rows = _manifest_rows(path)
+    uses_source_id = any("source_id" in row for row in rows)
+    source_ids = set()
+    result = []
     for index, row in enumerate(rows):
         key = next((k for k in MASK_COLUMNS if row.get(k)), None)
         if key is None: raise ValueError(f"{path}: row {index + 1} has no mask column {MASK_COLUMNS}")
+        if uses_source_id:
+            source_id = row.get("source_id")
+            if not isinstance(source_id, str) or not source_id.strip():
+                raise ValueError(f"{path}: row {index + 1} has an empty source_id in a tile manifest")
+            source_ids.add(source_id)
         mask = Path(str(row[key])); mask = mask if mask.is_absolute() else path.parent / mask
         result.append((mask, str(row["facade_id"]) if row.get("facade_id") not in (None, "") else None))
-    return result, len(rows), str(path)
+    image_count = len(source_ids) if uses_source_id else len(rows)
+    return result, image_count, str(path), uses_source_id
 
 def _read_mask(path: Path) -> np.ndarray:
     import numpy as np
@@ -50,7 +59,7 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
     ads_splits = []
     for split, source in sources.items():
         counts, images_with = Counter(), Counter(); unknown_files = []; facades = set()
-        try: entries, image_count, checked = _resolve_source(source)
+        try: entries, image_count, checked, uses_source_id = _resolve_source(source)
         except Exception as exc:
             report["errors"].append(f"{split}: {exc}"); continue
         for path, facade_id in entries:
@@ -75,6 +84,8 @@ def validate_splits(sources: dict[str, str | Path], ontology: Ontology) -> dict[
             report["warnings"].append(f"{split}: ADVERTISEMENTS (ID 11) is absent")
         if counts[11]: ads_splits.append(split)
         report["splits"][split] = {"image_count": image_count, "mask_count": len(entries),
+            "tile_count": len(entries) if uses_source_id else None,
+            "image_count_source": "unique non-empty source_id" if uses_source_id else "manifest rows or mask files",
             "unique_ids": sorted(counts), "pixel_count": {str(i): counts[i] for i in sorted(counts)},
             "pixel_frequency": {str(i): (counts[i] / valid_total if valid_total and i != ontology.ignore_index else 0.0) for i in sorted(counts)},
             "images_with_class": {str(i): images_with[i] for i in sorted(counts)},
