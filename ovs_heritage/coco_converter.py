@@ -256,30 +256,35 @@ class ImageResolver:
     def resolve(self, coco_name: str) -> dict[str, Any]:
         basename = Path(coco_name).name
         canonical = HASH_PREFIX.sub("", basename, count=1)
-        candidates = self.by_name[basename]
-        normalization_applied = False
-        if not candidates and canonical != basename:
-            candidates = self.by_name[canonical]
-            normalization_applied = True
-        target = canonical if normalization_applied else basename
-        case_insensitive = False
-        if not candidates:
-            candidates = self.by_fold[target.casefold()]
-            case_insensitive = bool(candidates)
-        if len(candidates) != 1:
-            reason = "missing" if not candidates else "ambiguous"
-            raise ConversionError(
-                f"{reason} image for COCO file {coco_name!r}: "
-                f"{len(candidates)} matches"
-            )
-        return {
-            "source_coco_file_name": coco_name,
-            "canonical_file_name": canonical,
-            "resolved_image_path": str(candidates[0].resolve()),
-            "normalization_applied": normalization_applied,
-            "case_insensitive_match": case_insensitive,
-            "path": candidates[0],
-        }
+        attempts = [
+            (self.by_name[basename], False, False),
+        ]
+        if canonical != basename:
+            attempts.append((self.by_name[canonical], True, False))
+        attempts.append((self.by_fold[basename.casefold()], False, True))
+        if canonical != basename:
+            attempts.append((self.by_fold[canonical.casefold()], True, True))
+
+        for candidates, normalization_applied, case_insensitive in attempts:
+            if not candidates:
+                continue
+            if len(candidates) != 1:
+                raise ConversionError(
+                    f"ambiguous image for COCO file {coco_name!r}: "
+                    f"{len(candidates)} matches"
+                )
+            path = candidates[0]
+            return {
+                "source_coco_file_name": coco_name,
+                "canonical_file_name": canonical,
+                "resolved_image_path": str(path.resolve()),
+                "normalization_applied": normalization_applied,
+                "case_insensitive_match": case_insensitive,
+                "path": path,
+            }
+        raise ConversionError(
+            f"missing image for COCO file {coco_name!r}: 0 matches"
+        )
 
 
 def resolve_all(

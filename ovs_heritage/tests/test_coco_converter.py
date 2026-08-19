@@ -279,6 +279,38 @@ def test_filename_resolution_rules(tmp_path):
     ]
 
 
+def test_hash_stripping_combines_with_case_insensitive_match(tmp_path):
+    root = tmp_path / "images"
+    root.mkdir()
+    (root / "facade.jpg").touch()
+    resolved = ImageResolver(root).resolve("deadbeef-Facade.JPG")
+    assert resolved["path"].name == "facade.jpg"
+    assert resolved["canonical_file_name"] == "Facade.JPG"
+    assert resolved["normalization_applied"] is True
+    assert resolved["case_insensitive_match"] is True
+
+
+def test_ambiguous_case_insensitive_normalized_match_fails(tmp_path):
+    root = tmp_path / "images"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir()
+    (root / "a/Facade.JPG").touch()
+    (root / "b/facade.jpg").touch()
+    with pytest.raises(ConversionError, match="ambiguous"):
+        ImageResolver(root).resolve("deadbeef-FACADE.jpg")
+
+
+def test_exact_original_precedes_normalized_alternative(tmp_path):
+    root = tmp_path / "images"
+    root.mkdir()
+    (root / "deadbeef-Facade.JPG").touch()
+    (root / "Facade.JPG").touch()
+    resolved = ImageResolver(root).resolve("deadbeef-Facade.JPG")
+    assert resolved["path"].name == "deadbeef-Facade.JPG"
+    assert resolved["normalization_applied"] is False
+    assert resolved["case_insensitive_match"] is False
+
+
 def test_missing_ambiguous_and_normalization_collision(tmp_path):
     root = tmp_path / "images"
     (root / "a").mkdir(parents=True)
