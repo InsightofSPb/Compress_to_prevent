@@ -118,14 +118,17 @@ def dfs_search(L, Y, tol=1e-6, maxiter=10):
     return out
 
 
-def perform_lp(L, preds):
+def perform_lp(L, preds, device=None):
     _require_cupy()
+    if device is None and isinstance(preds, torch.Tensor):
+        device = preds.device
     lp_preds = cp.zeros(preds.shape)
     preds = cp.asarray(preds)
     for cls_idx, y_cls in enumerate(preds.T):
         Y = y_cls
         lp_preds[:, cls_idx] = dfs_search(L, Y)
-    lp_preds = torch.as_tensor(lp_preds, device="cuda")
+    # Preserve the caller's selected CUDA index; never allocate on generic cuda:0.
+    lp_preds = torch.as_tensor(lp_preds, device=device)
 
     return lp_preds
 
@@ -217,11 +220,8 @@ class LPOSS_Infrencer(EncoderDecoder):
 
         imgs = self._ensure_list(img)
         device = next(self.model.parameters()).device
-        imgs = [
-            i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i
-            (i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i)
-            for i in imgs
-        ]
+        imgs = [i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i
+                for i in imgs]
         imgs = [
             i.to(device) if isinstance(i, torch.Tensor) else i
             for i in imgs

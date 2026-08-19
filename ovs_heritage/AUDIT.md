@@ -16,6 +16,17 @@ Class imbalance changes the relative number/gradient contribution of supervised 
 
 **Confirmed mathematical defect in the legacy training path.** `models/maskclip/maskclip.py:MaskClipHead.cls_seg` computes cosine convolution, multiplies by 100, then returns `F.softmax(...)`. `FineTuneWrapper` averages these probabilities and its direct second `cls_seg` result; `tools/finetune.py:compute_loss` passes that tensor to `F.cross_entropy`, which expects raw logits. Full `models/lposs/lposs.py:LPOSS.forward` does its own graph label-propagation scorer from normalized CLIP/DINO features rather than merely consuming the MaskCLIP probability map. P0 provides a new isolated raw scorer/loss; this does not retroactively repair checkpoints or historical measurements.
 
+## P1a stock inference correction
+
+`tools/lposs_inference.py` remains runnable but is now explicitly labelled as a **legacy
+MaskCLIP-only** path. `tools/finetune.py` and `tools/finetune_tiled.py` likewise train only
+that branch. Historical improvements including mIoU 0.0551→0.1676 therefore provide no
+evidence for DINO propagation, LPOSS+, or retention of open-vocabulary behavior.
+
+The P1a entry point is `python -m ovs_heritage.infer_ovs`. Its mode ledger fields distinguish
+raw MaskCLIP cosine seeds, genuine patch propagation, and pixel refinement. Graph modes fail
+closed during preflight; they cannot relabel raw predictions as LPOSS output.
+
 ## 4. Vocabulary-specific state
 
 `MaskClipHead.__init__` uses `register_buffer("class_embeddings", ...)`, so prototypes are persistent in `state_dict` and checkpoint shape/order depends on aliases and vocabulary. `class_mapping` is a plain tensor attribute, not a registered buffer, and is not saved. `class_names` is a plain Python value. `proj.weight` is persistent vocabulary-independent image projection state. P0 `PrototypeSet` is returned at runtime and `RawCosineScorer.state_dict()` is empty.

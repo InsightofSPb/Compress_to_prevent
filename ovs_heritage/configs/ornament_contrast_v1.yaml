@@ -1,0 +1,6 @@
+version: ornament_text_contrast_v1
+name: non_ornamental_facade_surface
+semantic_id: null
+prompts:
+  - a plain non-ornamental building facade surface
+  - an undecorated flat facade material surface

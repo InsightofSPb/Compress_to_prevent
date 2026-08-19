@@ -149,7 +149,6 @@ class MaskClipHead(nn.Module):
         self.tokenizer = get_tokenizer(clip_model)
         model, _ = create_model_from_pretrained(clip_model, pretrained=pretrained)
         model.eval()
-        model.cuda()
         self.register_buffer("class_embeddings", self._get_class_embeddings(model, class_names))
         self.proj = nn.Conv2d(self.in_channels, text_channels, 1, bias=False)
         self.proj.weight = nn.Parameter(model.visual.proj.t()[:, :, None, None])
@@ -173,7 +172,7 @@ class MaskClipHead(nn.Module):
             templates = ['a {}']
         all_prompts = [self.tokenizer(template.format(label)) for template in templates]
         all_prompts = torch.cat(all_prompts)
-        all_prompts = all_prompts.to("cuda")
+        all_prompts = all_prompts.to(next(text_model.parameters()).device)
         out = text_model.encode_text(all_prompts)
         out /= out.norm(dim=-1, keepdim=True)
         out = out.mean(dim=0)

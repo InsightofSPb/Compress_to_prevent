@@ -125,3 +125,9 @@ ruff check ovs_heritage
 The CPU GitHub Actions workflow runs these commands on Python 3.9 with versions
 compatible with the project environment. No model or dataset download occurs in
 the unit tests.
+# Stock MaskCLIP/LPOSS inference (P1a)
+
+The dataset-independent, no-fine-tuned-checkpoint runner is documented in
+[`docs/stock_ovs_lposs_inference.md`](../docs/stock_ovs_lposs_inference.md). Historical
+`tools/lposs_inference.py`, `tools/finetune.py`, and `tools/finetune_tiled.py` operate on the
+legacy MaskCLIP branch and are retained only for reproduction.
