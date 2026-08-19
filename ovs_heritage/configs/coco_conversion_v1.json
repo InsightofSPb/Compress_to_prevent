@@ -1,0 +1,20 @@
+{
+  "version": "coco-to-heritage-two-map-v1",
+  "source_names": {
+    "WATER_STAIN": "water_stain",
+    "MISSING_ELEMENT": "missing_element",
+    "DELAMINATION": "delamination",
+    "SPALLING": "spalling",
+    "ORNAMENT_INTACT": "ornament_region",
+    "CRACK": "crack",
+    "REPAIRS": "repairs",
+    "EFFLORESCENCE": "efflorescence",
+    "TEXT_OR_IMAGES": "text_or_images",
+    "CORROSION": "corrosion",
+    "ADVERTISEMENTS": "advertisements"
+  },
+  "main_priority_high_to_low": [
+    "missing_element", "spalling", "crack", "delamination", "corrosion",
+    "repairs", "advertisements", "text_or_images", "efflorescence", "water_stain"
+  ]
+}
