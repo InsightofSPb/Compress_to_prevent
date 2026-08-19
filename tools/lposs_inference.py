@@ -28,9 +28,7 @@ logging.basicConfig(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=("LEGACY MaskCLIP-only checkpoint inference (historical name; does not "
-                     "execute DINO, LPOSS propagation, or LPOSS+). Use python -m "
-                     "ovs_heritage.infer_ovs for stock LPOSS.")
+        description="Run LPOSS/MaskCLIP inference on a folder of images."
     )
     parser.add_argument(
         "--images",

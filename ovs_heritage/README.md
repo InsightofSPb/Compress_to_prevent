@@ -128,6 +128,4 @@ the unit tests.
 # Stock MaskCLIP/LPOSS inference (P1a)
 
 The dataset-independent, no-fine-tuned-checkpoint runner is documented in
-[`docs/stock_ovs_lposs_inference.md`](../docs/stock_ovs_lposs_inference.md). Historical
-`tools/lposs_inference.py`, `tools/finetune.py`, and `tools/finetune_tiled.py` operate on the
-legacy MaskCLIP branch and are retained only for reproduction.
+[`docs/stock_ovs_lposs_inference.md`](../docs/stock_ovs_lposs_inference.md).

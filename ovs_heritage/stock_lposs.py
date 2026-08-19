@@ -1,12 +1,14 @@
-"""Stock open-vocabulary MaskCLIP/LPOSS inference.
+"""Execution core for stock open-vocabulary MaskCLIP/LPOSS inference.
 
-The graph equations follow the MIT-licensed LPOSS implementation by Stojnic et al.
-Components are injectable so the execution contract can be tested without weights/CUDA.
+Graph behavior follows LPOSS commit e489a7445528922ddfe4e39631ef2fe34827c873.
+The small protocols keep CPU contract tests independent of pretrained weights.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+import importlib
 import importlib.util
+import math
 from typing import Protocol
 
 import torch
@@ -17,17 +19,29 @@ from .scoring import RawCosineScorer
 from .vocabulary import PrototypeSet
 
 MODES = ("maskclip_raw", "lposs", "lposs_plus")
+UPSTREAM_COMMIT = "e489a7445528922ddfe4e39631ef2fe34827c873"
+IMPLEMENTATION_ID = "stock-maskclip-lposs-p1a-v1"
 
 
-class StockFeatureModel(Protocol):
+class FeatureModel(Protocol):
     def clip_dense(self, image: torch.Tensor) -> torch.Tensor: ...
     def dino_dense(self, image: torch.Tensor) -> torch.Tensor: ...
 
 
-class Propagator(Protocol):
-    def patch(self, dino: torch.Tensor, seeds: torch.Tensor, *, image: torch.Tensor,
-              locations: torch.Tensor | None, parameters: dict) -> tuple[torch.Tensor, int]: ...
-    def pixel(self, image: torch.Tensor, scores: torch.Tensor, *, parameters: dict) -> torch.Tensor: ...
+class GraphPropagator(Protocol):
+    def patch_nodes(self, dino_nodes: torch.Tensor, seed_nodes: torch.Tensor, *,
+                    locations: torch.Tensor, height_width: list[tuple[int, int]],
+                    parameters: dict, device_index: int) -> tuple[torch.Tensor, int]: ...
+    def pixel(self, image: torch.Tensor, scores: torch.Tensor, *, parameters: dict,
+              device_index: int) -> torch.Tensor: ...
+
+
+@dataclass(frozen=True)
+class DeviceInfo:
+    requested_device: str
+    resolved_device: str
+    logical_index: int | None
+    visible_device_name: str | None
 
 
 @dataclass(frozen=True)
@@ -40,6 +54,12 @@ class ExecutionMetadata:
     cosine_scale: float
     requested_k: int | None
     effective_k: int | None
+    inference: str
+    window_count: int
+    graph_nodes: int | None
+    estimated_dense_graph_bytes: int | None
+    crop_size: tuple[int, int] | None
+    stride: tuple[int, int] | None
 
 
 @dataclass
@@ -55,126 +75,236 @@ class StockOutput:
     metadata: ExecutionMetadata
 
 
-def preflight(mode: str, device: torch.device | str) -> None:
-    """Fail closed before feature extraction for graph modes."""
+def resolve_device(requested: str) -> DeviceInfo:
+    try:
+        device = torch.device(requested)
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(f"invalid torch device {requested!r}: {exc}") from exc
+    if device.type == "cpu":
+        return DeviceInfo(requested, "cpu", None, None)
+    if device.type != "cuda":
+        raise ValueError("stock inference supports only cpu and explicitly indexed cuda devices")
+    if device.index is None:
+        raise ValueError("CUDA device must include a logical index, for example cuda:0")
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"requested cuda:{device.index}, but CUDA is unavailable")
+    count = torch.cuda.device_count()
+    if device.index < 0 or device.index >= count:
+        raise RuntimeError(f"requested cuda:{device.index}, but only {count} logical CUDA device(s) are visible")
+    return DeviceInfo(requested, str(device), device.index, torch.cuda.get_device_name(device.index))
+
+
+def graph_preflight(mode: str, device: DeviceInfo) -> dict[str, str | None]:
+    """Import graph dependencies only for graph modes, before model construction."""
     if mode not in MODES:
-        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+        raise ValueError(f"mode must be one of {MODES}")
     if mode == "maskclip_raw":
-        return
-    device = torch.device(device)
+        return {"cupy": None, "faiss": None}
+    if device.logical_index is None:
+        raise RuntimeError(f"{mode} requires an explicitly indexed CUDA device")
     missing = []
-    if device.type != "cuda" or not torch.cuda.is_available():
-        missing.append("an available CUDA device")
-    for module, label in (("faiss", "FAISS with GPU support"), ("cupy", "CuPy"),
-                          ("cupyx.scipy.sparse.linalg", "cupyx sparse solver")):
+    for name in ("cupy", "cupyx.scipy.sparse.linalg", "faiss"):
         try:
-            found = importlib.util.find_spec(module) is not None
+            if importlib.util.find_spec(name) is None:
+                missing.append(name)
         except (ImportError, ModuleNotFoundError):
-            found = False
-        if not found:
-            missing.append(label)
-    if importlib.util.find_spec("faiss") is not None:
-        import faiss
-        if not hasattr(faiss, "StandardGpuResources"):
-            missing.append("FAISS GPU bindings")
+            missing.append(name)
     if missing:
-        raise RuntimeError(
-            f"{mode} requires genuine GPU graph propagation; missing: {', '.join(missing)}. "
-            "Install matching CUDA CuPy and faiss-gpu packages, or explicitly request maskclip_raw."
-        )
+        raise RuntimeError(f"{mode} requires CUDA CuPy/cupyx and faiss-gpu; missing: {', '.join(missing)}")
+    cp = importlib.import_module("cupy")
+    faiss = importlib.import_module("faiss")
+    if not hasattr(faiss, "StandardGpuResources"):
+        raise RuntimeError("faiss is installed without GPU bindings; install a matching faiss-gpu build")
+    try:
+        with cp.cuda.Device(device.logical_index):
+            cp.cuda.runtime.getDevice()
+    except Exception as exc:
+        raise RuntimeError(f"CuPy cannot select logical CUDA device {device.logical_index}: {exc}") from exc
+    return {"cupy": getattr(cp, "__version__", "unknown"),
+            "cupy_cuda_runtime": str(cp.cuda.runtime.runtimeGetVersion()),
+            "faiss": getattr(faiss, "__version__", "unknown")}
+
+
+def _windows(h: int, w: int, crop: tuple[int, int], stride: tuple[int, int]):
+    ch, cw = crop
+    sh, sw = stride
+    if min(ch, cw, sh, sw) <= 0 or sh > ch or sw > cw:
+        raise ValueError("crop and stride must be positive and stride must not exceed crop")
+    hg = max(h - ch + sh - 1, 0) // sh + 1
+    wg = max(w - cw + sw - 1, 0) // sw + 1
+    result = []
+    for hi in range(hg):
+        for wi in range(wg):
+            y2, x2 = min(hi * sh + ch, h), min(wi * sw + cw, w)
+            y1, x1 = max(y2 - ch, 0), max(x2 - cw, 0)
+            result.append((y1, y2, x1, x2))
+    return result
 
 
 class StockOVSEngine:
-    """Runs exactly the stages named by ``mode``; prototypes are call-time data."""
-    def __init__(self, model: StockFeatureModel, propagator: Propagator | None,
-                 *, device: str | torch.device, cosine_scale: float = 1.0,
-                 graph_parameters: dict | None = None, enforce_preflight: bool = True):
-        self.model, self.propagator = model, propagator
-        self.device = torch.device(device)
+    def __init__(self, model: FeatureModel, propagator: GraphPropagator | None, *,
+                 device: DeviceInfo, cosine_scale: float = 1.0,
+                 graph_parameters: dict | None = None):
+        self.model, self.propagator, self.device = model, propagator, device
         self.scorer = RawCosineScorer(scale=cosine_scale)
-        self.graph_parameters = dict(graph_parameters or {})
-        self.enforce_preflight = enforce_preflight
+        self.parameters = dict(graph_parameters or {})
 
     @torch.no_grad()
     def run(self, image: torch.Tensor, prototypes: PrototypeSet, *, mode: str,
-            ornament_negative_index: int | None = None, ornament_threshold: float | None = None,
-            locations: torch.Tensor | None = None) -> StockOutput:
-        if self.enforce_preflight:
-            preflight(mode, self.device)
-        elif mode not in MODES:
+            inference: str = "whole", crop_size: tuple[int, int] | None = None,
+            stride: tuple[int, int] | None = None, ornament_negative_index: int | None = None,
+            ornament_threshold: float | None = None) -> StockOutput:
+        if mode not in MODES:
             raise ValueError(f"unknown mode {mode!r}")
-        image = image.to(self.device)
-        original_size = image.shape[-2:]
-        clip = self.model.clip_dense(image)
-        seeds = self.scorer(clip, prototypes.prototypes)
-        scores, dino_done, patch_done, pixel_done, effective_k = seeds, False, False, False, None
-        if mode != "maskclip_raw":
-            if self.propagator is None:
-                raise RuntimeError("LPOSS mode requested but no graph propagator is configured")
-            dino = self.model.dino_dense(image)
+        if inference not in ("whole", "slide"):
+            raise ValueError("inference must be whole or slide")
+        if ornament_threshold is not None and (not math.isfinite(ornament_threshold) or
+                                                not 0 <= ornament_threshold <= 1):
+            raise ValueError("ornament_threshold must be finite and within [0, 1]")
+        target = torch.device(self.device.resolved_device)
+        image = image.to(target)
+        original = image.shape[-2:]
+        windows = [(0, original[0], 0, original[1])]
+        if inference == "slide":
+            if crop_size is None or stride is None:
+                raise ValueError("slide inference requires crop_size and stride")
+            windows = _windows(*original, crop_size, stride)
+        crops = torch.cat([image[..., y1:y2, x1:x2] for y1, y2, x1, x2 in windows])
+        clip = self.model.clip_dense(crops)
+        window_seed_maps = self.scorer(clip, prototypes.prototypes)
+        dino_done = patch_done = pixel_done = False
+        effective_k = graph_nodes = estimated_graph_bytes = None
+        if mode == "maskclip_raw":
+            window_outputs = [window_seed_maps[i:i + 1] for i in range(len(windows))]
+        else:
+            if self.propagator is None or self.device.logical_index is None:
+                raise RuntimeError("graph mode requires a configured GPU propagator")
+            dino = self.model.dino_dense(crops)
             dino_done = True
-            scores, effective_k = self.propagator.patch(
-                dino, seeds, image=image, locations=locations, parameters=self.graph_parameters)
+            height_width = [tuple(item.shape[-2:]) for item in dino]
+            seeds = [F.interpolate(window_seed_maps[i:i + 1], size=height_width[i],
+                                   mode="bilinear", align_corners=False)[0]
+                     for i in range(len(windows))]
+            dino_nodes = torch.cat([item.permute(1, 2, 0).reshape(-1, item.shape[0]) for item in dino])
+            seed_nodes = torch.cat([item.permute(1, 2, 0).reshape(-1, item.shape[0]) for item in seeds])
+            graph_nodes = dino_nodes.shape[0]
+            estimated_graph_bytes = graph_nodes * graph_nodes * dino_nodes.element_size()
+            max_nodes = int(self.parameters.get("max_graph_nodes", 250_000))
+            if graph_nodes > max_nodes:
+                raise RuntimeError(f"resolved graph has {graph_nodes} nodes, exceeding max_graph_nodes={max_nodes}")
+            max_bytes = int(self.parameters.get("max_dense_graph_bytes", 8 * 1024**3))
+            if estimated_graph_bytes > max_bytes:
+                raise RuntimeError(
+                    f"estimated dense geometry graph requires {estimated_graph_bytes} bytes, "
+                    f"exceeding max_dense_graph_bytes={max_bytes}")
+            locations = torch.tensor(windows, device=target, dtype=torch.long)
+            context = torch.cuda.device(self.device.logical_index)
+            with context:
+                propagated, effective_k = self.propagator.patch_nodes(
+                    dino_nodes, seed_nodes, locations=locations, height_width=height_width,
+                    parameters=self.parameters, device_index=self.device.logical_index)
             patch_done = True
-            if mode == "lposs_plus":
-                scores = self.propagator.pixel(image, scores, parameters=self.graph_parameters)
-                pixel_done = True
-        scores = F.interpolate(scores, original_size, mode="bilinear", align_corners=False)
-        seeds_full = F.interpolate(seeds, original_size, mode="bilinear", align_corners=False)
+            window_outputs, offset = [], 0
+            for h, w in height_width:
+                count = h * w
+                window_outputs.append(propagated[offset:offset + count].reshape(h, w, -1)
+                                      .permute(2, 0, 1).unsqueeze(0))
+                offset += count
+        seeds_full = self._stitch(window_seed_maps, windows, original)
+        scores = self._stitch(window_outputs, windows, original)
+        if mode == "lposs_plus":
+            pixel_nodes = original[0] * original[1]
+            max_pixel_nodes = int(self.parameters.get("max_pixel_nodes", 20_000_000))
+            if pixel_nodes > max_pixel_nodes:
+                raise RuntimeError(
+                    f"LPOSS+ pixel graph has {pixel_nodes} nodes, exceeding "
+                    f"max_pixel_nodes={max_pixel_nodes}")
+            with torch.cuda.device(self.device.logical_index):
+                scores = self.propagator.pixel(image, scores, parameters=self.parameters,
+                                               device_index=self.device.logical_index)
+            pixel_done = True
+        self._validate_scores(seeds_full, scores, original, len(prototypes.channel_names))
+        result = self._project(scores, seeds_full, prototypes, ornament_negative_index,
+                               ornament_threshold)
+        result.metadata = ExecutionMetadata(
+            mode, mode, dino_done, patch_done, pixel_done, self.scorer.scale,
+            self.parameters.get("k"), effective_k, inference, len(windows), graph_nodes,
+            estimated_graph_bytes,
+            crop_size if inference == "slide" else None,
+            stride if inference == "slide" else None)
+        return result
+
+    @staticmethod
+    def _stitch(maps, windows, size):
+        if isinstance(maps, torch.Tensor):
+            maps = [maps[i:i + 1] for i in range(maps.shape[0])]
+        channels, device, dtype = maps[0].shape[1], maps[0].device, maps[0].dtype
+        output = torch.zeros(1, channels, *size, device=device, dtype=dtype)
+        count = torch.zeros(1, 1, *size, device=device, dtype=dtype)
+        for score, (y1, y2, x1, x2) in zip(maps, windows):
+            score = F.interpolate(score, (y2 - y1, x2 - x1), mode="bilinear", align_corners=False)
+            output[..., y1:y2, x1:x2] += score
+            count[..., y1:y2, x1:x2] += 1
+        if torch.any(count == 0):
+            raise RuntimeError("sliding windows do not cover the complete image")
+        return output / count
+
+    @staticmethod
+    def _validate_scores(seed, propagated, size, channels):
+        for name, tensor in (("seed_scores", seed), ("propagated_scores", propagated)):
+            if tensor.shape != (1, channels, *size):
+                raise ValueError(f"{name} has invalid shape {tuple(tensor.shape)}")
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f"{name} contains non-finite values")
+
+    @staticmethod
+    def _project(scores, seeds, prototypes, negative, threshold):
         names, ids = prototypes.channel_names, prototypes.semantic_ids
-        main_indices = [ids.index(i) for i in MAIN_SEMANTIC_IDS if i in ids]
-        complete = len(main_indices) == len(MAIN_SEMANTIC_IDS)
-        main_scores = scores[:, main_indices] if complete else None
+        indices = [ids.index(i) for i in MAIN_SEMANTIC_IDS if i in ids]
+        complete = len(indices) == len(MAIN_SEMANTIC_IDS)
+        main_scores = scores[:, indices] if complete else None
         main_mask = None
         if complete:
-            lookup = torch.tensor(MAIN_SEMANTIC_IDS, device=scores.device)
+            lookup = torch.tensor(MAIN_SEMANTIC_IDS, device=scores.device, dtype=torch.uint8)
             main_mask = lookup[main_scores.argmax(1)]
-        ornament_index = ids.index(8) if 8 in ids else None
-        ornament_score = None
-        if ornament_index is not None and ornament_negative_index is not None:
-            ornament_score = scores[:, ornament_index:ornament_index + 1] - scores[:, ornament_negative_index:ornament_negative_index + 1]
-        ornament_probability = torch.sigmoid(ornament_score) if ornament_score is not None else None
-        ornament_mask = None
-        if ornament_probability is not None and ornament_threshold is not None:
-            ornament_mask = (ornament_probability >= ornament_threshold).to(torch.uint8)
-        excluded = set(main_indices)
-        if ornament_index is not None: excluded.add(ornament_index)
-        if ornament_negative_index is not None: excluded.add(ornament_negative_index)
+        ornament = ids.index(8) if 8 in ids else None
+        contrast = (scores[:, ornament:ornament + 1] - scores[:, negative:negative + 1]
+                    if ornament is not None and negative is not None else None)
+        probability = torch.sigmoid(contrast) if contrast is not None else None
+        binary = ((probability >= threshold).to(torch.uint8)
+                  if probability is not None and threshold is not None else None)
+        excluded = set(indices) | ({ornament} if ornament is not None else set())
+        if negative is not None:
+            excluded.add(negative)
         extras = {name: scores[:, i:i + 1] for i, (name, sid) in enumerate(zip(names, ids))
                   if sid is None and i not in excluded}
-        meta = ExecutionMetadata(mode, mode, dino_done, patch_done, pixel_done,
-                                 self.scorer.scale, self.graph_parameters.get("k"), effective_k)
-        return StockOutput(seeds_full, scores, main_scores, main_mask, ornament_score,
-                           ornament_probability, ornament_mask, extras, meta)
+        placeholder = ExecutionMetadata("", "", False, False, False, 1, None, None,
+                                        "whole", 1, None, None, None, None)
+        return StockOutput(seeds, scores, main_scores, main_mask, contrast, probability,
+                           binary, extras, placeholder)
 
 
 class UpstreamGraphPropagator:
-    """Thin device-safe adapter around the forked upstream LPOSS graph routines."""
-    def patch(self, dino, seeds, *, image, locations, parameters):
+    def patch_nodes(self, dino_nodes, seed_nodes, *, locations, height_width,
+                    parameters, device_index):
         from segmentation.evaluation.lposs_eval import get_lposs_laplacian, perform_lp
-        b, _, h, w = dino.shape
-        if b != 1:
-            raise ValueError("stock whole-image graph propagation currently requires batch size 1")
-        feats = F.normalize(dino.permute(0, 2, 3, 1).reshape(h * w, -1), dim=-1)
-        patch_seeds = F.interpolate(seeds, (h, w), mode="bilinear", align_corners=False)
-        flat = patch_seeds.permute(0, 2, 3, 1).reshape(h * w, -1)
         requested = int(parameters["k"])
-        effective = min(requested, h * w)
-        loc = image.new_zeros((1, 4)) if locations is None else locations
-        L = get_lposs_laplacian(feats, loc, [(h, w)], k=effective,
+        effective = min(requested, dino_nodes.shape[0])
+        L = get_lposs_laplacian(
+            F.normalize(dino_nodes, dim=-1), locations, height_width,
             sigma=parameters["sigma"], pix_dist_pow=parameters["pix_dist_pow"],
-            gamma=parameters["gamma"], alpha=parameters["alpha"],
-            patch_size=parameters["vit_patch_size"])
-        out = perform_lp(L, flat, device=image.device)
-        return out.reshape(h, w, -1).permute(2, 0, 1).unsqueeze(0), effective
+            k=effective, gamma=parameters["gamma"], alpha=parameters["alpha"],
+            patch_size=parameters["vit_patch_size"], device_index=device_index)
+        return perform_lp(L, seed_nodes, device=seed_nodes.device,
+                          device_index=device_index), effective
 
-    def pixel(self, image, scores, *, parameters):
+    def pixel(self, image, scores, *, parameters, device_index):
         from segmentation.evaluation.lposs_eval import get_lposs_plus_laplacian, perform_lp
-        scores = F.interpolate(scores, image.shape[-2:], mode="bilinear", align_corners=False)
         flat = scores[0].permute(1, 2, 0).reshape(-1, scores.shape[1])
         L = get_lposs_plus_laplacian(image, flat, tau=parameters["tau"],
-                                     neigh=parameters["r"] // 2, alpha=parameters["alpha"])
-        out = perform_lp(L, flat, device=image.device)
+                                     neigh=parameters["r"] // 2,
+                                     alpha=parameters["alpha"], device_index=device_index)
+        out = perform_lp(L, flat, device=flat.device, device_index=device_index)
         return out.reshape(*image.shape[-2:], -1).permute(2, 0, 1).unsqueeze(0)
 
 
