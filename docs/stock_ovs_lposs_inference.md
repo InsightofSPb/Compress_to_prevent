@@ -18,7 +18,7 @@ Only these dedicated configurations are stock references:
 
 Both pin implementation ID `stock-maskclip-lposs-p1a-v1`, upstream repository/commit,
 OpenCLIP `ViT-B-16` with `laion2b_s34b_b88k`, and the original
-`facebookresearch/dino:main` `dino_vitb16` Torch Hub entrypoint. Every manifest records these
+`facebookresearch/dino:7c446df5b9f45747937fb7d72314ebf7b66930c` `dino_vitb16` Torch Hub entrypoint. Every manifest records these
 identifiers, resolved graph values, available local weight hashes, device/dependency facts,
 ontology/prototype metadata, and artifact hashes.
 
@@ -99,20 +99,66 @@ read back, validated, and hashed. Existing scientific runs are never overwritten
 The ledger begins before model loading, records snapshots and stage transitions, registers verified
 artifacts with `ArtifactDescriptor`, and ends in `run.completed` or sanitized `run.failed`.
 
-## Verification status and opt-in parity
+## Verification ladder and exact commands
 
-CPU tests use deterministic fake features/graphs to verify contracts and are **not numerical
-upstream parity evidence**. A real parity run was not executed in the PR environment. Generate
-reference tensors from the pinned official checkout using the same image, OpenCLIP/DINO caches,
-vocabulary, and graph settings, then run:
+These four outcomes are deliberately distinct. A CPU contract pass validates routing, exports,
+configuration rejection, provenance, and memory guards; it is **not** model execution or numerical
+LPOSS parity.
 
-```bash
-python tools/check_stock_lposs_gpu.py --image /data/fixed-small.png \
-  --upstream-root /src/LPOSS-e489a7445528922ddfe4e39631ef2fe34827c873 \
-  --upstream-scores /data/pinned-upstream-scores.pt --device cuda:0 \
-  --work-dir outputs/parity-e489a744
-```
+1. **Structural CPU contract test** (no downloads or GPU):
 
-The opt-in check verifies the checkout commit, runs all three modes, verifies stages, finiteness,
-device/grid/output IDs, and compares raw seeds and propagated scores with explicit tolerances.
-Successful execution is implementation evidence only, not a scientific-quality claim.
+   ```bash
+   pytest -q ovs_heritage/tests/test_stock_lposs.py
+   ```
+
+2. **Smallest real-GPU model smoke test** (successful execution, not upstream parity):
+
+   ```bash
+   python -m ovs_heritage.infer_ovs --image fixtures/lposs/small.png \
+     --model-config configs/stock_lposs.yaml --mode maskclip_raw --device cuda:0 \
+     --vocabulary ovs_heritage/configs/heritage_vocab.yaml --ornament-threshold 0.5 \
+     --output-dir runs/lposs-smoke --save-scores
+   ```
+
+3. **Pinned official-reference generation and numerical comparison**:
+
+   ```bash
+   git -C third_party/LPOSS checkout e489a7445528922ddfe4e39631ef2fe34827c873
+   python tools/check_stock_lposs_gpu.py --upstream-root third_party/LPOSS \
+     --image fixtures/lposs/small.png --device cuda:0 --work-dir runs/lposs-parity \
+     --atol 1e-5 --rtol 1e-4
+   ```
+
+   The checker rejects dirty/wrong upstream checkouts and never accepts an opaque `.pt` input.
+   At the reviewed official commit there is no stable arbitrary-vocabulary tensor-export API; the
+   bundled adapter therefore reports that exact blocker rather than modifying upstream semantics or
+   claiming parity. A `parity_manifest.json` is written only after a real comparison succeeds.
+
+4. **Stock graph inference**:
+
+   ```bash
+   python -m ovs_heritage.infer_ovs --manifest dataset-v2/test.jsonl \
+     --model-config configs/stock_lposs.yaml --mode lposs --device cuda:0 \
+     --vocabulary ovs_heritage/configs/heritage_vocab.yaml --ornament-threshold 0.5 \
+     --output-dir runs/dataset-v2-lposs --save-scores
+   ```
+
+5. **Stock LPOSS+ inference**:
+
+   ```bash
+   python -m ovs_heritage.infer_ovs --manifest dataset-v2/test.jsonl \
+     --model-config configs/stock_lposs_plus.yaml --mode lposs_plus --device cuda:0 \
+     --vocabulary ovs_heritage/configs/heritage_vocab.yaml --ornament-threshold 0.5 \
+     --output-dir runs/dataset-v2-lposs-plus --save-scores
+   ```
+
+6. **Later scientific dataset-v2 benchmark**: after successful model execution and real numerical
+   parity, run the project evaluation command against the sealed facade-disjoint dataset-v2 split:
+
+   ```bash
+   python tools/evaluate_segmentation_tiled.py --help
+   ```
+
+   This PR does not run or claim that benchmark. Direct `--image`/`--image-dir` manifests explicitly
+   report unavailable dataset/split metadata; JSONL inputs retain every source-record field plus the
+   source manifest path and hash.

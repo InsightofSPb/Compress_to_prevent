@@ -27,6 +27,8 @@ from ovs_heritage.stock_lposs import (
     DeviceInfo,
     StockOVSEngine,
     graph_preflight,
+    patch_graph_preflight,
+    pixel_graph_preflight,
     resolve_device,
 )
 from ovs_heritage.vocabulary import PrototypeSet
@@ -79,7 +81,8 @@ def engine(mode):
     instance = StockOVSEngine(configured and model or model, configured,
         device=DeviceInfo("cpu", "cpu", None, None) if mode == "maskclip_raw"
         else DeviceInfo("cuda:0", "cpu", 0, "fake"),
-        graph_parameters={"k": 99})
+        graph_parameters={"k": 99, "r": 13, "available_gpu_bytes": 10**12,
+                          "gpu_memory_reserve_bytes": 0})
     return instance, model, propagation
 
 
@@ -184,7 +187,10 @@ def test_dataset_v2_jsonl_resolves_relative_images(tmp_path):
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('\n{"sample_id":"sample-a","image_path":"images/a.png"}\n')
     result = discover_inputs(_args(manifest=str(manifest)))
-    assert result == [InputSample("sample-a", (image_dir / "a.png").resolve())]
+    assert result[0].sample_id == "sample-a"
+    assert result[0].image_path == (image_dir / "a.png").resolve()
+    assert result[0].provenance["source_record"]["image_path"] == "images/a.png"
+    assert result[0].provenance["source_manifest_sha256"] == sha256(manifest.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize("name,pixel", [("stock_lposs.yaml", False),
@@ -225,6 +231,63 @@ def test_output_is_immutable_and_ornament_png_is_binary(tmp_path):
     assert set(np.unique(ornament)) <= {0, 1}
     with pytest.raises(FileExistsError):
         prepare_output(output, [sample])
+
+
+def test_scores_are_saved_and_reloaded_with_112_compatible_loader(tmp_path, monkeypatch):
+    from ovs_heritage.stock_features import compatible_torch_load
+    sample = InputSample("sample", tmp_path / "input.png")
+    output = prepare_output(tmp_path / "out", [sample])
+    instance, _, _ = engine("maskclip_raw")
+    result = instance.run(torch.rand(1, 3, 2, 3), prototype_set(), mode="maskclip_raw",
+        ornament_negative_index=12, ornament_threshold=0.5)
+    original = torch.load
+    def old_load(path, **kwargs):
+        if "weights_only" in kwargs:
+            raise TypeError("load() got an unexpected keyword argument 'weights_only'")
+        return original(path, **kwargs)
+    monkeypatch.setattr(torch, "load", old_load)
+    export_sample(output, sample, result, prototype_set(), True, False)
+    payload = compatible_torch_load(output / "sample" / "scores.pt")
+    assert torch.equal(payload["seed_scores"], result.seed_scores.cpu())
+
+
+def test_graph_preflights_safe_and_reject_before_propagation(monkeypatch):
+    device = DeviceInfo("cuda:0", "cpu", 0, "fake")
+    safe = {"r": 13, "available_gpu_bytes": 10**9, "gpu_memory_reserve_bytes": 0,
+            "max_graph_nodes": 100, "max_dense_graph_bytes": 10**9,
+            "max_pixel_nodes": 100, "max_pixel_edges": 10000, "max_pixel_graph_bytes": 10**9}
+    assert patch_graph_preflight(4, 2, 4, device, safe) > 0
+    assert pixel_graph_preflight(2, 2, 2, 4, device, safe)[0] == 4 * 168
+    instance, _, propagation = engine("lposs")
+    instance.parameters["max_graph_nodes"] = 1
+    with pytest.raises(RuntimeError, match="patch graph preflight rejected"):
+        instance.run(torch.rand(1, 3, 5, 7), prototype_set(), mode="lposs")
+    assert propagation.patch_calls == 0
+    instance, _, propagation = engine("lposs_plus")
+    instance.parameters["max_pixel_edges"] = 1
+    with pytest.raises(RuntimeError, match="pixel graph preflight rejected"):
+        instance.run(torch.rand(1, 3, 5, 7), prototype_set(), mode="lposs_plus")
+    assert propagation.pixel_calls == 0
+
+
+def test_parity_mapping_contract_uses_channels_semantics_and_tolerances():
+    from tools.check_stock_lposs_gpu import compare_score_mappings
+    base = {"seed_scores": torch.ones(1, 2, 2, 2),
+            "propagated_scores": torch.ones(1, 2, 2, 2),
+            "channel_names": ("a", "b"), "semantic_ids": (1, 2)}
+    assert compare_score_mappings(base, dict(base), atol=0, rtol=0) == {
+        "seed_scores": 0.0, "propagated_scores": 0.0}
+    with pytest.raises(AssertionError, match="channel order"):
+        compare_score_mappings(base, {**base, "channel_names": ("b", "a")}, atol=0, rtol=0)
+
+
+def test_stock_config_rejects_changed_scientific_parameter(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    config = (root / "configs/stock_lposs.yaml").read_text().replace("alpha: 0.95", "alpha: 0.90")
+    path = tmp_path / "changed.yaml"
+    path.write_text(config)
+    with pytest.raises(ValueError, match="scientifically meaningful graph"):
+        load_config(path)
 
 
 @pytest.mark.parametrize("threshold", [-0.1, 1.1, float("nan"), float("inf")])

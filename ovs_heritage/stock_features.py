@@ -9,6 +9,16 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def compatible_torch_load(path, *, map_location="cpu"):
+    """Load tensor-only artifacts on both torch 1.12 and newer releases."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        return torch.load(path, map_location=map_location)
+
+
 class StockFeatureModel(nn.Module):
     """Load image/text CLIP once; runtime classes never enter module state."""
     def __init__(self, *, clip_model: str, clip_pretrained: str,
@@ -124,6 +134,18 @@ def module_state_fingerprint(module: nn.Module) -> tuple[tuple[str, tuple[int, .
         digest = sha256(raw).hexdigest()
         result.append((key, tuple(value.shape), digest))
     return tuple(result)
+
+
+def model_state_sha256(module: nn.Module) -> str:
+    """Hash state deterministically, moving only one tensor at a time to the CPU."""
+    digest = sha256()
+    for key, value in sorted(module.state_dict().items()):
+        cpu = value.detach().cpu().contiguous()
+        digest.update(key.encode())
+        digest.update(str(tuple(cpu.shape)).encode())
+        digest.update(str(cpu.dtype).encode())
+        digest.update(cpu.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def optional_weight_hash(identifier: str | None) -> str | None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+from importlib import metadata as package_metadata
 import json
 import math
 import os
@@ -22,7 +23,8 @@ import yaml
 from .metadata import make_metadata
 from .ontology import load_ontology
 from .projection import MAIN_SEMANTIC_IDS, OntologyProjection
-from .stock_features import StockFeatureModel, optional_weight_hash
+from .stock_features import (StockFeatureModel, compatible_torch_load,
+                             model_state_sha256, optional_weight_hash)
 from .stock_lposs import (
     IMPLEMENTATION_ID,
     MODES,
@@ -44,6 +46,7 @@ IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff"})
 class InputSample:
     sample_id: str
     image_path: Path
+    provenance: dict[str, Any] | None = None
 
 
 def parse_args(argv=None):
@@ -83,6 +86,16 @@ def canonical_hash(value: Any) -> str:
                              allow_nan=False).encode()).hexdigest()
 
 
+def installed_versions() -> dict[str, str | None]:
+    result = {}
+    for distribution in ("open-clip-torch", "torch", "faiss-gpu", "faiss-cpu", "cupy-cuda11x", "cupy-cuda12x"):
+        try:
+            result[distribution] = package_metadata.version(distribution)
+        except package_metadata.PackageNotFoundError:
+            result[distribution] = None
+    return result
+
+
 def load_config(path: Path) -> dict[str, Any]:
     try:
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -96,9 +109,20 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("incompatible stock implementation identifier")
     if config["upstream_repository"] != UPSTREAM_REPOSITORY or config["upstream_commit"] != UPSTREAM_COMMIT:
         raise ValueError("stock config has an incompatible upstream LPOSS reference")
-    expected_dino = {"model": "dino_vitb16", "patch_size": 16, "feature_type": "v"}
-    if any(config["dino"].get(key) != value for key, value in expected_dino.items()):
-        raise ValueError("stock config must use upstream DINO ViT-B/16 value features")
+    expected = {
+        "clip": {"model": "ViT-B-16", "pretrained": "laion2b_s34b_b88k", "patch_size": 16, "image_size": 224},
+        "dino": {"repository": "facebookresearch/dino:7c446df5b9f45747937fb7d72314ebf7b66930c",
+                 "model": "dino_vitb16", "source": "github", "weights": None,
+                 "architecture": "vit_base", "patch_size": 16, "feature_type": "v"},
+        "graph": {"alpha": .95, "gamma": 3.0, "k": 400, "sigma": .01,
+                  "pix_dist_pow": 1.0, "tau": .01, "r": 13},
+        "slide": {"crop_size": [512, 512], "stride": [341, 341]},
+    }
+    for section, values in expected.items():
+        if not isinstance(config.get(section), dict) or any(config[section].get(k) != v for k, v in values.items()):
+            raise ValueError(f"stock config changes scientifically meaningful {section} parameters")
+    if not isinstance(config["pixel_refine"], bool):
+        raise ValueError("pixel_refine must be boolean")
     return config
 
 
@@ -114,14 +138,16 @@ def discover_inputs(args) -> list[InputSample]:
     samples = []
     if args.image:
         path = Path(args.image).expanduser().resolve()
-        samples.append(InputSample(_sample_id(None, path), path))
+        samples.append(InputSample(_sample_id(None, path), path,
+            {"input_kind": "image", "dataset_metadata_available": False}))
     elif args.image_dir:
         directory = Path(args.image_dir).expanduser().resolve()
         if not directory.is_dir():
             raise ValueError(f"image directory does not exist: {directory}")
         for path in sorted(directory.iterdir()):
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
-                samples.append(InputSample(_sample_id(None, path), path.resolve()))
+                samples.append(InputSample(_sample_id(None, path), path.resolve(),
+                    {"input_kind": "image_dir", "dataset_metadata_available": False}))
     else:
         manifest = Path(args.manifest).expanduser().resolve()
         try:
@@ -140,7 +166,10 @@ def discover_inputs(args) -> list[InputSample]:
             path = Path(item["image_path"]).expanduser()
             path = path if path.is_absolute() else manifest.parent / path
             sample = item.get("sample_id", item.get("source_id", item.get("image_id")))
-            samples.append(InputSample(_sample_id(sample, path, line_number), path.resolve()))
+            samples.append(InputSample(_sample_id(sample, path, line_number), path.resolve(), {
+                "input_kind": "manifest", "dataset_metadata_available": True,
+                "source_manifest_path": str(manifest), "source_manifest_sha256": file_hash(manifest),
+                "source_manifest_line_number": line_number, "source_record": item}))
     if not samples:
         raise ValueError("input contains no supported images")
     ids = [item.sample_id for item in samples]
@@ -223,7 +252,7 @@ def _atomic_torch(path: Path, payload):
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
-    torch.load(path, map_location="cpu", weights_only=True)
+    compatible_torch_load(path, map_location="cpu")
 
 
 def export_sample(output: Path, sample: InputSample, result, prototypes,
@@ -274,6 +303,7 @@ def _ledger_stage(ledger, name, function):
 
 def main(argv=None):
     args = parse_args(argv)
+    torch.manual_seed(0)
     validate_threshold(args.ornament_threshold)
     if args.ornament_threshold is None:
         raise ValueError("--ornament-threshold is required for the canonical binary output")
@@ -343,6 +373,9 @@ def main(argv=None):
                 model.to(device.resolved_device).eval()
             return model
         model, _ = _ledger_stage(ledger, "model_loading", build_feature_model)
+        model_fingerprints = {"clip_state_sha256": model_state_sha256(model.clip),
+            "dino_state_sha256": (model_state_sha256(model.dino_encoder)
+                                  if model.dino_encoder is not None else None)}
         prototypes, _ = _ledger_stage(ledger, "prototype_construction", lambda: build_prototypes(
             classes, model.encode_text, device=device.resolved_device, ontology_hash=ontology.hash))
         graph = dict(config["graph"])
@@ -359,19 +392,28 @@ def main(argv=None):
                 image = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
                 if device.logical_index is not None:
                     torch.cuda.reset_peak_memory_stats(device.logical_index)
+                    torch.cuda.synchronize(device.logical_index)
+                    free_before, total_memory = torch.cuda.mem_get_info(device.logical_index)
+                else:
+                    free_before = total_memory = None
                 started = time.perf_counter()
                 result = engine.run(image, prototypes, mode=args.mode, inference=args.inference,
                     crop_size=crop, stride=stride, ornament_negative_index=len(classes) - 1,
                     ornament_threshold=args.ornament_threshold)
+                if device.logical_index is not None:
+                    torch.cuda.synchronize(device.logical_index)
+                    free_after, _ = torch.cuda.mem_get_info(device.logical_index)
+                else:
+                    free_after = None
                 peak = (torch.cuda.max_memory_allocated(device.logical_index)
                         if device.logical_index is not None else None)
                 completed.append((sample, result, rgb.shape[:2],
-                                  time.perf_counter() - started, peak))
+                                  time.perf_counter() - started, peak, free_before, free_after, total_memory))
 
         _, inference_event = _ledger_stage(ledger, "inference_and_propagation", run_inference)
 
         def run_export():
-            for sample, result, original_size, elapsed, peak in completed:
+            for sample, result, original_size, elapsed, peak, free_before, free_after, total in completed:
                 artifacts = export_sample(
                     output, sample, result, prototypes, args.save_scores, args.visualize)
                 artifact_rows.extend(artifacts)
@@ -379,7 +421,10 @@ def main(argv=None):
                     "image_sha256": file_hash(sample.image_path), "original_size": list(original_size),
                     "output_grid": list(result.propagated_scores.shape[-2:]),
                     "execution": metadata_dict(result), "elapsed_seconds": elapsed,
-                    "peak_gpu_bytes": peak,
+                    "provenance": sample.provenance,
+                    "peak_pytorch_allocated_bytes": peak,
+                    "device_memory": {"free_before_bytes": free_before, "free_after_bytes": free_after,
+                        "total_bytes": total, "limitation": "snapshots are not total peak GPU memory; PyTorch peak excludes CuPy and FAISS"},
                     "artifacts": [{"path": str(path), "byte_size": path.stat().st_size,
                                    "sha256": file_hash(path)} for path, _, _ in artifacts]})
         _, export_event = _ledger_stage(ledger, "export", run_export)
@@ -390,8 +435,10 @@ def main(argv=None):
                 "clip_weight_sha256": optional_weight_hash(config["clip"]["pretrained"]),
                 "dino_repository": config["dino"]["repository"], "dino_model": config["dino"]["model"],
                 "dino_weights": config["dino"]["weights"],
-                "dino_weight_sha256": optional_weight_hash(config["dino"]["weights"])},
-            "device": asdict(device), "dependencies": dependencies, "graph_parameters": graph,
+                "dino_weight_sha256": optional_weight_hash(config["dino"]["weights"]),
+                **model_fingerprints},
+            "device": asdict(device), "dependencies": dependencies,
+            "installed_versions": installed_versions(), "graph_parameters": graph,
             "ontology_hash": ontology.hash, "projection": projection.as_dict(),
             "vocabulary_hash": prototypes.vocabulary_hash, "channel_names": list(prototypes.channel_names),
             "semantic_ids": list(prototypes.semantic_ids), "prompt_settings": dict(prototypes.prompt_settings),
@@ -399,6 +446,8 @@ def main(argv=None):
                                     "prompts": list(item.prompts), "aliases": list(item.aliases)}
                                    for item in classes],
             "ornament_contrast": contrast, "ornament_threshold": args.ornament_threshold,
+            "determinism": {"seed": 0, "policy": "inference-only; fixed seed; no stochastic augmentation",
+                            "torch_deterministic_algorithms": False},
             "records": records}
         manifest_path = output / "run_manifest.json"
         temporary = output / f".manifest.{uuid4().hex}.tmp"
