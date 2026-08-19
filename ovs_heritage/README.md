@@ -112,6 +112,10 @@ python -m ovs_heritage.validate_dataset \
 
 ## Checks
 
+COCO polygon exports can be audited and converted into this representation with
+the focused converter described in
+[`docs/coco_ontology_v2_conversion.md`](../docs/coco_ontology_v2_conversion.md).
+
 ```bash
 python -m compileall -q ovs_heritage
 pytest -q ovs_heritage/tests
