@@ -5,7 +5,7 @@ into the existing `heritage_facades_v2_12concepts_two_heads` contract. It never
 edits its COCO or image inputs. Run a read-only audit first:
 
 ```bash
-python -m ovs_heritage.coco_converter audit --coco annotations.json --images-root images --output audit.json
+python -m ovs_heritage.coco_converter audit --coco annotations.json --images-root images --metadata metadata.csv --output audit.json
 python -m ovs_heritage.coco_converter convert --coco annotations.json --images-root images --metadata metadata.csv --output-dir dataset-v2
 python -m ovs_heritage.coco_converter validate --manifest dataset-v2/manifest.jsonl --output validation.json
 ```
@@ -18,11 +18,13 @@ from `{0,1,2,3,4,5,6,7,9,10,11,255}`. Semantic ID 8 is forbidden there.
 any main label. Both are lossless single-channel uint8 PNGs and are read back
 after writing to verify shape, dtype, grid, values, and bytes.
 
-Multiple polygons in an annotation are unioned. Polygon rasterization uses the
-even-odd rule at pixel centres `(x + 0.5, y + 0.5)` with boundary intersections
-included. RLE, empty/malformed polygons, non-finite coordinates, orphan
-references, duplicate IDs/names, unknown categories, and dimension mismatches
-fail explicitly. Masks are unioned per source category before overlap analysis.
+Multiple polygons in an annotation are decoded with the canonical
+`pycocotools.mask.frPyObjects` implementation and merged before decoding. RLE,
+empty/malformed/degenerate polygons, non-finite coordinates, orphan references,
+duplicate IDs/names, unknown categories, zero decoded area, and dimension
+mismatches fail explicitly. Coordinates outside the image are accepted and
+clipped to the COCO image grid; geometry that becomes empty after clipping is
+rejected. Masks are unioned per source category before overlap analysis.
 
 Main overlaps use the versioned operational policy in
 `ovs_heritage/configs/coco_conversion_v1.json`: missing element, spalling,
@@ -46,13 +48,19 @@ keyed by `image_id` (preferred), or `canonical_file_name`, and requires
 are `building_id`, `capture_date`, and `capture_year`. No value is inferred from
 a filename. Missing mappings and facade leakage across splits fail closed.
 
+Audit and conversion use the same complete read-only preflight: it opens every
+image, decodes every annotation, computes geometry and overlaps, and, when
+metadata is supplied, verifies complete metadata and facade-disjoint splits.
+
 The output contains copied portable images under `images/`, both mask trees,
 `manifest.jsonl`, `overlap_report.json`, `filename_resolution_report.json`, and
 `conversion_summary.json`. The summary records source, ontology, and policy
 hashes plus artifact sizes/hashes. The overlap report exposes every intersecting
 category pair and its automatic or independent-mask treatment. Conversion
-requires a new/empty directory; `--overwrite` explicitly replaces the entire
-output directory only after all inputs pass the initial COCO inspection.
+requires a new/empty directory. Generation and validation occur in a unique
+sibling staging directory. `--overwrite` preserves the existing output until
+staging succeeds, then uses backup and atomic rename operations with rollback;
+failed staging trees are removed.
 
 The real export additionally requires the COCO file, complete source-image
 root, and complete reviewed metadata mapping. Snapshot counts are deliberately
