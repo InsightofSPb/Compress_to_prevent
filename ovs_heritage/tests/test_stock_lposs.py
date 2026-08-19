@@ -223,11 +223,13 @@ def test_canonical_dataset_metadata_and_facade_split_consistency(tmp_path):
         Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(tmp_path / name)
     base = {"schema_version": "heritage_two_map_v2", "ontology_version": ontology.version,
             "ontology_hash": ontology.hash, "facade_id": "facade-a", "split": "test",
-            "facade_disjoint_split_id": "official-v2-split"}
+            "main_mask_path": "main/a.png", "ornament_mask_path": "ornament/a.png"}
     manifest = tmp_path / "canonical.jsonl"
     manifest.write_text(json.dumps({**base, "sample_id": "a", "image_path": "a.png"}) + "\n")
     sample = discover_inputs(_args(manifest=str(manifest)))[0]
     assert sample.provenance["dataset_metadata_available"] is True
+    assert sample.provenance["canonical_dataset_v2"] is True
+    assert sample.provenance["facade_disjoint_split_verified"] is False
     assert sample.provenance["canonical_fields"]["facade_id"] == "facade-a"
     manifest.write_text("\n".join(json.dumps(row) for row in (
         {**base, "sample_id": "a", "image_path": "a.png"},
@@ -352,6 +354,9 @@ def _official_artifact(tmp_path):
             "commit": "e489a7445528922ddfe4e39631ef2fe34827c873", "tree": "tree"}}
     manifest = {**expected, "schema_version": "official-lposs-parity-artifact-v1",
         "producer": "official-upstream", "upstream": expected["upstream"],
+        "dino_hub_loads": [{"requested_repository": "facebookresearch/dino:main",
+            "resolved_repository": DINO_REPOSITORY, "model": "dino_vitb16",
+            "args": [], "kwargs": {}}],
         "patch_grid": [2, 2], "image_grid": [3, 4],
         "stages": {"maskclip_raw": ["seed_scores"],
             "lposs": ["seed_scores", "propagated_scores"],
@@ -403,6 +408,48 @@ def test_correct_dino_commit_is_passed_to_torch_hub(monkeypatch):
     StockFeatureModel.configure_dino(model, repository=DINO_REPOSITORY, model="dino_vitb16",
         patch_size=16, feature_type="v")
     assert calls == [(DINO_REPOSITORY, "dino_vitb16", {"source": "github"})]
+
+
+def test_official_constructor_boundary_and_scoped_dino_redirect(monkeypatch):
+    from tools.run_official_lposs_parity import construct_official_lposs
+    constructed = []
+    downloads = []
+
+    class FakeOfficialLPOSS:
+        def __init__(self, clip_backbone, class_names, vit_arch="vit_base",
+                     vit_patch_size=16, enc_type_feats="k"):
+            constructed.append((clip_backbone, class_names, vit_arch,
+                                vit_patch_size, enc_type_feats))
+            self.encoder = torch.hub.load("facebookresearch/dino:main", "dino_vitb16")
+
+    def original(repository, model, *args, **kwargs):
+        downloads.append((repository, model, args, kwargs))
+        return object()
+    monkeypatch.setattr(torch.hub, "load", original)
+    config = {"dino": {"architecture": "vit_base", "patch_size": 16, "feature_type": "v"}}
+    model, intercepted = construct_official_lposs(
+        FakeOfficialLPOSS, torch, class_names=["wall", "window"], config=config)
+    assert isinstance(model, FakeOfficialLPOSS)
+    assert constructed == [("maskclip", ["wall", "window"], "vit_base", 16, "v")]
+    assert downloads == [(DINO_REPOSITORY, "dino_vitb16", (), {})]
+    assert intercepted[0]["requested_repository"] == "facebookresearch/dino:main"
+    assert intercepted[0]["resolved_repository"] == DINO_REPOSITORY
+    assert torch.hub.load is original
+
+
+@pytest.mark.parametrize("repository,model", [
+    ("facebookresearch/dino:other", "dino_vitb16"),
+    ("facebookresearch/dino:main", "dino_vits16"),
+])
+def test_official_dino_redirect_rejects_unexpected_calls_and_restores(monkeypatch, repository, model):
+    from tools.run_official_lposs_parity import pinned_dino_hub_load
+    def original(*_args, **_kwargs):
+        return object()
+    monkeypatch.setattr(torch.hub, "load", original)
+    with pytest.raises(RuntimeError, match="unexpected official"):
+        with pinned_dino_hub_load(torch, []):
+            torch.hub.load(repository, model)
+    assert torch.hub.load is original
 
 
 def test_stock_config_rejects_changed_scientific_parameter(tmp_path):

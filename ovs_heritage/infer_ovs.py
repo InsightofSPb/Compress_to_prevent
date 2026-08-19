@@ -71,6 +71,7 @@ def parse_args(argv=None):
     parser.add_argument("--ledger-dir")
     parser.add_argument("--run-id")
     parser.add_argument("--prototype-artifact", help=argparse.SUPPRESS)
+    parser.add_argument("--parity-feature-artifact", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -156,7 +157,7 @@ def discover_inputs(args, ontology=None) -> list[InputSample]:
         except OSError as exc:
             raise ValueError(f"cannot read manifest {manifest}: {exc}") from exc
         manifest_sha256 = file_hash(manifest)
-        facade_splits: dict[str, set[tuple[str, str]]] = {}
+        facade_splits: dict[str, set[str]] = {}
         from .ontology import V2_VERSION
         from .validate_dataset import V2_DATASET_SCHEMA
         canonical_ontology = ontology or load_ontology()
@@ -172,17 +173,21 @@ def discover_inputs(args, ontology=None) -> list[InputSample]:
             path = Path(item["image_path"]).expanduser()
             path = path if path.is_absolute() else manifest.parent / path
             sample = item.get("sample_id", item.get("source_id", item.get("image_id")))
-            split_id = item.get("facade_disjoint_split_id", item.get("split_id"))
             canonical_fields = {
                 "schema_version": item.get("schema_version"),
                 "ontology_version": item.get("ontology_version"),
                 "facade_id": item.get("facade_id"), "split": item.get("split"),
-                "facade_disjoint_split_id": split_id,
+                "image_path": item.get("image_path"),
+                "main_mask_path": item.get("main_mask_path"),
+                "ornament_mask_path": item.get("ornament_mask_path"),
             }
-            canonical = (canonical_fields["schema_version"] == V2_DATASET_SCHEMA
+            metadata_available = (canonical_fields["schema_version"] == V2_DATASET_SCHEMA
                 and canonical_fields["ontology_version"] == V2_VERSION
                 and all(isinstance(canonical_fields[k], str) and canonical_fields[k].strip()
-                        for k in ("facade_id", "split", "facade_disjoint_split_id"))
+                        for k in ("facade_id", "split", "image_path")))
+            canonical = (metadata_available
+                and all(isinstance(canonical_fields[k], str) and canonical_fields[k].strip()
+                        for k in ("main_mask_path", "ornament_mask_path"))
                 and item.get("ontology_hash", canonical_ontology.hash) == canonical_ontology.hash)
             if canonical_fields["schema_version"] not in (None, V2_DATASET_SCHEMA):
                 raise ValueError(f"{manifest}: line {line_number} has incompatible dataset schema")
@@ -195,12 +200,13 @@ def discover_inputs(args, ontology=None) -> list[InputSample]:
                     and isinstance(canonical_fields["split"], str)
                     and canonical_fields["split"].strip()):
                 facade = canonical_fields["facade_id"].strip()
-                identity = (canonical_fields["split"].strip(),
-                            split_id.strip() if isinstance(split_id, str) else "<unidentified>")
+                identity = canonical_fields["split"].strip()
                 facade_splits.setdefault(facade, set()).add(identity)
             samples.append(InputSample(_sample_id(sample, path, line_number), path.resolve(), {
-                "input_kind": "manifest", "dataset_metadata_available": canonical,
+                "input_kind": "manifest", "dataset_metadata_available": metadata_available,
                 "canonical_dataset_v2": canonical, "canonical_fields": canonical_fields,
+                "facade_disjoint_split_verified": False,
+                "facade_disjoint_split_evidence": "unavailable from a single inference manifest",
                 "source_manifest_path": str(manifest), "source_manifest_sha256": manifest_sha256,
                 "source_manifest_line_number": line_number, "source_record": item}))
         conflicts = {facade: sorted(values) for facade, values in facade_splits.items() if len(values) > 1}
@@ -359,6 +365,9 @@ def main(argv=None):
         raise ValueError("lposs requires stock_lposs.yaml with pixel_refine:false")
     ontology = load_ontology(args.vocabulary)
     samples = discover_inputs(args, ontology)
+    if args.parity_feature_artifact and (len(samples) != 1 or args.inference != "whole"
+                                         or args.mode == "maskclip_raw"):
+        raise ValueError("parity feature capture requires one whole-inference graph mode sample")
     output = prepare_output(Path(args.output_dir), samples)
     projection = OntologyProjection.from_ontology(ontology)
     classes, contrast = load_runtime_classes(
@@ -407,6 +416,7 @@ def main(argv=None):
             clip = config["clip"]
             model = StockFeatureModel(clip_model=clip["model"], clip_pretrained=clip["pretrained"],
                                       patch_size=clip["patch_size"], image_size=clip["image_size"])
+            model.parity_capture_enabled = args.parity_feature_artifact
             model.to(device.resolved_device).eval()
             if args.mode != "maskclip_raw":
                 dino = config["dino"]
@@ -487,6 +497,18 @@ def main(argv=None):
                         "total_bytes": total, "limitation": "snapshots are not total peak GPU memory; PyTorch peak excludes CuPy and FAISS"},
                     "artifacts": [{"path": str(path), "byte_size": path.stat().st_size,
                                    "sha256": file_hash(path)} for path, _, _ in artifacts]})
+            if args.parity_feature_artifact:
+                clip_nodes, dino_nodes, patch_grid = model.parity_features()
+                feature_path = output / "parity_features.npz"
+                temporary = output / f".parity-features.{uuid4().hex}.tmp"
+                with temporary.open("wb") as stream:
+                    np.savez(stream, clip_features=clip_nodes.cpu().numpy(),
+                             dino_features=dino_nodes.cpu().numpy(),
+                             patch_grid=np.asarray(patch_grid, dtype=np.int64),
+                             image_grid=np.asarray(completed[0][2], dtype=np.int64))
+                os.replace(temporary, feature_path)
+                artifact_rows.append((feature_path, "parity_normalized_dense_features",
+                                      "application/x-npz"))
         _, export_event = _ledger_stage(ledger, "export", run_export)
         manifest = {"schema_version": "stock-ovs-lposs-run-v1", "run_id": run_id,
             "stock_implementation": IMPLEMENTATION_ID, "upstream_repository": UPSTREAM_REPOSITORY,

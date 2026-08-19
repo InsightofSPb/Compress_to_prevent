@@ -163,10 +163,15 @@ PYCONTRACT
 
    The checker launches the unmodified official checkout in an isolated subprocess, injects the
    exact same versioned prototype tensor into both implementations, validates checkout/tree/model/
-   input/configuration/prototype provenance, and compares raw, LPOSS, and LPOSS+ stages. It never
+   input/configuration/prototype provenance, compares normalized dense CLIP and DINO features, and
+   compares raw, LPOSS, and LPOSS+ score stages. It never
    accepts an externally supplied official score file. `parity_manifest.json` is created with
    `real_gpu_parity=true` only after every required real-CUDA comparison succeeds; any missing or
    mismatched stage exits non-zero.
+
+   The harness being implemented and CPU-contract-tested is not evidence that parity passed. Until
+   this command completes on a compatible CUDA/CuPy/FAISS-GPU environment and writes the validated
+   manifest, real upstream/local numerical parity remains pending.
 
 5. **Stock dataset-v2 `lposs` inference**:
 
@@ -192,5 +197,7 @@ PYCONTRACT
 
 Direct `--image`/`--image-dir` records explicitly report unavailable dataset/split metadata. Generic
 JSONL is supported but marked non-canonical; canonical dataset-v2 status requires a validated schema,
-ontology, facade, split, and facade-disjoint split identity. The original JSON mapping and its source
-manifest path, line, and single computed manifest hash are retained in the existing ledger.
+ontology, facade, split, image path, and the two canonical mask paths emitted by the converter.
+`facade_disjoint_split_verified` remains false for a single inference manifest because cross-split
+validation evidence is unavailable. The original JSON mapping and its source manifest path, line, and
+single computed manifest hash are retained in the existing ledger.

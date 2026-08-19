@@ -6,7 +6,9 @@ the parent checker is exclusively through versioned JSON/NPZ files.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from hashlib import sha256
+import inspect
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,47 @@ import sys
 
 EXPECTED_COMMIT = "e489a7445528922ddfe4e39631ef2fe34827c873"
 EXPECTED_REPOSITORY = "https://github.com/vladan-stojnic/LPOSS"
+DINO_REQUESTED_REPOSITORY = "facebookresearch/dino:main"
+DINO_RESOLVED_REPOSITORY = "facebookresearch/dino:7c446df5b9f45747937fb0d72314eb9f7b66930a"
+DINO_MODEL = "dino_vitb16"
+LPOSS_CONSTRUCTOR_PARAMETERS = (
+    "clip_backbone", "class_names", "vit_arch", "vit_patch_size", "enc_type_feats")
+
+
+@contextmanager
+def pinned_dino_hub_load(torch_module, calls):
+    """Narrowly redirect the single hard-coded official DINO load, then restore it."""
+    original = torch_module.hub.load
+
+    def load(repository, model, *args, **kwargs):
+        if repository != DINO_REQUESTED_REPOSITORY or model != DINO_MODEL:
+            raise RuntimeError(f"unexpected official torch.hub.load request: {repository!r}, {model!r}")
+        call = {"requested_repository": repository, "resolved_repository": DINO_RESOLVED_REPOSITORY,
+                "model": model, "args": list(args), "kwargs": dict(kwargs)}
+        calls.append(call)
+        return original(DINO_RESOLVED_REPOSITORY, model, *args, **kwargs)
+
+    torch_module.hub.load = load
+    try:
+        yield
+    finally:
+        torch_module.hub.load = original
+
+
+def construct_official_lposs(lposs_class, torch_module, *, class_names, config):
+    """Validate and call the exact constructor exposed by pinned official LPOSS."""
+    parameters = tuple(inspect.signature(lposs_class).parameters)
+    if parameters != LPOSS_CONSTRUCTOR_PARAMETERS:
+        raise RuntimeError("pinned official LPOSS constructor drift: "
+                           f"expected {LPOSS_CONSTRUCTOR_PARAMETERS}, observed {parameters}")
+    calls = []
+    with pinned_dino_hub_load(torch_module, calls):
+        model = lposs_class(clip_backbone="maskclip", class_names=class_names,
+            vit_arch=config["dino"]["architecture"], vit_patch_size=config["dino"]["patch_size"],
+            enc_type_feats=config["dino"]["feature_type"])
+    if len(calls) != 1:
+        raise RuntimeError(f"official LPOSS must issue exactly one pinned DINO load; observed {len(calls)}")
+    return model, calls
 
 
 def file_hash(path: Path) -> str:
@@ -108,11 +151,9 @@ def main(argv=None):
     if configurations["lposs_plus"] != plus_expected:
         raise ValueError("LPOSS+ configuration differs by more than pixel_refine")
     graph = config["graph"]
-    model = LPOSS(clip_backbone="maskclip", class_names=proto_meta["channel_names"],
-        vit_arch=config["dino"]["architecture"], vit_patch_size=config["dino"]["patch_size"],
-        enc_type_feats=config["dino"]["feature_type"], dino_repo=config["dino"]["repository"],
-        dino_model=config["dino"]["model"], dino_weights=config["dino"]["weights"],
-        dino_source=config["dino"]["source"]).to(request["device"]).eval()
+    model, dino_loads = construct_official_lposs(
+        LPOSS, torch, class_names=proto_meta["channel_names"], config=config)
+    model = model.to(request["device"]).eval()
     model.clip_backbone.decode_head.class_embeddings = prototypes
     model_hashes = {"clip_state_sha256": state_hash(model.clip_backbone.backbone),
                     "dino_state_sha256": state_hash(model.dino_encoder)}
@@ -166,6 +207,7 @@ def main(argv=None):
         "ontology_hash": proto_meta["ontology_hash"], "patch_grid": [h, w],
         "image_grid": list(image.shape[-2:]), "device": request["device"], "seed": request["seed"],
         "model_hashes": model_hashes,
+        "dino_hub_loads": dino_loads,
         "stages": {"maskclip_raw": ["seed_scores"],
                    "lposs": ["seed_scores", "propagated_scores"],
                    "lposs_plus": ["seed_scores", "propagated_scores", "pixel_refinement"]},

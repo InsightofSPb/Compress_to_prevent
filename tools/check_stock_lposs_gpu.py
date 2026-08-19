@@ -68,6 +68,13 @@ def validate_official_artifact(manifest_path: Path, *, expected: dict) -> tuple[
             raise ValueError(f"official artifact provenance mismatch for {key}")
     if canonical_hash(manifest["configurations"]) != manifest["configuration_sha256"]:
         raise ValueError("official artifact configuration content does not match its fingerprint")
+    dino_loads = manifest.get("dino_hub_loads", [])
+    if len(dino_loads) != 1 or dino_loads[0].get("requested_repository") != "facebookresearch/dino:main":
+        raise ValueError("official artifact lacks the single expected DINO interception")
+    if (dino_loads[0].get("resolved_repository") !=
+            "facebookresearch/dino:7c446df5b9f45747937fb0d72314eb9f7b66930a"
+            or dino_loads[0].get("model") != "dino_vitb16"):
+        raise ValueError("official artifact did not resolve DINO to the pinned model revision")
     for mode, required in REQUIRED_STAGES.items():
         if not required.issubset(set(manifest.get("stages", {}).get(mode, []))):
             raise ValueError(f"official artifact is incomplete for {mode}")
@@ -152,7 +159,8 @@ def main(argv=None):
         dino_bootstrap = work / "local-lposs"
         subprocess.run([sys.executable, "-m", "ovs_heritage.infer_ovs", *common,
             "--prototype-artifact", str(prototype_artifact), "--model-config", str(local_root / "configs/stock_lposs.yaml"),
-            "--mode", "lposs", "--output-dir", str(dino_bootstrap)], cwd=local_root, check=True)
+            "--parity-feature-artifact", "--mode", "lposs", "--output-dir", str(dino_bootstrap)],
+            cwd=local_root, check=True)
         dino_manifest = json.loads((dino_bootstrap / "run_manifest.json").read_text())
         request["model_hashes"] = {k: dino_manifest["weights"][k]
                                    for k in ("clip_state_sha256", "dino_state_sha256")}
@@ -166,6 +174,18 @@ def main(argv=None):
     subprocess.run(command, cwd=upstream, env=env, check=True)
     expected = {**request, "prototype_artifact_sha256": file_hash(prototype_artifact)}
     official_manifest, official = validate_official_artifact(official_dir / "manifest.json", expected=expected)
+    local_features = np.load(work / "local-lposs/parity_features.npz", allow_pickle=False)
+    if local_features["patch_grid"].tolist() != official_manifest["patch_grid"]:
+        raise ValueError("local and official patch grids differ")
+    if local_features["image_grid"].tolist() != official_manifest["image_grid"]:
+        raise ValueError("local and official image grids differ")
+    differences = {}
+    shapes = {}
+    for feature in ("clip_features", "dino_features"):
+        observed = torch.from_numpy(local_features[feature])
+        differences[feature] = compare_scores(official[feature], observed, atol=args.atol, rtol=args.rtol)
+        shapes[feature] = {"official": list(official[feature].shape),
+                           "local": list(local_features[feature].shape)}
 
     local_outputs = {"maskclip_raw": (bootstrap_manifest, bootstrap_scores)}
     for mode, config_name in (("lposs", "stock_lposs.yaml"), ("lposs_plus", "stock_lposs_plus.yaml")):
@@ -181,7 +201,6 @@ def main(argv=None):
             scores = compatible_torch_load(next(target.glob("*/scores.pt")))
         local_outputs[mode] = (manifest, scores)
 
-    differences = {}
     for mode, (manifest, scores) in local_outputs.items():
         if manifest["config"] != configurations[mode]:
             raise ValueError(f"local {mode} did not execute the requested resolved configuration")
@@ -196,8 +215,11 @@ def main(argv=None):
                                        or execution["effective_k"] != config["graph"]["k"]):
             raise ValueError(f"local {mode} silently changed stock neighbor count")
         for stage in ("seed_scores", "propagated_scores"):
-            differences[f"{mode}.{stage}"] = compare_scores(
+            key = f"{mode}.{stage}"
+            differences[key] = compare_scores(
                 official[f"{mode}.{stage}"], scores[stage], atol=args.atol, rtol=args.rtol)
+            shapes[key] = {"official": list(official[key].shape),
+                           "local": list(scores[stage].shape)}
     parity = {"schema_version": "lposs-upstream-parity-v2", "real_gpu_parity": True,
         "passed": True, "upstream": official_manifest["upstream"], "input_sha256": request["input_sha256"],
         "configurations": configurations, "configuration_sha256": request["configuration_sha256"],
@@ -205,7 +227,9 @@ def main(argv=None):
         "prototypes_sha256": request["prototypes_sha256"], "model_hashes": request["model_hashes"],
         "channel_names": request["channel_names"], "semantic_ids": request["semantic_ids"],
         "device": args.device, "seed": 0, "atol": args.atol, "rtol": args.rtol,
-        "maximum_absolute_differences": differences, "modes": list(MODES),
+        "maximum_absolute_differences": differences, "tensor_shapes": shapes,
+        "patch_grid": official_manifest["patch_grid"], "image_grid": official_manifest["image_grid"],
+        "modes": list(MODES),
         "artifacts": {"request": str(request_path), "prototypes": str(prototype_artifact),
                       "official_manifest": str(official_dir / "manifest.json")}}
     (work / "parity_manifest.json").write_text(json.dumps(parity, indent=2, sort_keys=True) + "\n")

@@ -53,6 +53,9 @@ class StockFeatureModel(nn.Module):
         self.dino_patch_size = None
         self.dino_feature_type = None
         self._dino_hook = {}
+        self.parity_capture_enabled = False
+        self._parity_clip_dense = None
+        self._parity_dino_dense = None
 
     @torch.no_grad()
     def encode_text(self, prompts: list[str]) -> torch.Tensor:
@@ -80,7 +83,10 @@ class StockFeatureModel(nn.Module):
             value = visual.ln_post(value.permute(1, 0, 2)).permute(1, 0, 2)[:, 1:]
             value = value.reshape(b, *grid, -1).permute(0, 3, 1, 2).contiguous()
             projection = visual.proj
-            return F.conv2d(value, projection.t()[:, :, None, None])
+            output = F.conv2d(value, projection.t()[:, :, None, None])
+            if self.parity_capture_enabled:
+                self._parity_clip_dense = output.detach()
+            return output
         finally:
             visual.positional_embedding.data = saved
 
@@ -116,7 +122,22 @@ class StockFeatureModel(nn.Module):
         qkv = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, heads, -1).permute(2, 0, 3, 1, 4)
         selected = {"q": 0, "k": 1, "v": 2}[self.dino_feature_type]
         features = qkv[selected][:, :, 1:, :].permute(0, 2, 1, 3).flatten(-2)
-        return F.normalize(features, dim=-1).reshape(batch.shape[0], h, w, -1).permute(0, 3, 1, 2)
+        output = F.normalize(features, dim=-1).reshape(batch.shape[0], h, w, -1).permute(0, 3, 1, 2)
+        if self.parity_capture_enabled:
+            self._parity_dino_dense = output.detach()
+        return output
+
+    def parity_features(self) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+        """Return normalized aligned patch nodes only when explicitly enabled."""
+        if not self.parity_capture_enabled or self._parity_clip_dense is None or self._parity_dino_dense is None:
+            raise RuntimeError("parity feature capture did not execute both CLIP and DINO")
+        dino = self._parity_dino_dense
+        clip = self._parity_clip_dense
+        if clip.shape[-2:] != dino.shape[-2:]:
+            clip = F.interpolate(clip, dino.shape[-2:], mode="bilinear", align_corners=False)
+        clip_nodes = F.normalize(clip.permute(0, 2, 3, 1).reshape(-1, clip.shape[1]), dim=-1)
+        dino_nodes = F.normalize(dino.permute(0, 2, 3, 1).reshape(-1, dino.shape[1]), dim=-1)
+        return clip_nodes, dino_nodes, tuple(dino.shape[-2:])
 
     def _resize_position(self, grid):
         position = self._original_position.to(next(self.clip.parameters()).device)
