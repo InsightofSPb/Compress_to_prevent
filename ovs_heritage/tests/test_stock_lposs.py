@@ -14,6 +14,7 @@ from torch import nn
 
 from ovs_heritage.infer_ovs import (
     InputSample,
+    dataset_snapshot,
     discover_inputs,
     export_sample,
     load_config,
@@ -22,7 +23,11 @@ from ovs_heritage.infer_ovs import (
     _ledger_stage,
 )
 from ovs_heritage.projection import MAIN_SEMANTIC_IDS
-from ovs_heritage.stock_features import StockFeatureModel, module_state_fingerprint
+from ovs_heritage.ontology import load_ontology
+from ovs_heritage.stock_features import (
+    DINO_REPOSITORY, StockFeatureModel, module_state_fingerprint,
+    validate_pinned_hub_repository,
+)
 from ovs_heritage.stock_lposs import (
     DeviceInfo,
     StockOVSEngine,
@@ -191,6 +196,53 @@ def test_dataset_v2_jsonl_resolves_relative_images(tmp_path):
     assert result[0].image_path == (image_dir / "a.png").resolve()
     assert result[0].provenance["source_record"]["image_path"] == "images/a.png"
     assert result[0].provenance["source_manifest_sha256"] == sha256(manifest.read_bytes()).hexdigest()
+    assert result[0].provenance["dataset_metadata_available"] is False
+
+
+def test_source_manifest_hash_is_computed_once(tmp_path, monkeypatch):
+    import ovs_heritage.infer_ovs as inference
+    for name in ("a.png", "b.png"):
+        Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(tmp_path / name)
+    manifest = tmp_path / "generic.jsonl"
+    manifest.write_text("\n".join(json.dumps({"sample_id": name[0], "image_path": name})
+                                  for name in ("a.png", "b.png")))
+    calls = []
+    original = inference.file_hash
+    monkeypatch.setattr(inference, "file_hash", lambda path: calls.append(Path(path)) or original(path))
+    samples = discover_inputs(_args(manifest=str(manifest)))
+    assert calls == [manifest.resolve()]
+    assert {sample.provenance["source_manifest_sha256"] for sample in samples} == {
+        sha256(manifest.read_bytes()).hexdigest()}
+    snapshot = dataset_snapshot(samples)
+    assert snapshot["inputs"][0]["provenance"]["source_record"]["image_path"] == "a.png"
+
+
+def test_canonical_dataset_metadata_and_facade_split_consistency(tmp_path):
+    ontology = load_ontology()
+    for name in ("a.png", "b.png"):
+        Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(tmp_path / name)
+    base = {"schema_version": "heritage_two_map_v2", "ontology_version": ontology.version,
+            "ontology_hash": ontology.hash, "facade_id": "facade-a", "split": "test",
+            "facade_disjoint_split_id": "official-v2-split"}
+    manifest = tmp_path / "canonical.jsonl"
+    manifest.write_text(json.dumps({**base, "sample_id": "a", "image_path": "a.png"}) + "\n")
+    sample = discover_inputs(_args(manifest=str(manifest)))[0]
+    assert sample.provenance["dataset_metadata_available"] is True
+    assert sample.provenance["canonical_fields"]["facade_id"] == "facade-a"
+    manifest.write_text("\n".join(json.dumps(row) for row in (
+        {**base, "sample_id": "a", "image_path": "a.png"},
+        {**base, "sample_id": "b", "image_path": "b.png", "split": "train"})))
+    with pytest.raises(ValueError, match="inconsistently"):
+        discover_inputs(_args(manifest=str(manifest)))
+
+
+def test_partial_dataset_identity_is_explicitly_noncanonical(tmp_path):
+    Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(tmp_path / "a.png")
+    manifest = tmp_path / "partial.jsonl"
+    manifest.write_text(json.dumps({"image_path": "a.png", "facade_id": "f"}))
+    sample = discover_inputs(_args(manifest=str(manifest)))[0]
+    assert sample.provenance["dataset_metadata_available"] is False
+    assert sample.provenance["canonical_dataset_v2"] is False
 
 
 @pytest.mark.parametrize("name,pixel", [("stock_lposs.yaml", False),
@@ -201,6 +253,7 @@ def test_dedicated_stock_configs_pin_upstream_dino(name, pixel):
     assert config["dino"]["model"] == "dino_vitb16"
     assert config["dino"]["patch_size"] == 16
     assert config["dino"]["feature_type"] == "v"
+    assert config["dino"]["repository"] == DINO_REPOSITORY
     assert config["pixel_refine"] is pixel
 
 
@@ -252,6 +305,7 @@ def test_scores_are_saved_and_reloaded_with_112_compatible_loader(tmp_path, monk
 
 
 def test_graph_preflights_safe_and_reject_before_propagation(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: __import__("contextlib").nullcontext())
     device = DeviceInfo("cuda:0", "cpu", 0, "fake")
     safe = {"r": 13, "available_gpu_bytes": 10**9, "gpu_memory_reserve_bytes": 0,
             "max_graph_nodes": 100, "max_dense_graph_bytes": 10**9,
@@ -270,15 +324,85 @@ def test_graph_preflights_safe_and_reject_before_propagation(monkeypatch):
     assert propagation.pixel_calls == 0
 
 
-def test_parity_mapping_contract_uses_channels_semantics_and_tolerances():
-    from tools.check_stock_lposs_gpu import compare_score_mappings
-    base = {"seed_scores": torch.ones(1, 2, 2, 2),
-            "propagated_scores": torch.ones(1, 2, 2, 2),
-            "channel_names": ("a", "b"), "semantic_ids": (1, 2)}
-    assert compare_score_mappings(base, dict(base), atol=0, rtol=0) == {
-        "seed_scores": 0.0, "propagated_scores": 0.0}
-    with pytest.raises(AssertionError, match="channel order"):
-        compare_score_mappings(base, {**base, "channel_names": ("b", "a")}, atol=0, rtol=0)
+def test_official_adapter_command_is_isolated_and_explicit(tmp_path):
+    from tools.check_stock_lposs_gpu import official_adapter_command
+    command = official_adapter_command(python="python", adapter=tmp_path / "adapter.py",
+        request=tmp_path / "request.json", output=tmp_path / "official")
+    assert command == ["python", str(tmp_path / "adapter.py"), "--request",
+                       str(tmp_path / "request.json"), "--output-dir", str(tmp_path / "official")]
+
+
+def _official_artifact(tmp_path):
+    from tools.check_stock_lposs_gpu import canonical_hash, file_hash
+    arrays = {f"{mode}.{stage}": np.ones((1, 2, 3, 4), dtype=np.float32)
+              for mode in ("maskclip_raw", "lposs", "lposs_plus")
+              for stage in ("seed_scores", "propagated_scores")}
+    arrays.update(clip_features=np.ones((4, 2), np.float32),
+                  dino_features=np.ones((4, 2), np.float32))
+    np.savez(tmp_path / "stages.npz", **arrays)
+    configurations = {"maskclip_raw": {"pixel_refine": False},
+                      "lposs": {"pixel_refine": False}, "lposs_plus": {"pixel_refine": True}}
+    expected = {"input_sha256": "input", "prototype_artifact_sha256": "file-proto",
+        "prototypes_sha256": "proto", "configurations": configurations,
+        "configuration_sha256": canonical_hash(configurations),
+        "channel_names": ["a", "b"], "semantic_ids": [1, None], "ontology_hash": "ontology",
+        "model_hashes": {"clip_state_sha256": "clip", "dino_state_sha256": "dino"},
+        "device": "cuda:0", "seed": 0, "upstream": {
+            "repository": "https://github.com/vladan-stojnic/LPOSS",
+            "commit": "e489a7445528922ddfe4e39631ef2fe34827c873", "tree": "tree"}}
+    manifest = {**expected, "schema_version": "official-lposs-parity-artifact-v1",
+        "producer": "official-upstream", "upstream": expected["upstream"],
+        "patch_grid": [2, 2], "image_grid": [3, 4],
+        "stages": {"maskclip_raw": ["seed_scores"],
+            "lposs": ["seed_scores", "propagated_scores"],
+            "lposs_plus": ["seed_scores", "propagated_scores", "pixel_refinement"]},
+        "stage_artifact": "stages.npz", "stage_artifact_sha256": file_hash(tmp_path / "stages.npz")}
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    return path, expected, manifest
+
+
+def test_official_artifact_validation_and_rejections(tmp_path):
+    from tools.check_stock_lposs_gpu import validate_official_artifact
+    path, expected, manifest = _official_artifact(tmp_path)
+    validated, arrays = validate_official_artifact(path, expected=expected)
+    assert validated["upstream"]["commit"] == "e489a7445528922ddfe4e39631ef2fe34827c873"
+    arrays.close()
+    for key, value in (("input_sha256", "wrong"), ("prototypes_sha256", "wrong")):
+        changed = {**manifest, key: value}
+        path.write_text(json.dumps(changed))
+        with pytest.raises(ValueError, match="provenance mismatch"):
+            validate_official_artifact(path, expected=expected)
+    changed = {**manifest, "stages": {**manifest["stages"], "lposs_plus": ["seed_scores"]}}
+    path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_official_artifact(path, expected=expected)
+    changed = {**manifest, "upstream": {**manifest["upstream"], "commit": "0" * 40}}
+    path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="wrong repository"):
+        validate_official_artifact(path, expected=expected)
+    changed = {**manifest, "channel_names": ["b", "a"]}
+    path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="channel_names"):
+        validate_official_artifact(path, expected=expected)
+
+
+def test_correct_dino_commit_is_passed_to_torch_hub(monkeypatch):
+    validate_pinned_hub_repository(DINO_REPOSITORY)
+    with pytest.raises(ValueError, match="immutable"):
+        validate_pinned_hub_repository("facebookresearch/dino:main")
+    calls = []
+    attention = types.SimpleNamespace(qkv=nn.Linear(2, 6), num_heads=1)
+    encoder = nn.Module()
+    encoder.blocks = [types.SimpleNamespace(attn=attention)]
+    monkeypatch.setattr(torch.hub, "load", lambda repository, model, **kwargs:
+                        calls.append((repository, model, kwargs)) or encoder)
+    model = object.__new__(StockFeatureModel)
+    nn.Module.__init__(model)
+    model._dino_hook = {}
+    StockFeatureModel.configure_dino(model, repository=DINO_REPOSITORY, model="dino_vitb16",
+        patch_size=16, feature_type="v")
+    assert calls == [(DINO_REPOSITORY, "dino_vitb16", {"source": "github"})]
 
 
 def test_stock_config_rejects_changed_scientific_parameter(tmp_path):

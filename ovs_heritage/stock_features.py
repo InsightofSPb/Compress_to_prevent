@@ -8,6 +8,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+DINO_REPOSITORY_COMMIT = "7c446df5b9f45747937fb0d72314eb9f7b66930a"
+DINO_REPOSITORY = f"facebookresearch/dino:{DINO_REPOSITORY_COMMIT}"
+
+
+def validate_pinned_hub_repository(repository: str) -> None:
+    """Reject moving or malformed Torch Hub references before any download."""
+    if repository != DINO_REPOSITORY:
+        raise ValueError(f"DINO repository must be immutable {DINO_REPOSITORY}, got {repository!r}")
+
 
 def compatible_torch_load(path, *, map_location="cpu"):
     """Load tensor-only artifacts on both torch 1.12 and newer releases."""
@@ -77,6 +86,7 @@ class StockFeatureModel(nn.Module):
 
     def configure_dino(self, *, repository: str, model: str, patch_size: int,
                        feature_type: str, source: str = "github", weights: str | None = None):
+        validate_pinned_hub_repository(repository)
         kwargs = {"source": source}
         if weights is not None:
             kwargs["weights"] = weights

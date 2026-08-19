@@ -24,7 +24,7 @@ from .metadata import make_metadata
 from .ontology import load_ontology
 from .projection import MAIN_SEMANTIC_IDS, OntologyProjection
 from .stock_features import (StockFeatureModel, compatible_torch_load,
-                             model_state_sha256, optional_weight_hash)
+                             DINO_REPOSITORY, model_state_sha256, optional_weight_hash)
 from .stock_lposs import (
     IMPLEMENTATION_ID,
     MODES,
@@ -35,7 +35,7 @@ from .stock_lposs import (
     metadata_dict,
     resolve_device,
 )
-from .vocabulary import RuntimeClass, build_prototypes, heritage_runtime_vocabulary
+from .vocabulary import PrototypeSet, RuntimeClass, build_prototypes, heritage_runtime_vocabulary
 
 UPSTREAM_REPOSITORY = "https://github.com/vladan-stojnic/LPOSS"
 SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -70,6 +70,7 @@ def parse_args(argv=None):
     parser.add_argument("--ornament-threshold", type=float)
     parser.add_argument("--ledger-dir")
     parser.add_argument("--run-id")
+    parser.add_argument("--prototype-artifact", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -111,7 +112,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("stock config has an incompatible upstream LPOSS reference")
     expected = {
         "clip": {"model": "ViT-B-16", "pretrained": "laion2b_s34b_b88k", "patch_size": 16, "image_size": 224},
-        "dino": {"repository": "facebookresearch/dino:7c446df5b9f45747937fb7d72314ebf7b66930c",
+        "dino": {"repository": DINO_REPOSITORY,
                  "model": "dino_vitb16", "source": "github", "weights": None,
                  "architecture": "vit_base", "patch_size": 16, "feature_type": "v"},
         "graph": {"alpha": .95, "gamma": 3.0, "k": 400, "sigma": .01,
@@ -134,7 +135,7 @@ def _sample_id(value: Any, path: Path, line: int | None = None) -> str:
     return sample
 
 
-def discover_inputs(args) -> list[InputSample]:
+def discover_inputs(args, ontology=None) -> list[InputSample]:
     samples = []
     if args.image:
         path = Path(args.image).expanduser().resolve()
@@ -154,6 +155,11 @@ def discover_inputs(args) -> list[InputSample]:
             lines = manifest.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
             raise ValueError(f"cannot read manifest {manifest}: {exc}") from exc
+        manifest_sha256 = file_hash(manifest)
+        facade_splits: dict[str, set[tuple[str, str]]] = {}
+        from .ontology import V2_VERSION
+        from .validate_dataset import V2_DATASET_SCHEMA
+        canonical_ontology = ontology or load_ontology()
         for line_number, line in enumerate(lines, 1):
             if not line.strip():
                 continue
@@ -166,10 +172,40 @@ def discover_inputs(args) -> list[InputSample]:
             path = Path(item["image_path"]).expanduser()
             path = path if path.is_absolute() else manifest.parent / path
             sample = item.get("sample_id", item.get("source_id", item.get("image_id")))
+            split_id = item.get("facade_disjoint_split_id", item.get("split_id"))
+            canonical_fields = {
+                "schema_version": item.get("schema_version"),
+                "ontology_version": item.get("ontology_version"),
+                "facade_id": item.get("facade_id"), "split": item.get("split"),
+                "facade_disjoint_split_id": split_id,
+            }
+            canonical = (canonical_fields["schema_version"] == V2_DATASET_SCHEMA
+                and canonical_fields["ontology_version"] == V2_VERSION
+                and all(isinstance(canonical_fields[k], str) and canonical_fields[k].strip()
+                        for k in ("facade_id", "split", "facade_disjoint_split_id"))
+                and item.get("ontology_hash", canonical_ontology.hash) == canonical_ontology.hash)
+            if canonical_fields["schema_version"] not in (None, V2_DATASET_SCHEMA):
+                raise ValueError(f"{manifest}: line {line_number} has incompatible dataset schema")
+            if canonical_fields["ontology_version"] not in (None, V2_VERSION):
+                raise ValueError(f"{manifest}: line {line_number} has incompatible ontology revision")
+            if item.get("ontology_hash", canonical_ontology.hash) != canonical_ontology.hash:
+                raise ValueError(f"{manifest}: line {line_number} has incompatible ontology hash")
+            if (isinstance(canonical_fields["facade_id"], str)
+                    and canonical_fields["facade_id"].strip()
+                    and isinstance(canonical_fields["split"], str)
+                    and canonical_fields["split"].strip()):
+                facade = canonical_fields["facade_id"].strip()
+                identity = (canonical_fields["split"].strip(),
+                            split_id.strip() if isinstance(split_id, str) else "<unidentified>")
+                facade_splits.setdefault(facade, set()).add(identity)
             samples.append(InputSample(_sample_id(sample, path, line_number), path.resolve(), {
-                "input_kind": "manifest", "dataset_metadata_available": True,
-                "source_manifest_path": str(manifest), "source_manifest_sha256": file_hash(manifest),
+                "input_kind": "manifest", "dataset_metadata_available": canonical,
+                "canonical_dataset_v2": canonical, "canonical_fields": canonical_fields,
+                "source_manifest_path": str(manifest), "source_manifest_sha256": manifest_sha256,
                 "source_manifest_line_number": line_number, "source_record": item}))
+        conflicts = {facade: sorted(values) for facade, values in facade_splits.items() if len(values) > 1}
+        if conflicts:
+            raise ValueError(f"facades assigned inconsistently across split identities: {conflicts}")
     if not samples:
         raise ValueError("input contains no supported images")
     ids = [item.sample_id for item in samples]
@@ -196,6 +232,13 @@ def prepare_output(path: Path, samples: list[InputSample]) -> Path:
         raise ValueError("sample output paths collide or escape the output directory")
     output.mkdir(parents=True, exist_ok=True)
     return output
+
+
+def dataset_snapshot(samples: list[InputSample]) -> dict[str, Any]:
+    """Payload for the existing research ledger; no parallel provenance store."""
+    return {"inputs": [{"sample_id": item.sample_id, "path": str(item.image_path),
+                        "sha256": file_hash(item.image_path), "provenance": item.provenance}
+                       for item in samples]}
 
 
 def load_runtime_classes(ontology, extra_path: str | None, contrast_path: Path):
@@ -288,6 +331,7 @@ def export_sample(output: Path, sample: InputSample, result, prototypes,
                    "semantic_ids": prototypes.semantic_ids,
                    "vocabulary_hash": prototypes.vocabulary_hash,
                    "prompt_settings": dict(prototypes.prompt_settings)}
+        payload["prototypes"] = prototypes.prototypes.cpu()
         _atomic_torch(score_path, payload)
         artifacts.append((score_path, "raw_score_tensors", "application/x-pytorch"))
     return artifacts
@@ -313,9 +357,9 @@ def main(argv=None):
         raise ValueError("mode/config mismatch: use stock_lposs_plus.yaml only with lposs_plus")
     if args.mode == "lposs" and config["pixel_refine"]:
         raise ValueError("lposs requires stock_lposs.yaml with pixel_refine:false")
-    samples = discover_inputs(args)
-    output = prepare_output(Path(args.output_dir), samples)
     ontology = load_ontology(args.vocabulary)
+    samples = discover_inputs(args, ontology)
+    output = prepare_output(Path(args.output_dir), samples)
     projection = OntologyProjection.from_ontology(ontology)
     classes, contrast = load_runtime_classes(
         ontology, args.extra_concepts, Path(args.ornament_contrast).resolve())
@@ -341,8 +385,7 @@ def main(argv=None):
                                      "upstream_commit": UPSTREAM_COMMIT}),
                 ("config.snapshot", {"config": config, "canonical_hash": config_hash,
                                      "path": str(config_path), "sha256": file_hash(config_path)}),
-                ("dataset.snapshot", {"inputs": [{"sample_id": item.sample_id,
-                    "path": str(item.image_path), "sha256": file_hash(item.image_path)} for item in samples]}),
+                ("dataset.snapshot", dataset_snapshot(samples)),
                 ("environment.snapshot", {"device": asdict(device), "torch": torch.__version__,
                                           "cuda": torch.version.cuda,
                                           "graph_dependencies": "pending mode-specific preflight"}),
@@ -376,8 +419,25 @@ def main(argv=None):
         model_fingerprints = {"clip_state_sha256": model_state_sha256(model.clip),
             "dino_state_sha256": (model_state_sha256(model.dino_encoder)
                                   if model.dino_encoder is not None else None)}
-        prototypes, _ = _ledger_stage(ledger, "prototype_construction", lambda: build_prototypes(
-            classes, model.encode_text, device=device.resolved_device, ontology_hash=ontology.hash))
+        def construct_prototypes():
+            if not args.prototype_artifact:
+                return build_prototypes(classes, model.encode_text,
+                    device=device.resolved_device, ontology_hash=ontology.hash)
+            artifact = np.load(args.prototype_artifact, allow_pickle=False)
+            metadata = json.loads(str(artifact["metadata_json"].item()))
+            expected_names = [item.name for item in classes]
+            expected_ids = [item.semantic_id for item in classes]
+            if metadata.get("schema_version") != "lposs-prototypes-v1" or metadata.get("channel_names") != expected_names:
+                raise ValueError("prototype artifact channel ordering is incompatible")
+            if metadata.get("semantic_ids") != expected_ids or metadata.get("ontology_hash") != ontology.hash:
+                raise ValueError("prototype artifact semantic IDs or ontology hash are incompatible")
+            tensor = torch.from_numpy(artifact["prototypes"]).to(device.resolved_device)
+            digest = sha256(artifact["prototypes"].tobytes(order="C")).hexdigest()
+            if digest != metadata.get("prototypes_sha256"):
+                raise ValueError("prototype artifact fingerprint mismatch")
+            return PrototypeSet(tensor, tuple(expected_names), tuple(expected_ids),
+                metadata["vocabulary_specification_hash"], ontology.hash, metadata["prompt_settings"])
+        prototypes, _ = _ledger_stage(ledger, "prototype_construction", construct_prototypes)
         graph = dict(config["graph"])
         graph["vit_patch_size"] = config["dino"]["patch_size"]
         engine = StockOVSEngine(model, UpstreamGraphPropagator() if args.mode != "maskclip_raw" else None,
@@ -440,6 +500,7 @@ def main(argv=None):
             "device": asdict(device), "dependencies": dependencies,
             "installed_versions": installed_versions(), "graph_parameters": graph,
             "ontology_hash": ontology.hash, "projection": projection.as_dict(),
+            "projection_hash": canonical_hash(projection.as_dict()),
             "vocabulary_hash": prototypes.vocabulary_hash, "channel_names": list(prototypes.channel_names),
             "semantic_ids": list(prototypes.semantic_ids), "prompt_settings": dict(prototypes.prompt_settings),
             "runtime_vocabulary": [{"name": item.name, "semantic_id": item.semantic_id,

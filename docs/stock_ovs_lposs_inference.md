@@ -18,7 +18,7 @@ Only these dedicated configurations are stock references:
 
 Both pin implementation ID `stock-maskclip-lposs-p1a-v1`, upstream repository/commit,
 OpenCLIP `ViT-B-16` with `laion2b_s34b_b88k`, and the original
-`facebookresearch/dino:7c446df5b9f45747937fb7d72314ebf7b66930c` `dino_vitb16` Torch Hub entrypoint. Every manifest records these
+`facebookresearch/dino:7c446df5b9f45747937fb0d72314eb9f7b66930a` `dino_vitb16` Torch Hub entrypoint. Every manifest records these
 identifiers, resolved graph values, available local weight hashes, device/dependency facts,
 ontology/prototype metadata, and artifact hashes.
 
@@ -101,40 +101,74 @@ artifacts with `ArtifactDescriptor`, and ends in `run.completed` or sanitized `r
 
 ## Verification ladder and exact commands
 
-These four outcomes are deliberately distinct. A CPU contract pass validates routing, exports,
-configuration rejection, provenance, and memory guards; it is **not** model execution or numerical
-LPOSS parity.
+The following outcomes are deliberately distinct. First create a deterministic 320×320 RGB input;
+this yields exactly 400 ViT-B/16 patch nodes, so the upstream stock `k=400` is not reduced:
 
-1. **Structural CPU contract test** (no downloads or GPU):
+```bash
+mkdir -p runs/lposs-fixture
+python - <<'PYFIXTURE'
+from pathlib import Path
+import numpy as np
+from PIL import Image
+y, x = np.indices((320, 320))
+rgb = np.stack(((x * 13 + y * 3) % 256, (x * 5 + y * 11) % 256,
+                (x * 7 + y * 17) % 256), axis=-1).astype(np.uint8)
+Image.fromarray(rgb, "RGB").save(Path("runs/lposs-fixture/deterministic-320.png"))
+PYFIXTURE
+```
+
+1. **CPU unit and contract tests** (no model download and not numerical parity):
 
    ```bash
-   pytest -q ovs_heritage/tests/test_stock_lposs.py
+   pytest -q ovs_heritage/tests
    ```
 
-2. **Smallest real-GPU model smoke test** (successful execution, not upstream parity):
+2. **Local CPU configuration/preflight smoke** (no model execution):
 
    ```bash
-   python -m ovs_heritage.infer_ovs --image fixtures/lposs/small.png \
-     --model-config configs/stock_lposs.yaml --mode maskclip_raw --device cuda:0 \
+   python - <<'PYCONTRACT'
+from pathlib import Path
+from ovs_heritage.infer_ovs import load_config
+from ovs_heritage.stock_lposs import DeviceInfo, patch_graph_preflight, pixel_graph_preflight
+cfg = load_config(Path("configs/stock_lposs_plus.yaml"))
+p = {**cfg["graph"], "available_gpu_bytes": 16 * 1024**3, "gpu_memory_reserve_bytes": 1024**3}
+d = DeviceInfo("cuda:0", "cpu", 0, "contract-only")
+print(patch_graph_preflight(400, 14, 4, d, p))
+print(pixel_graph_preflight(320, 320, 14, 4, d, p))
+PYCONTRACT
+   ```
+
+3. **Real CUDA model execution** (successful local execution, not upstream parity):
+
+   ```bash
+   python -m ovs_heritage.infer_ovs --image runs/lposs-fixture/deterministic-320.png \
+     --model-config configs/stock_lposs.yaml --mode lposs --device cuda:0 \
      --vocabulary ovs_heritage/configs/heritage_vocab.yaml --ornament-threshold 0.5 \
      --output-dir runs/lposs-smoke --save-scores
    ```
 
-3. **Pinned official-reference generation and numerical comparison**:
+4. **Pinned official-reference generation and all-mode numerical comparison**:
 
    ```bash
+   git clone https://github.com/vladan-stojnic/LPOSS third_party/LPOSS
    git -C third_party/LPOSS checkout e489a7445528922ddfe4e39631ef2fe34827c873
+   test "$(git -C third_party/LPOSS status --porcelain)" = ""
+   git init --bare runs/dino-revision-check.git
+   git -C runs/dino-revision-check.git fetch --depth=1 \
+     https://github.com/facebookresearch/dino.git 7c446df5b9f45747937fb0d72314eb9f7b66930a
    python tools/check_stock_lposs_gpu.py --upstream-root third_party/LPOSS \
-     --image fixtures/lposs/small.png --device cuda:0 --work-dir runs/lposs-parity \
-     --atol 1e-5 --rtol 1e-4
+     --image runs/lposs-fixture/deterministic-320.png --device cuda:0 \
+     --work-dir runs/lposs-parity --atol 1e-5 --rtol 1e-4
    ```
 
-   The checker rejects dirty/wrong upstream checkouts and never accepts an opaque `.pt` input.
-   At the reviewed official commit there is no stable arbitrary-vocabulary tensor-export API; the
-   bundled adapter therefore reports that exact blocker rather than modifying upstream semantics or
-   claiming parity. A `parity_manifest.json` is written only after a real comparison succeeds.
+   The checker launches the unmodified official checkout in an isolated subprocess, injects the
+   exact same versioned prototype tensor into both implementations, validates checkout/tree/model/
+   input/configuration/prototype provenance, and compares raw, LPOSS, and LPOSS+ stages. It never
+   accepts an externally supplied official score file. `parity_manifest.json` is created with
+   `real_gpu_parity=true` only after every required real-CUDA comparison succeeds; any missing or
+   mismatched stage exits non-zero.
 
-4. **Stock graph inference**:
+5. **Stock dataset-v2 `lposs` inference**:
 
    ```bash
    python -m ovs_heritage.infer_ovs --manifest dataset-v2/test.jsonl \
@@ -143,7 +177,7 @@ LPOSS parity.
      --output-dir runs/dataset-v2-lposs --save-scores
    ```
 
-5. **Stock LPOSS+ inference**:
+6. **Stock dataset-v2 `lposs_plus` inference**:
 
    ```bash
    python -m ovs_heritage.infer_ovs --manifest dataset-v2/test.jsonl \
@@ -152,13 +186,11 @@ LPOSS parity.
      --output-dir runs/dataset-v2-lposs-plus --save-scores
    ```
 
-6. **Later scientific dataset-v2 benchmark**: after successful model execution and real numerical
-   parity, run the project evaluation command against the sealed facade-disjoint dataset-v2 split:
+7. **Later scientific dataset-v2 benchmark**: only after successful model execution and real
+   numerical parity, use the project evaluation tooling against the sealed facade-disjoint split.
+   This PR does not run or claim that benchmark.
 
-   ```bash
-   python tools/evaluate_segmentation_tiled.py --help
-   ```
-
-   This PR does not run or claim that benchmark. Direct `--image`/`--image-dir` manifests explicitly
-   report unavailable dataset/split metadata; JSONL inputs retain every source-record field plus the
-   source manifest path and hash.
+Direct `--image`/`--image-dir` records explicitly report unavailable dataset/split metadata. Generic
+JSONL is supported but marked non-canonical; canonical dataset-v2 status requires a validated schema,
+ontology, facade, split, and facade-disjoint split identity. The original JSON mapping and its source
+manifest path, line, and single computed manifest hash are retained in the existing ledger.
