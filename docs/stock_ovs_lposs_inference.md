@@ -18,7 +18,7 @@ Only these dedicated configurations are stock references:
 
 Both pin implementation ID `stock-maskclip-lposs-p1a-v1`, upstream repository/commit,
 OpenCLIP `ViT-B-16` with `laion2b_s34b_b88k`, and the original
-`facebookresearch/dino:main` `dino_vitb16` Torch Hub entrypoint. Every manifest records these
+`facebookresearch/dino:7c446df5b9f45747937fb0d72314eb9f7b66930a` `dino_vitb16` Torch Hub entrypoint. Every manifest records these
 identifiers, resolved graph values, available local weight hashes, device/dependency facts,
 ontology/prototype metadata, and artifact hashes.
 
@@ -99,20 +99,108 @@ read back, validated, and hashed. Existing scientific runs are never overwritten
 The ledger begins before model loading, records snapshots and stage transitions, registers verified
 artifacts with `ArtifactDescriptor`, and ends in `run.completed` or sanitized `run.failed`.
 
-## Verification status and opt-in parity
+## Verification ladder and exact commands
 
-CPU tests use deterministic fake features/graphs to verify contracts and are **not numerical
-upstream parity evidence**. A real parity run was not executed in the PR environment. Generate
-reference tensors from the pinned official checkout using the same image, OpenCLIP/DINO caches,
-vocabulary, and graph settings, then run:
+The following outcomes are deliberately distinct. First create a deterministic 320×320 RGB input;
+this yields exactly 400 ViT-B/16 patch nodes, so the upstream stock `k=400` is not reduced:
 
 ```bash
-python tools/check_stock_lposs_gpu.py --image /data/fixed-small.png \
-  --upstream-root /src/LPOSS-e489a7445528922ddfe4e39631ef2fe34827c873 \
-  --upstream-scores /data/pinned-upstream-scores.pt --device cuda:0 \
-  --work-dir outputs/parity-e489a744
+mkdir -p runs/lposs-fixture
+python - <<'PYFIXTURE'
+from pathlib import Path
+import numpy as np
+from PIL import Image
+y, x = np.indices((320, 320))
+rgb = np.stack(((x * 13 + y * 3) % 256, (x * 5 + y * 11) % 256,
+                (x * 7 + y * 17) % 256), axis=-1).astype(np.uint8)
+Image.fromarray(rgb, "RGB").save(Path("runs/lposs-fixture/deterministic-320.png"))
+PYFIXTURE
 ```
 
-The opt-in check verifies the checkout commit, runs all three modes, verifies stages, finiteness,
-device/grid/output IDs, and compares raw seeds and propagated scores with explicit tolerances.
-Successful execution is implementation evidence only, not a scientific-quality claim.
+1. **CPU unit and contract tests** (no model download and not numerical parity):
+
+   ```bash
+   pytest -q ovs_heritage/tests
+   ```
+
+2. **Local CPU configuration/preflight smoke** (no model execution):
+
+   ```bash
+   python - <<'PYCONTRACT'
+from pathlib import Path
+from ovs_heritage.infer_ovs import load_config
+from ovs_heritage.stock_lposs import DeviceInfo, patch_graph_preflight, pixel_graph_preflight
+cfg = load_config(Path("configs/stock_lposs_plus.yaml"))
+p = {**cfg["graph"], "available_gpu_bytes": 16 * 1024**3, "gpu_memory_reserve_bytes": 1024**3}
+d = DeviceInfo("cuda:0", "cpu", 0, "contract-only")
+print(patch_graph_preflight(400, 14, 4, d, p))
+print(pixel_graph_preflight(320, 320, 14, 4, d, p))
+PYCONTRACT
+   ```
+
+3. **Real CUDA model execution** (successful local execution, not upstream parity):
+
+   ```bash
+   python -m ovs_heritage.infer_ovs --image runs/lposs-fixture/deterministic-320.png \
+     --model-config configs/stock_lposs.yaml --mode lposs --device cuda:0 \
+     --vocabulary ovs_heritage/configs/heritage_vocab.yaml --ornament-threshold 0.5 \
+     --output-dir runs/lposs-smoke --save-scores
+   ```
+
+4. **Pinned official-reference generation and all-mode numerical comparison**:
+
+   ```bash
+   git clone https://github.com/vladan-stojnic/LPOSS third_party/LPOSS
+   git -C third_party/LPOSS checkout e489a7445528922ddfe4e39631ef2fe34827c873
+   test "$(git -C third_party/LPOSS status --porcelain)" = ""
+   git init --bare runs/dino-revision-check.git
+   git -C runs/dino-revision-check.git fetch --depth=1 \
+     https://github.com/facebookresearch/dino.git 7c446df5b9f45747937fb0d72314eb9f7b66930a
+   python tools/check_stock_lposs_gpu.py --upstream-root third_party/LPOSS \
+     --image runs/lposs-fixture/deterministic-320.png --device cuda:0 \
+     --work-dir runs/lposs-parity --atol 1e-5 --rtol 1e-4
+   ```
+
+   The checker launches the unmodified official checkout in an isolated subprocess, injects the
+   exact same versioned prototype tensor into both implementations, validates checkout/tree/model/
+   input/configuration/prototype provenance, compares normalized dense CLIP and DINO features, and
+   compares raw, LPOSS, and LPOSS+ score stages. It never
+   accepts an externally supplied official score file. `parity_manifest.json` is created with
+   `real_gpu_parity=true` only after every required real-CUDA comparison succeeds; any missing or
+   mismatched stage exits non-zero.
+
+   The harness being implemented and CPU-contract-tested is not evidence that parity passed. Until
+   this command completes on a compatible CUDA/CuPy/FAISS-GPU environment and writes the validated
+   manifest, real upstream/local numerical parity remains pending.
+
+5. **Stock dataset-v2 `lposs` inference**:
+
+   ```bash
+   python -m ovs_heritage.infer_ovs --manifest dataset-v2/test.jsonl \
+     --model-config configs/stock_lposs.yaml --mode lposs --device cuda:0 \
+     --vocabulary ovs_heritage/configs/heritage_vocab.yaml --ornament-threshold 0.5 \
+     --output-dir runs/dataset-v2-lposs --save-scores
+   ```
+
+6. **Stock dataset-v2 `lposs_plus` inference**:
+
+   ```bash
+   python -m ovs_heritage.infer_ovs --manifest dataset-v2/test.jsonl \
+     --model-config configs/stock_lposs_plus.yaml --mode lposs_plus --device cuda:0 \
+     --vocabulary ovs_heritage/configs/heritage_vocab.yaml --ornament-threshold 0.5 \
+     --output-dir runs/dataset-v2-lposs-plus --save-scores
+   ```
+
+7. **Later scientific dataset-v2 benchmark**: only after successful model execution and real
+   numerical parity, use the project evaluation tooling against the sealed facade-disjoint split.
+   This PR does not run or claim that benchmark.
+
+Direct `--image`/`--image-dir` records explicitly report unavailable dataset/split metadata. Generic
+JSONL is supported but marked non-canonical; canonical dataset-v2 status requires a validated schema,
+ontology, facade, split, image path, and the two canonical mask paths emitted by the converter.
+Declared dataset-v2 JSONL is checked once, as a complete manifest, by the converter's authoritative
+`validate_manifest` implementation; missing artifacts, invalid mask domains, invalid splits, and
+image/mask grid mismatches fail closed rather than producing canonical provenance.
+`facade_disjoint_split_verified` remains false for a single inference manifest because cross-split
+validation evidence is unavailable. The original JSON mapping and its source manifest path, line, and
+single computed manifest hash are retained in the existing ledger.

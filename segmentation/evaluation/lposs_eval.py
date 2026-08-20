@@ -1,21 +1,21 @@
+import importlib
+import importlib.util
 from itertools import product
 import logging
-import math
-import os
-import time
 from typing import List
 
-import importlib
-
+import faiss
+import faiss.contrib.torch_utils
+from kornia.color import rgb_to_lab
+from mmcv import ConfigDict
+from mmcv.parallel import DataContainer
+from mmseg.models import EncoderDecoder
+from mmseg.ops import resize
 import torch
 from torch import Tensor
 import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
-from mmcv.parallel import DataContainer
-from mmcv import ConfigDict
-from mmseg.ops import resize
-from mmseg.models import EncoderDecoder
 
 _cupy_spec = importlib.util.find_spec("cupyx")
 if _cupy_spec is not None:
@@ -30,14 +30,6 @@ else:
         "fall back to raw predictions. Install cupy-cuda to enable full LPOSS "
         "post-processing."
     )
-
-import faiss
-import numpy as np
-import faiss.contrib.torch_utils
-from PIL import Image
-import numpy as np
-from kornia.color import rgb_to_lab
-
 
 def _require_cupy():
     if cp is None:

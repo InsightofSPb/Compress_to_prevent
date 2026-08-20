@@ -8,6 +8,25 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+DINO_REPOSITORY_COMMIT = "7c446df5b9f45747937fb0d72314eb9f7b66930a"
+DINO_REPOSITORY = f"facebookresearch/dino:{DINO_REPOSITORY_COMMIT}"
+
+
+def validate_pinned_hub_repository(repository: str) -> None:
+    """Reject moving or malformed Torch Hub references before any download."""
+    if repository != DINO_REPOSITORY:
+        raise ValueError(f"DINO repository must be immutable {DINO_REPOSITORY}, got {repository!r}")
+
+
+def compatible_torch_load(path, *, map_location="cpu"):
+    """Load tensor-only artifacts on both torch 1.12 and newer releases."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        return torch.load(path, map_location=map_location)
+
 
 class StockFeatureModel(nn.Module):
     """Load image/text CLIP once; runtime classes never enter module state."""
@@ -34,6 +53,9 @@ class StockFeatureModel(nn.Module):
         self.dino_patch_size = None
         self.dino_feature_type = None
         self._dino_hook = {}
+        self.parity_capture_enabled = False
+        self._parity_clip_dense = None
+        self._parity_dino_dense = None
 
     @torch.no_grad()
     def encode_text(self, prompts: list[str]) -> torch.Tensor:
@@ -61,12 +83,16 @@ class StockFeatureModel(nn.Module):
             value = visual.ln_post(value.permute(1, 0, 2)).permute(1, 0, 2)[:, 1:]
             value = value.reshape(b, *grid, -1).permute(0, 3, 1, 2).contiguous()
             projection = visual.proj
-            return F.conv2d(value, projection.t()[:, :, None, None])
+            output = F.conv2d(value, projection.t()[:, :, None, None])
+            if self.parity_capture_enabled:
+                self._parity_clip_dense = output.detach()
+            return output
         finally:
             visual.positional_embedding.data = saved
 
     def configure_dino(self, *, repository: str, model: str, patch_size: int,
                        feature_type: str, source: str = "github", weights: str | None = None):
+        validate_pinned_hub_repository(repository)
         kwargs = {"source": source}
         if weights is not None:
             kwargs["weights"] = weights
@@ -96,7 +122,22 @@ class StockFeatureModel(nn.Module):
         qkv = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, heads, -1).permute(2, 0, 3, 1, 4)
         selected = {"q": 0, "k": 1, "v": 2}[self.dino_feature_type]
         features = qkv[selected][:, :, 1:, :].permute(0, 2, 1, 3).flatten(-2)
-        return F.normalize(features, dim=-1).reshape(batch.shape[0], h, w, -1).permute(0, 3, 1, 2)
+        output = F.normalize(features, dim=-1).reshape(batch.shape[0], h, w, -1).permute(0, 3, 1, 2)
+        if self.parity_capture_enabled:
+            self._parity_dino_dense = output.detach()
+        return output
+
+    def parity_features(self) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+        """Return normalized aligned patch nodes only when explicitly enabled."""
+        if not self.parity_capture_enabled or self._parity_clip_dense is None or self._parity_dino_dense is None:
+            raise RuntimeError("parity feature capture did not execute both CLIP and DINO")
+        dino = self._parity_dino_dense
+        clip = self._parity_clip_dense
+        if clip.shape[-2:] != dino.shape[-2:]:
+            clip = F.interpolate(clip, dino.shape[-2:], mode="bilinear", align_corners=False)
+        clip_nodes = F.normalize(clip.permute(0, 2, 3, 1).reshape(-1, clip.shape[1]), dim=-1)
+        dino_nodes = F.normalize(dino.permute(0, 2, 3, 1).reshape(-1, dino.shape[1]), dim=-1)
+        return clip_nodes, dino_nodes, tuple(dino.shape[-2:])
 
     def _resize_position(self, grid):
         position = self._original_position.to(next(self.clip.parameters()).device)
@@ -124,6 +165,18 @@ def module_state_fingerprint(module: nn.Module) -> tuple[tuple[str, tuple[int, .
         digest = sha256(raw).hexdigest()
         result.append((key, tuple(value.shape), digest))
     return tuple(result)
+
+
+def model_state_sha256(module: nn.Module) -> str:
+    """Hash state deterministically, moving only one tensor at a time to the CPU."""
+    digest = sha256()
+    for key, value in sorted(module.state_dict().items()):
+        cpu = value.detach().cpu().contiguous()
+        digest.update(key.encode())
+        digest.update(str(tuple(cpu.shape)).encode())
+        digest.update(str(cpu.dtype).encode())
+        digest.update(cpu.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def optional_weight_hash(identifier: str | None) -> str | None:

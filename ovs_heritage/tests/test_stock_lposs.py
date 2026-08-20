@@ -14,6 +14,7 @@ from torch import nn
 
 from ovs_heritage.infer_ovs import (
     InputSample,
+    dataset_snapshot,
     discover_inputs,
     export_sample,
     load_config,
@@ -22,11 +23,17 @@ from ovs_heritage.infer_ovs import (
     _ledger_stage,
 )
 from ovs_heritage.projection import MAIN_SEMANTIC_IDS
-from ovs_heritage.stock_features import StockFeatureModel, module_state_fingerprint
+from ovs_heritage.ontology import load_ontology
+from ovs_heritage.stock_features import (
+    DINO_REPOSITORY, StockFeatureModel, module_state_fingerprint,
+    validate_pinned_hub_repository,
+)
 from ovs_heritage.stock_lposs import (
     DeviceInfo,
     StockOVSEngine,
     graph_preflight,
+    patch_graph_preflight,
+    pixel_graph_preflight,
     resolve_device,
 )
 from ovs_heritage.vocabulary import PrototypeSet
@@ -79,7 +86,8 @@ def engine(mode):
     instance = StockOVSEngine(configured and model or model, configured,
         device=DeviceInfo("cpu", "cpu", None, None) if mode == "maskclip_raw"
         else DeviceInfo("cuda:0", "cpu", 0, "fake"),
-        graph_parameters={"k": 99})
+        graph_parameters={"k": 99, "r": 13, "available_gpu_bytes": 10**12,
+                          "gpu_memory_reserve_bytes": 0})
     return instance, model, propagation
 
 
@@ -184,7 +192,90 @@ def test_dataset_v2_jsonl_resolves_relative_images(tmp_path):
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('\n{"sample_id":"sample-a","image_path":"images/a.png"}\n')
     result = discover_inputs(_args(manifest=str(manifest)))
-    assert result == [InputSample("sample-a", (image_dir / "a.png").resolve())]
+    assert result[0].sample_id == "sample-a"
+    assert result[0].image_path == (image_dir / "a.png").resolve()
+    assert result[0].provenance["source_record"]["image_path"] == "images/a.png"
+    assert result[0].provenance["source_manifest_sha256"] == sha256(manifest.read_bytes()).hexdigest()
+    assert result[0].provenance["dataset_metadata_available"] is False
+
+
+def test_source_manifest_hash_is_computed_once(tmp_path, monkeypatch):
+    import ovs_heritage.infer_ovs as inference
+    for name in ("a.png", "b.png"):
+        Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(tmp_path / name)
+    manifest = tmp_path / "generic.jsonl"
+    manifest.write_text("\n".join(json.dumps({"sample_id": name[0], "image_path": name})
+                                  for name in ("a.png", "b.png")))
+    calls = []
+    original = inference.file_hash
+    monkeypatch.setattr(inference, "file_hash", lambda path: calls.append(Path(path)) or original(path))
+    samples = discover_inputs(_args(manifest=str(manifest)))
+    assert calls == [manifest.resolve()]
+    assert {sample.provenance["source_manifest_sha256"] for sample in samples} == {
+        sha256(manifest.read_bytes()).hexdigest()}
+    snapshot = dataset_snapshot(samples)
+    assert snapshot["inputs"][0]["provenance"]["source_record"]["image_path"] == "a.png"
+
+
+def _converter_manifest_fixture(tmp_path):
+    ontology = load_ontology()
+    Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8), "RGB").save(tmp_path / "a.png")
+    Image.fromarray(np.array([[0, 1], [2, 11]], dtype=np.uint8)).save(tmp_path / "main.png")
+    Image.fromarray(np.array([[0, 1], [1, 0]], dtype=np.uint8)).save(tmp_path / "ornament.png")
+    row = {"sample_id": "a", "image_id": 1, "source_coco_file_name": "a.png",
+        "canonical_file_name": "a.png", "resolved_image_path": str((tmp_path / "a.png").resolve()),
+        "image_path": "a.png", "main_mask_path": "main.png", "ornament_mask_path": "ornament.png",
+        "facade_id": "facade-a", "building_id": "building-a", "split": "test",
+        "schema_version": "heritage_two_map_v2", "ontology_version": ontology.version,
+        "source_coco_sha256": "a" * 64, "source_annotation_ids": [1], "width": 2, "height": 2}
+    manifest = tmp_path / "canonical.jsonl"
+    manifest.write_text(json.dumps(row) + "\n")
+    return manifest, row
+
+
+def test_authoritatively_valid_converter_manifest_is_canonical(tmp_path, monkeypatch):
+    import ovs_heritage.coco_converter as converter
+    manifest, _ = _converter_manifest_fixture(tmp_path)
+    calls = []
+    original = converter.validate_manifest
+    monkeypatch.setattr(converter, "validate_manifest",
+                        lambda path: calls.append(path) or original(path))
+    sample = discover_inputs(_args(manifest=str(manifest)))[0]
+    assert calls == [manifest.resolve()]
+    assert sample.provenance["dataset_metadata_available"] is True
+    assert sample.provenance["canonical_dataset_v2"] is True
+    assert sample.provenance["facade_disjoint_split_verified"] is False
+    assert sample.provenance["canonical_fields"]["facade_id"] == "facade-a"
+
+
+@pytest.mark.parametrize("defect,expected", [
+    ("missing_mask", "unreadable artifact"),
+    ("invalid_split", "invalid split"),
+    ("invalid_domain", "invalid main-mask value domain"),
+    ("grid_mismatch", "image/mask grid or dtype mismatch"),
+])
+def test_declared_canonical_manifest_defects_fail_closed(tmp_path, defect, expected):
+    manifest, row = _converter_manifest_fixture(tmp_path)
+    if defect == "missing_mask":
+        (tmp_path / "main.png").unlink()
+    elif defect == "invalid_split":
+        row["split"] = "holdout"
+        manifest.write_text(json.dumps(row) + "\n")
+    elif defect == "invalid_domain":
+        Image.fromarray(np.full((2, 2), 8, dtype=np.uint8)).save(tmp_path / "main.png")
+    else:
+        Image.fromarray(np.zeros((1, 2), dtype=np.uint8)).save(tmp_path / "main.png")
+    with pytest.raises(ValueError, match=f"canonical dataset-v2 manifest validation failed:.*{expected}"):
+        discover_inputs(_args(manifest=str(manifest)))
+
+
+def test_partial_dataset_identity_is_explicitly_noncanonical(tmp_path):
+    Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(tmp_path / "a.png")
+    manifest = tmp_path / "partial.jsonl"
+    manifest.write_text(json.dumps({"image_path": "a.png", "facade_id": "f"}))
+    sample = discover_inputs(_args(manifest=str(manifest)))[0]
+    assert sample.provenance["dataset_metadata_available"] is False
+    assert sample.provenance["canonical_dataset_v2"] is False
 
 
 @pytest.mark.parametrize("name,pixel", [("stock_lposs.yaml", False),
@@ -195,6 +286,7 @@ def test_dedicated_stock_configs_pin_upstream_dino(name, pixel):
     assert config["dino"]["model"] == "dino_vitb16"
     assert config["dino"]["patch_size"] == 16
     assert config["dino"]["feature_type"] == "v"
+    assert config["dino"]["repository"] == DINO_REPOSITORY
     assert config["pixel_refine"] is pixel
 
 
@@ -225,6 +317,179 @@ def test_output_is_immutable_and_ornament_png_is_binary(tmp_path):
     assert set(np.unique(ornament)) <= {0, 1}
     with pytest.raises(FileExistsError):
         prepare_output(output, [sample])
+
+
+def test_scores_are_saved_and_reloaded_with_112_compatible_loader(tmp_path, monkeypatch):
+    from ovs_heritage.stock_features import compatible_torch_load
+    sample = InputSample("sample", tmp_path / "input.png")
+    output = prepare_output(tmp_path / "out", [sample])
+    instance, _, _ = engine("maskclip_raw")
+    result = instance.run(torch.rand(1, 3, 2, 3), prototype_set(), mode="maskclip_raw",
+        ornament_negative_index=12, ornament_threshold=0.5)
+    original = torch.load
+    def old_load(path, **kwargs):
+        if "weights_only" in kwargs:
+            raise TypeError("load() got an unexpected keyword argument 'weights_only'")
+        return original(path, **kwargs)
+    monkeypatch.setattr(torch, "load", old_load)
+    export_sample(output, sample, result, prototype_set(), True, False)
+    payload = compatible_torch_load(output / "sample" / "scores.pt")
+    assert torch.equal(payload["seed_scores"], result.seed_scores.cpu())
+
+
+def test_graph_preflights_safe_and_reject_before_propagation(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: __import__("contextlib").nullcontext())
+    device = DeviceInfo("cuda:0", "cpu", 0, "fake")
+    safe = {"r": 13, "available_gpu_bytes": 10**9, "gpu_memory_reserve_bytes": 0,
+            "max_graph_nodes": 100, "max_dense_graph_bytes": 10**9,
+            "max_pixel_nodes": 100, "max_pixel_edges": 10000, "max_pixel_graph_bytes": 10**9}
+    assert patch_graph_preflight(4, 2, 4, device, safe) > 0
+    assert pixel_graph_preflight(2, 2, 2, 4, device, safe)[0] == 4 * 168
+    instance, _, propagation = engine("lposs")
+    instance.parameters["max_graph_nodes"] = 1
+    with pytest.raises(RuntimeError, match="patch graph preflight rejected"):
+        instance.run(torch.rand(1, 3, 5, 7), prototype_set(), mode="lposs")
+    assert propagation.patch_calls == 0
+    instance, _, propagation = engine("lposs_plus")
+    instance.parameters["max_pixel_edges"] = 1
+    with pytest.raises(RuntimeError, match="pixel graph preflight rejected"):
+        instance.run(torch.rand(1, 3, 5, 7), prototype_set(), mode="lposs_plus")
+    assert propagation.pixel_calls == 0
+
+
+def test_official_adapter_command_is_isolated_and_explicit(tmp_path):
+    from tools.check_stock_lposs_gpu import official_adapter_command
+    command = official_adapter_command(python="python", adapter=tmp_path / "adapter.py",
+        request=tmp_path / "request.json", output=tmp_path / "official")
+    assert command == ["python", str(tmp_path / "adapter.py"), "--request",
+                       str(tmp_path / "request.json"), "--output-dir", str(tmp_path / "official")]
+
+
+def _official_artifact(tmp_path):
+    from tools.check_stock_lposs_gpu import canonical_hash, file_hash
+    arrays = {f"{mode}.{stage}": np.ones((1, 2, 3, 4), dtype=np.float32)
+              for mode in ("maskclip_raw", "lposs", "lposs_plus")
+              for stage in ("seed_scores", "propagated_scores")}
+    arrays.update(clip_features=np.ones((4, 2), np.float32),
+                  dino_features=np.ones((4, 2), np.float32))
+    np.savez(tmp_path / "stages.npz", **arrays)
+    configurations = {"maskclip_raw": {"pixel_refine": False},
+                      "lposs": {"pixel_refine": False}, "lposs_plus": {"pixel_refine": True}}
+    expected = {"input_sha256": "input", "prototype_artifact_sha256": "file-proto",
+        "prototypes_sha256": "proto", "configurations": configurations,
+        "configuration_sha256": canonical_hash(configurations),
+        "channel_names": ["a", "b"], "semantic_ids": [1, None], "ontology_hash": "ontology",
+        "model_hashes": {"clip_state_sha256": "clip", "dino_state_sha256": "dino"},
+        "device": "cuda:0", "seed": 0, "upstream": {
+            "repository": "https://github.com/vladan-stojnic/LPOSS",
+            "commit": "e489a7445528922ddfe4e39631ef2fe34827c873", "tree": "tree"}}
+    manifest = {**expected, "schema_version": "official-lposs-parity-artifact-v1",
+        "producer": "official-upstream", "upstream": expected["upstream"],
+        "dino_hub_loads": [{"requested_repository": "facebookresearch/dino:main",
+            "resolved_repository": DINO_REPOSITORY, "model": "dino_vitb16",
+            "args": [], "kwargs": {}}],
+        "patch_grid": [2, 2], "image_grid": [3, 4],
+        "stages": {"maskclip_raw": ["seed_scores"],
+            "lposs": ["seed_scores", "propagated_scores"],
+            "lposs_plus": ["seed_scores", "propagated_scores", "pixel_refinement"]},
+        "stage_artifact": "stages.npz", "stage_artifact_sha256": file_hash(tmp_path / "stages.npz")}
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    return path, expected, manifest
+
+
+def test_official_artifact_validation_and_rejections(tmp_path):
+    from tools.check_stock_lposs_gpu import validate_official_artifact
+    path, expected, manifest = _official_artifact(tmp_path)
+    validated, arrays = validate_official_artifact(path, expected=expected)
+    assert validated["upstream"]["commit"] == "e489a7445528922ddfe4e39631ef2fe34827c873"
+    arrays.close()
+    for key, value in (("input_sha256", "wrong"), ("prototypes_sha256", "wrong")):
+        changed = {**manifest, key: value}
+        path.write_text(json.dumps(changed))
+        with pytest.raises(ValueError, match="provenance mismatch"):
+            validate_official_artifact(path, expected=expected)
+    changed = {**manifest, "stages": {**manifest["stages"], "lposs_plus": ["seed_scores"]}}
+    path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_official_artifact(path, expected=expected)
+    changed = {**manifest, "upstream": {**manifest["upstream"], "commit": "0" * 40}}
+    path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="wrong repository"):
+        validate_official_artifact(path, expected=expected)
+    changed = {**manifest, "channel_names": ["b", "a"]}
+    path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="channel_names"):
+        validate_official_artifact(path, expected=expected)
+
+
+def test_correct_dino_commit_is_passed_to_torch_hub(monkeypatch):
+    validate_pinned_hub_repository(DINO_REPOSITORY)
+    with pytest.raises(ValueError, match="immutable"):
+        validate_pinned_hub_repository("facebookresearch/dino:main")
+    calls = []
+    attention = types.SimpleNamespace(qkv=nn.Linear(2, 6), num_heads=1)
+    encoder = nn.Module()
+    encoder.blocks = [types.SimpleNamespace(attn=attention)]
+    monkeypatch.setattr(torch.hub, "load", lambda repository, model, **kwargs:
+                        calls.append((repository, model, kwargs)) or encoder)
+    model = object.__new__(StockFeatureModel)
+    nn.Module.__init__(model)
+    model._dino_hook = {}
+    StockFeatureModel.configure_dino(model, repository=DINO_REPOSITORY, model="dino_vitb16",
+        patch_size=16, feature_type="v")
+    assert calls == [(DINO_REPOSITORY, "dino_vitb16", {"source": "github"})]
+
+
+def test_official_constructor_boundary_and_scoped_dino_redirect(monkeypatch):
+    from tools.run_official_lposs_parity import construct_official_lposs
+    constructed = []
+    downloads = []
+
+    class FakeOfficialLPOSS:
+        def __init__(self, clip_backbone, class_names, vit_arch="vit_base",
+                     vit_patch_size=16, enc_type_feats="k"):
+            constructed.append((clip_backbone, class_names, vit_arch,
+                                vit_patch_size, enc_type_feats))
+            self.encoder = torch.hub.load("facebookresearch/dino:main", "dino_vitb16")
+
+    def original(repository, model, *args, **kwargs):
+        downloads.append((repository, model, args, kwargs))
+        return object()
+    monkeypatch.setattr(torch.hub, "load", original)
+    config = {"dino": {"architecture": "vit_base", "patch_size": 16, "feature_type": "v"}}
+    model, intercepted = construct_official_lposs(
+        FakeOfficialLPOSS, torch, class_names=["wall", "window"], config=config)
+    assert isinstance(model, FakeOfficialLPOSS)
+    assert constructed == [("maskclip", ["wall", "window"], "vit_base", 16, "v")]
+    assert downloads == [(DINO_REPOSITORY, "dino_vitb16", (), {})]
+    assert intercepted[0]["requested_repository"] == "facebookresearch/dino:main"
+    assert intercepted[0]["resolved_repository"] == DINO_REPOSITORY
+    assert torch.hub.load is original
+
+
+@pytest.mark.parametrize("repository,model", [
+    ("facebookresearch/dino:other", "dino_vitb16"),
+    ("facebookresearch/dino:main", "dino_vits16"),
+])
+def test_official_dino_redirect_rejects_unexpected_calls_and_restores(monkeypatch, repository, model):
+    from tools.run_official_lposs_parity import pinned_dino_hub_load
+    def original(*_args, **_kwargs):
+        return object()
+    monkeypatch.setattr(torch.hub, "load", original)
+    with pytest.raises(RuntimeError, match="unexpected official"):
+        with pinned_dino_hub_load(torch, []):
+            torch.hub.load(repository, model)
+    assert torch.hub.load is original
+
+
+def test_stock_config_rejects_changed_scientific_parameter(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    config = (root / "configs/stock_lposs.yaml").read_text().replace("alpha: 0.95", "alpha: 0.90")
+    path = tmp_path / "changed.yaml"
+    path.write_text(config)
+    with pytest.raises(ValueError, match="scientifically meaningful graph"):
+        load_config(path)
 
 
 @pytest.mark.parametrize("threshold", [-0.1, 1.1, float("nan"), float("inf")])

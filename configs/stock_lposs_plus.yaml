@@ -9,7 +9,7 @@ clip:
   image_size: 224
 
 dino:
-  repository: facebookresearch/dino:main
+  repository: facebookresearch/dino:7c446df5b9f45747937fb0d72314eb9f7b66930a
   model: dino_vitb16
   source: github
   weights: null
@@ -27,7 +27,10 @@ graph:
   r: 13
   max_graph_nodes: 250000
   max_dense_graph_bytes: 8589934592
-  max_pixel_nodes: 20000000
+  max_pixel_nodes: 2000000
+  max_pixel_edges: 250000000
+  max_pixel_graph_bytes: 8589934592
+  gpu_memory_reserve_bytes: 1073741824
 
 pixel_refine: true
 

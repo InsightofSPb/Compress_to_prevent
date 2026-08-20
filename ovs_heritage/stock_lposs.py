@@ -58,6 +58,8 @@ class ExecutionMetadata:
     window_count: int
     graph_nodes: int | None
     estimated_dense_graph_bytes: int | None
+    estimated_pixel_graph_edges: int | None
+    estimated_pixel_graph_bytes: int | None
     crop_size: tuple[int, int] | None
     stride: tuple[int, int] | None
 
@@ -125,6 +127,52 @@ def graph_preflight(mode: str, device: DeviceInfo) -> dict[str, str | None]:
             "faiss": getattr(faiss, "__version__", "unknown")}
 
 
+def _available_graph_bytes(device: DeviceInfo, parameters: dict) -> tuple[int, int]:
+    reserve = int(parameters.get("gpu_memory_reserve_bytes", 1024**3))
+    if "available_gpu_bytes" in parameters:  # deterministic contract-test override
+        free = int(parameters["available_gpu_bytes"])
+    else:
+        free, _ = torch.cuda.mem_get_info(device.logical_index)
+    return free, max(0, free - reserve)
+
+
+def patch_graph_preflight(nodes: int, channels: int, element_size: int,
+                          device: DeviceInfo, parameters: dict) -> int:
+    """Conservative peak for affinity, distances, masks, Laplacian and solver work."""
+    dense = nodes * nodes
+    estimated = dense * (element_size * 6 + 2) + nodes * channels * element_size * 4
+    free, usable = _available_graph_bytes(device, parameters)
+    max_nodes = int(parameters.get("max_graph_nodes", 250_000))
+    max_bytes = int(parameters.get("max_dense_graph_bytes", 8 * 1024**3))
+    if nodes > max_nodes or estimated > max_bytes or estimated > usable:
+        raise RuntimeError("patch graph preflight rejected: "
+            f"nodes={nodes}, edges={dense}, estimated_bytes={estimated}, available_bytes={free}, "
+            f"usable_after_reserve_bytes={usable}; reduce image/window count or select a larger GPU; "
+            "stock inference will not resize automatically")
+    return estimated
+
+
+def pixel_graph_preflight(height: int, width: int, channels: int, element_size: int,
+                          device: DeviceInfo, parameters: dict) -> tuple[int, int]:
+    nodes = height * width
+    radius = int(parameters["r"]) // 2
+    neighbours = (2 * radius + 1) ** 2 - 1
+    edges = nodes * neighbours  # safe upper bound; boundaries only reduce it
+    # COO row/column + value, two sparse matrices, CSR work, labels and solver vectors.
+    estimated = edges * (8 * 2 + element_size) * 3 + (nodes + 1) * 8 * 3
+    estimated += nodes * channels * element_size * 5
+    free, usable = _available_graph_bytes(device, parameters)
+    limits = (int(parameters.get("max_pixel_nodes", 2_000_000)),
+              int(parameters.get("max_pixel_edges", 250_000_000)),
+              int(parameters.get("max_pixel_graph_bytes", 8 * 1024**3)))
+    if nodes > limits[0] or edges > limits[1] or estimated > limits[2] or estimated > usable:
+        raise RuntimeError("pixel graph preflight rejected: "
+            f"nodes={nodes}, edges={edges}, estimated_bytes={estimated}, available_bytes={free}, "
+            f"usable_after_reserve_bytes={usable}; reduce input size explicitly or select a larger GPU; "
+            "stock inference will not resize automatically")
+    return edges, estimated
+
+
 def _windows(h: int, w: int, crop: tuple[int, int], stride: tuple[int, int]):
     ch, cw = crop
     sh, sw = stride
@@ -174,6 +222,7 @@ class StockOVSEngine:
         window_seed_maps = self.scorer(clip, prototypes.prototypes)
         dino_done = patch_done = pixel_done = False
         effective_k = graph_nodes = estimated_graph_bytes = None
+        pixel_edges = estimated_pixel_bytes = None
         if mode == "maskclip_raw":
             window_outputs = [window_seed_maps[i:i + 1] for i in range(len(windows))]
         else:
@@ -188,15 +237,8 @@ class StockOVSEngine:
             dino_nodes = torch.cat([item.permute(1, 2, 0).reshape(-1, item.shape[0]) for item in dino])
             seed_nodes = torch.cat([item.permute(1, 2, 0).reshape(-1, item.shape[0]) for item in seeds])
             graph_nodes = dino_nodes.shape[0]
-            estimated_graph_bytes = graph_nodes * graph_nodes * dino_nodes.element_size()
-            max_nodes = int(self.parameters.get("max_graph_nodes", 250_000))
-            if graph_nodes > max_nodes:
-                raise RuntimeError(f"resolved graph has {graph_nodes} nodes, exceeding max_graph_nodes={max_nodes}")
-            max_bytes = int(self.parameters.get("max_dense_graph_bytes", 8 * 1024**3))
-            if estimated_graph_bytes > max_bytes:
-                raise RuntimeError(
-                    f"estimated dense geometry graph requires {estimated_graph_bytes} bytes, "
-                    f"exceeding max_dense_graph_bytes={max_bytes}")
+            estimated_graph_bytes = patch_graph_preflight(
+                graph_nodes, seed_nodes.shape[1], dino_nodes.element_size(), self.device, self.parameters)
             locations = torch.tensor(windows, device=target, dtype=torch.long)
             context = torch.cuda.device(self.device.logical_index)
             with context:
@@ -213,12 +255,9 @@ class StockOVSEngine:
         seeds_full = self._stitch(window_seed_maps, windows, original)
         scores = self._stitch(window_outputs, windows, original)
         if mode == "lposs_plus":
-            pixel_nodes = original[0] * original[1]
-            max_pixel_nodes = int(self.parameters.get("max_pixel_nodes", 20_000_000))
-            if pixel_nodes > max_pixel_nodes:
-                raise RuntimeError(
-                    f"LPOSS+ pixel graph has {pixel_nodes} nodes, exceeding "
-                    f"max_pixel_nodes={max_pixel_nodes}")
+            pixel_edges, estimated_pixel_bytes = pixel_graph_preflight(
+                original[0], original[1], scores.shape[1], scores.element_size(),
+                self.device, self.parameters)
             with torch.cuda.device(self.device.logical_index):
                 scores = self.propagator.pixel(image, scores, parameters=self.parameters,
                                                device_index=self.device.logical_index)
@@ -230,6 +269,7 @@ class StockOVSEngine:
             mode, mode, dino_done, patch_done, pixel_done, self.scorer.scale,
             self.parameters.get("k"), effective_k, inference, len(windows), graph_nodes,
             estimated_graph_bytes,
+            pixel_edges, estimated_pixel_bytes,
             crop_size if inference == "slide" else None,
             stride if inference == "slide" else None)
         return result
@@ -279,7 +319,7 @@ class StockOVSEngine:
         extras = {name: scores[:, i:i + 1] for i, (name, sid) in enumerate(zip(names, ids))
                   if sid is None and i not in excluded}
         placeholder = ExecutionMetadata("", "", False, False, False, 1, None, None,
-                                        "whole", 1, None, None, None, None)
+                                        "whole", 1, None, None, None, None, None, None)
         return StockOutput(seeds, scores, main_scores, main_mask, contrast, probability,
                            binary, extras, placeholder)
 
