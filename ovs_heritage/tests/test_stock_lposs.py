@@ -217,24 +217,55 @@ def test_source_manifest_hash_is_computed_once(tmp_path, monkeypatch):
     assert snapshot["inputs"][0]["provenance"]["source_record"]["image_path"] == "a.png"
 
 
-def test_canonical_dataset_metadata_and_facade_split_consistency(tmp_path):
+def _converter_manifest_fixture(tmp_path):
     ontology = load_ontology()
-    for name in ("a.png", "b.png"):
-        Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(tmp_path / name)
-    base = {"schema_version": "heritage_two_map_v2", "ontology_version": ontology.version,
-            "ontology_hash": ontology.hash, "facade_id": "facade-a", "split": "test",
-            "main_mask_path": "main/a.png", "ornament_mask_path": "ornament/a.png"}
+    Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8), "RGB").save(tmp_path / "a.png")
+    Image.fromarray(np.array([[0, 1], [2, 11]], dtype=np.uint8)).save(tmp_path / "main.png")
+    Image.fromarray(np.array([[0, 1], [1, 0]], dtype=np.uint8)).save(tmp_path / "ornament.png")
+    row = {"sample_id": "a", "image_id": 1, "source_coco_file_name": "a.png",
+        "canonical_file_name": "a.png", "resolved_image_path": str((tmp_path / "a.png").resolve()),
+        "image_path": "a.png", "main_mask_path": "main.png", "ornament_mask_path": "ornament.png",
+        "facade_id": "facade-a", "building_id": "building-a", "split": "test",
+        "schema_version": "heritage_two_map_v2", "ontology_version": ontology.version,
+        "source_coco_sha256": "a" * 64, "source_annotation_ids": [1], "width": 2, "height": 2}
     manifest = tmp_path / "canonical.jsonl"
-    manifest.write_text(json.dumps({**base, "sample_id": "a", "image_path": "a.png"}) + "\n")
+    manifest.write_text(json.dumps(row) + "\n")
+    return manifest, row
+
+
+def test_authoritatively_valid_converter_manifest_is_canonical(tmp_path, monkeypatch):
+    import ovs_heritage.coco_converter as converter
+    manifest, _ = _converter_manifest_fixture(tmp_path)
+    calls = []
+    original = converter.validate_manifest
+    monkeypatch.setattr(converter, "validate_manifest",
+                        lambda path: calls.append(path) or original(path))
     sample = discover_inputs(_args(manifest=str(manifest)))[0]
+    assert calls == [manifest.resolve()]
     assert sample.provenance["dataset_metadata_available"] is True
     assert sample.provenance["canonical_dataset_v2"] is True
     assert sample.provenance["facade_disjoint_split_verified"] is False
     assert sample.provenance["canonical_fields"]["facade_id"] == "facade-a"
-    manifest.write_text("\n".join(json.dumps(row) for row in (
-        {**base, "sample_id": "a", "image_path": "a.png"},
-        {**base, "sample_id": "b", "image_path": "b.png", "split": "train"})))
-    with pytest.raises(ValueError, match="inconsistently"):
+
+
+@pytest.mark.parametrize("defect,expected", [
+    ("missing_mask", "unreadable artifact"),
+    ("invalid_split", "invalid split"),
+    ("invalid_domain", "invalid main-mask value domain"),
+    ("grid_mismatch", "image/mask grid or dtype mismatch"),
+])
+def test_declared_canonical_manifest_defects_fail_closed(tmp_path, defect, expected):
+    manifest, row = _converter_manifest_fixture(tmp_path)
+    if defect == "missing_mask":
+        (tmp_path / "main.png").unlink()
+    elif defect == "invalid_split":
+        row["split"] = "holdout"
+        manifest.write_text(json.dumps(row) + "\n")
+    elif defect == "invalid_domain":
+        Image.fromarray(np.full((2, 2), 8, dtype=np.uint8)).save(tmp_path / "main.png")
+    else:
+        Image.fromarray(np.zeros((1, 2), dtype=np.uint8)).save(tmp_path / "main.png")
+    with pytest.raises(ValueError, match=f"canonical dataset-v2 manifest validation failed:.*{expected}"):
         discover_inputs(_args(manifest=str(manifest)))
 
 

@@ -157,10 +157,9 @@ def discover_inputs(args, ontology=None) -> list[InputSample]:
         except OSError as exc:
             raise ValueError(f"cannot read manifest {manifest}: {exc}") from exc
         manifest_sha256 = file_hash(manifest)
-        facade_splits: dict[str, set[str]] = {}
+        parsed = []
         from .ontology import V2_VERSION
         from .validate_dataset import V2_DATASET_SCHEMA
-        canonical_ontology = ontology or load_ontology()
         for line_number, line in enumerate(lines, 1):
             if not line.strip():
                 continue
@@ -168,6 +167,21 @@ def discover_inputs(args, ontology=None) -> list[InputSample]:
                 item = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{manifest}: malformed JSON at line {line_number}: {exc.msg}") from exc
+            parsed.append((line_number, item))
+        declares_v2 = any(isinstance(item, dict) and (
+            item.get("schema_version") == V2_DATASET_SCHEMA
+            or item.get("ontology_version") == V2_VERSION) for _, item in parsed)
+        canonical = False
+        if declares_v2:
+            from .coco_converter import validate_manifest
+            validation = validate_manifest(manifest)
+            if not validation["valid"]:
+                failures = "; ".join(validation["errors"][:8])
+                if len(validation["errors"]) > 8:
+                    failures += f"; and {len(validation['errors']) - 8} more"
+                raise ValueError(f"canonical dataset-v2 manifest validation failed: {failures}")
+            canonical = True
+        for line_number, item in parsed:
             if not isinstance(item, dict) or not isinstance(item.get("image_path"), str) or not item["image_path"].strip():
                 raise ValueError(f"{manifest}: line {line_number} requires canonical image_path")
             path = Path(item["image_path"]).expanduser()
@@ -181,27 +195,11 @@ def discover_inputs(args, ontology=None) -> list[InputSample]:
                 "main_mask_path": item.get("main_mask_path"),
                 "ornament_mask_path": item.get("ornament_mask_path"),
             }
-            metadata_available = (canonical_fields["schema_version"] == V2_DATASET_SCHEMA
-                and canonical_fields["ontology_version"] == V2_VERSION
-                and all(isinstance(canonical_fields[k], str) and canonical_fields[k].strip()
-                        for k in ("facade_id", "split", "image_path")))
-            canonical = (metadata_available
-                and all(isinstance(canonical_fields[k], str) and canonical_fields[k].strip()
-                        for k in ("main_mask_path", "ornament_mask_path"))
-                and item.get("ontology_hash", canonical_ontology.hash) == canonical_ontology.hash)
-            if canonical_fields["schema_version"] not in (None, V2_DATASET_SCHEMA):
+            metadata_available = canonical
+            if not declares_v2 and canonical_fields["schema_version"] is not None:
                 raise ValueError(f"{manifest}: line {line_number} has incompatible dataset schema")
-            if canonical_fields["ontology_version"] not in (None, V2_VERSION):
+            if not declares_v2 and canonical_fields["ontology_version"] is not None:
                 raise ValueError(f"{manifest}: line {line_number} has incompatible ontology revision")
-            if item.get("ontology_hash", canonical_ontology.hash) != canonical_ontology.hash:
-                raise ValueError(f"{manifest}: line {line_number} has incompatible ontology hash")
-            if (isinstance(canonical_fields["facade_id"], str)
-                    and canonical_fields["facade_id"].strip()
-                    and isinstance(canonical_fields["split"], str)
-                    and canonical_fields["split"].strip()):
-                facade = canonical_fields["facade_id"].strip()
-                identity = canonical_fields["split"].strip()
-                facade_splits.setdefault(facade, set()).add(identity)
             samples.append(InputSample(_sample_id(sample, path, line_number), path.resolve(), {
                 "input_kind": "manifest", "dataset_metadata_available": metadata_available,
                 "canonical_dataset_v2": canonical, "canonical_fields": canonical_fields,
@@ -209,9 +207,6 @@ def discover_inputs(args, ontology=None) -> list[InputSample]:
                 "facade_disjoint_split_evidence": "unavailable from a single inference manifest",
                 "source_manifest_path": str(manifest), "source_manifest_sha256": manifest_sha256,
                 "source_manifest_line_number": line_number, "source_record": item}))
-        conflicts = {facade: sorted(values) for facade, values in facade_splits.items() if len(values) > 1}
-        if conflicts:
-            raise ValueError(f"facades assigned inconsistently across split identities: {conflicts}")
     if not samples:
         raise ValueError("input contains no supported images")
     ids = [item.sample_id for item in samples]

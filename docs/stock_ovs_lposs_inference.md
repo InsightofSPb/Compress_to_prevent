@@ -198,6 +198,9 @@ PYCONTRACT
 Direct `--image`/`--image-dir` records explicitly report unavailable dataset/split metadata. Generic
 JSONL is supported but marked non-canonical; canonical dataset-v2 status requires a validated schema,
 ontology, facade, split, image path, and the two canonical mask paths emitted by the converter.
+Declared dataset-v2 JSONL is checked once, as a complete manifest, by the converter's authoritative
+`validate_manifest` implementation; missing artifacts, invalid mask domains, invalid splits, and
+image/mask grid mismatches fail closed rather than producing canonical provenance.
 `facade_disjoint_split_verified` remains false for a single inference manifest because cross-split
 validation evidence is unavailable. The original JSON mapping and its source manifest path, line, and
 single computed manifest hash are retained in the existing ledger.
