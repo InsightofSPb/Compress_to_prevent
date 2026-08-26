@@ -16,6 +16,9 @@ This repository provides:
 
 The learned RGB residual compression model is trained in the companion repository [`InsightofSPb/MasksComp`](https://github.com/InsightofSPb/MasksComp), using the aligned pair manifests produced here.
 
+Stock open-vocabulary MaskCLIP/LPOSS inference is provided by
+`python -m ovs_heritage.infer_ovs`; see [the P1a inference guide](docs/stock_ovs_lposs_inference.md).
+
 ## Current experimental protocol
 
 ### Data split

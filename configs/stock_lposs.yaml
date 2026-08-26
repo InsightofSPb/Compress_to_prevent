@@ -1,0 +1,39 @@
+stock_implementation: stock-maskclip-lposs-p1a-v1
+upstream_repository: https://github.com/vladan-stojnic/LPOSS
+upstream_commit: e489a7445528922ddfe4e39631ef2fe34827c873
+
+clip:
+  model: ViT-B-16
+  pretrained: laion2b_s34b_b88k
+  patch_size: 16
+  image_size: 224
+
+dino:
+  repository: facebookresearch/dino:7c446df5b9f45747937fb0d72314eb9f7b66930a
+  model: dino_vitb16
+  source: github
+  weights: null
+  architecture: vit_base
+  patch_size: 16
+  feature_type: v
+
+graph:
+  alpha: 0.95
+  gamma: 3.0
+  k: 400
+  sigma: 0.01
+  pix_dist_pow: 1.0
+  tau: 0.01
+  r: 13
+  max_graph_nodes: 250000
+  max_dense_graph_bytes: 8589934592
+  max_pixel_nodes: 2000000
+  max_pixel_edges: 250000000
+  max_pixel_graph_bytes: 8589934592
+  gpu_memory_reserve_bytes: 1073741824
+
+pixel_refine: false
+
+slide:
+  crop_size: [512, 512]
+  stride: [341, 341]

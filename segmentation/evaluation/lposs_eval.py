@@ -1,21 +1,21 @@
+import importlib
+import importlib.util
 from itertools import product
 import logging
-import math
-import os
-import time
 from typing import List
 
-import importlib
-
+import faiss
+import faiss.contrib.torch_utils
+from kornia.color import rgb_to_lab
+from mmcv import ConfigDict
+from mmcv.parallel import DataContainer
+from mmseg.models import EncoderDecoder
+from mmseg.ops import resize
 import torch
 from torch import Tensor
 import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
-from mmcv.parallel import DataContainer
-from mmcv import ConfigDict
-from mmseg.ops import resize
-from mmseg.models import EncoderDecoder
 
 _cupy_spec = importlib.util.find_spec("cupyx")
 if _cupy_spec is not None:
@@ -30,14 +30,6 @@ else:
         "fall back to raw predictions. Install cupy-cuda to enable full LPOSS "
         "post-processing."
     )
-
-import faiss
-import numpy as np
-import faiss.contrib.torch_utils
-from PIL import Image
-import numpy as np
-from kornia.color import rgb_to_lab
-
 
 def _require_cupy():
     if cp is None:
@@ -71,7 +63,9 @@ def normalize_connection_graph(G):
     return Wn
 
 
-def get_lposs_laplacian(feats, locations, height_width, sigma=0.0, pix_dist_pow=2, k=100, gamma=1.0, alpha=0.95, patch_size=16):
+def get_lposs_laplacian(feats, locations, height_width, sigma=0.0, pix_dist_pow=2,
+                        k=100, gamma=1.0, alpha=0.95, patch_size=16,
+                        device_index=None):
     _require_cupy()
     idx_window = torch.cat([window * torch.ones((h*w, ), device=feats.device, dtype=torch.int64) for window, (h, w) in enumerate(height_width)])
     idx_h = torch.cat([torch.arange(h).view(-1,1).repeat(1, w).flatten() for h, w in height_width]).to(feats.device)
@@ -87,10 +81,16 @@ def get_lposs_laplacian(feats, locations, height_width, sigma=0.0, pix_dist_pow=
 
     N = feats.shape[0]
     
-    res = faiss.StandardGpuResources()
-    res.setDefaultNullStreamAllDevices()
-    res.setTempMemory(0)
-    sims, ks = faiss.knn_gpu(res, feats, feats, k, metric=faiss.METRIC_INNER_PRODUCT)
+    if device_index is None:
+        device_index = feats.device.index
+    if device_index is None:
+        raise ValueError("LPOSS graph construction requires an explicitly indexed CUDA device")
+    with torch.cuda.device(device_index), cp.cuda.Device(device_index):
+        res = faiss.StandardGpuResources()
+        res.setTempMemory(0)
+        sims, ks = faiss.knn_gpu(
+            res, feats, feats, k, metric=faiss.METRIC_INNER_PRODUCT,
+            device=device_index)
 
     sims[sims < 0] = 0
     sims = sims ** gamma
@@ -98,15 +98,16 @@ def get_lposs_laplacian(feats, locations, height_width, sigma=0.0, pix_dist_pow=
     sims = sims.flatten()
     sims = sims * geometry_affinity
     ks = ks.flatten()
-    rows = torch.arange(N).repeat_interleave(k)
+    rows = torch.arange(N, device=feats.device).repeat_interleave(k)
     
-    W = csr_matrix(
-        (cp.asarray(sims), (cp.asarray(rows), cp.asarray(ks))),
-        shape=(N, N),
-    )
-    W = W + W.T
-    Wn = normalize_connection_graph(W)
-    L = eye(Wn.shape[0]) - alpha * Wn
+    with torch.cuda.device(device_index), cp.cuda.Device(device_index):
+        W = csr_matrix(
+            (cp.asarray(sims), (cp.asarray(rows), cp.asarray(ks))),
+            shape=(N, N),
+        )
+        W = W + W.T
+        Wn = normalize_connection_graph(W)
+        L = eye(Wn.shape[0]) - alpha * Wn
 
     return L
 
@@ -118,14 +119,21 @@ def dfs_search(L, Y, tol=1e-6, maxiter=10):
     return out
 
 
-def perform_lp(L, preds):
+def perform_lp(L, preds, device=None, device_index=None):
     _require_cupy()
-    lp_preds = cp.zeros(preds.shape)
-    preds = cp.asarray(preds)
-    for cls_idx, y_cls in enumerate(preds.T):
-        Y = y_cls
-        lp_preds[:, cls_idx] = dfs_search(L, Y)
-    lp_preds = torch.as_tensor(lp_preds, device="cuda")
+    if device is None and isinstance(preds, torch.Tensor):
+        device = preds.device
+    if device_index is None and isinstance(device, torch.device):
+        device_index = device.index
+    if device_index is None:
+        raise ValueError("LPOSS solver requires an explicit CUDA device index")
+    with torch.cuda.device(device_index), cp.cuda.Device(device_index):
+        lp_preds = cp.zeros(preds.shape)
+        preds = cp.asarray(preds)
+        for cls_idx, y_cls in enumerate(preds.T):
+            lp_preds[:, cls_idx] = dfs_search(L, y_cls)
+        # Preserve the caller's selected CUDA index; never allocate on generic cuda:0.
+        lp_preds = torch.as_tensor(lp_preds, device=device)
 
     return lp_preds
 
@@ -162,23 +170,25 @@ def get_pixel_connections(img, neigh=1):
     return rows, cols, pixel_pixel_data, locs
 
 
-def get_lposs_plus_laplacian(img, preds, tau=0.1, neigh=6, alpha=0.95):
+def get_lposs_plus_laplacian(img, preds, tau=0.1, neigh=6, alpha=0.95,
+                             device_index=None):
     _require_cupy()
     rows, cols, pixel_pixel_data, locs = get_pixel_connections(img, neigh=neigh)
     pixel_pixel_data = torch.sqrt(pixel_pixel_data)
     pixel_pixel_data = torch.exp(-pixel_pixel_data / tau)
     
     N = preds.shape[0]
-    rows = cp.asarray(rows)
-    cols = cp.asarray(cols)
-    data = cp.asarray(pixel_pixel_data)
-    W = csr_matrix(
-        (data, (rows, cols)),
-        shape=(N, N),
-    )
-
-    Wn = normalize_connection_graph(W)
-    L = eye(Wn.shape[0]) - alpha * Wn
+    if device_index is None:
+        device_index = img.device.index
+    if device_index is None:
+        raise ValueError("LPOSS+ graph construction requires an explicit CUDA device index")
+    with torch.cuda.device(device_index), cp.cuda.Device(device_index):
+        rows = cp.asarray(rows)
+        cols = cp.asarray(cols)
+        data = cp.asarray(pixel_pixel_data)
+        W = csr_matrix((data, (rows, cols)), shape=(N, N))
+        Wn = normalize_connection_graph(W)
+        L = eye(Wn.shape[0]) - alpha * Wn
 
     return L
 
@@ -217,11 +227,8 @@ class LPOSS_Infrencer(EncoderDecoder):
 
         imgs = self._ensure_list(img)
         device = next(self.model.parameters()).device
-        imgs = [
-            i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i
-            (i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i)
-            for i in imgs
-        ]
+        imgs = [i.float().div(255) if isinstance(i, torch.Tensor) and i.dtype == torch.uint8 else i
+                for i in imgs]
         imgs = [
             i.to(device) if isinstance(i, torch.Tensor) else i
             for i in imgs
