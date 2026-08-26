@@ -161,7 +161,7 @@ def module_state_fingerprint(module: nn.Module) -> tuple[tuple[str, tuple[int, .
     """Functional test/provenance helper for vocabulary-invariant model state."""
     result = []
     for key, value in module.state_dict().items():
-        raw = value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
         digest = sha256(raw).hexdigest()
         result.append((key, tuple(value.shape), digest))
     return tuple(result)
@@ -175,7 +175,7 @@ def model_state_sha256(module: nn.Module) -> str:
         digest.update(key.encode())
         digest.update(str(tuple(cpu.shape)).encode())
         digest.update(str(cpu.dtype).encode())
-        digest.update(cpu.view(torch.uint8).numpy().tobytes())
+        digest.update(cpu.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 

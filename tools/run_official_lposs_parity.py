@@ -126,7 +126,7 @@ def main(argv=None):
             digest.update(key.encode())
             digest.update(str(tuple(cpu.shape)).encode())
             digest.update(str(cpu.dtype).encode())
-            digest.update(cpu.view(torch.uint8).numpy().tobytes())
+            digest.update(cpu.reshape(-1).view(torch.uint8).numpy().tobytes())
         return digest.hexdigest()
 
     torch.manual_seed(request["seed"])
