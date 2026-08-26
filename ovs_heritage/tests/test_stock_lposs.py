@@ -25,7 +25,7 @@ from ovs_heritage.infer_ovs import (
 from ovs_heritage.projection import MAIN_SEMANTIC_IDS
 from ovs_heritage.ontology import load_ontology
 from ovs_heritage.stock_features import (
-    DINO_REPOSITORY, StockFeatureModel, module_state_fingerprint,
+    DINO_REPOSITORY, StockFeatureModel, model_state_sha256, module_state_fingerprint,
     validate_pinned_hub_repository,
 )
 from ovs_heritage.stock_lposs import (
@@ -51,6 +51,21 @@ class FakeModel:
     def dino_dense(self, image):
         self.dino_calls += 1
         return torch.ones(image.shape[0], 2, 2, 2, device=image.device)
+
+
+def test_scalar_state_hashing_is_deterministic_and_sensitive():
+    module = nn.Module()
+    module.register_parameter("scalar", nn.Parameter(torch.tensor(1.0)))
+    module.register_buffer("matrix", torch.arange(6).reshape(2, 3))
+
+    fingerprint = module_state_fingerprint(module)
+    state_hash = model_state_sha256(module)
+    assert module_state_fingerprint(module) == fingerprint
+    assert model_state_sha256(module) == state_hash
+
+    module.scalar.data.fill_(2.0)
+    assert module_state_fingerprint(module) != fingerprint
+    assert model_state_sha256(module) != state_hash
 
 
 class FakePropagation:
