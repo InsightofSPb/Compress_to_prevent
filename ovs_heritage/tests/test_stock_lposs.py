@@ -136,6 +136,7 @@ def test_true_slide_builds_one_location_aware_graph_and_overlap_average(monkeypa
     assert model.clip_calls == model.dino_calls == propagation.patch_calls == 1
     assert propagation.locations.tolist() == [[0, 4, 0, 4], [0, 4, 3, 7],
                                                [2, 6, 0, 4], [2, 6, 3, 7]]
+    assert torch.is_floating_point(propagation.locations)
     assert result.propagated_scores.shape[-2:] == (6, 7)
     assert result.metadata.window_count == 4
     assert result.metadata.graph_nodes == 16

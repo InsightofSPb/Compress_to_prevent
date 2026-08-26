@@ -173,7 +173,7 @@ def main(argv=None):
         dino_nodes = F.normalize(dino[0].reshape(h * w, -1), dim=-1)
         clip_nodes = F.normalize(clip[0].reshape(h * w, -1), dim=-1)
         seed_nodes = clip_nodes @ prototypes.T
-        locations = torch.tensor([[0, image.shape[-2], 0, image.shape[-1]]], device=image.device)
+        locations = torch.tensor([[0, image.shape[-2], 0, image.shape[-1]]], device=image.device, dtype=dino_nodes.dtype)
         laplacian = get_lposs_laplacian(dino_nodes, locations, [(h, w)],
             sigma=graph["sigma"], pix_dist_pow=graph["pix_dist_pow"], k=graph["k"],
             gamma=graph["gamma"], alpha=graph["alpha"], patch_size=config["dino"]["patch_size"])

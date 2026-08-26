@@ -239,7 +239,7 @@ class StockOVSEngine:
             graph_nodes = dino_nodes.shape[0]
             estimated_graph_bytes = patch_graph_preflight(
                 graph_nodes, seed_nodes.shape[1], dino_nodes.element_size(), self.device, self.parameters)
-            locations = torch.tensor(windows, device=target, dtype=torch.long)
+            locations = torch.tensor(windows, device=target, dtype=dino_nodes.dtype)
             context = torch.cuda.device(self.device.logical_index)
             with context:
                 propagated, effective_k = self.propagator.patch_nodes(
